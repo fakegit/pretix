@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -31,36 +31,3 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the Apache License 2.0 is
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
-
-from django.apps import AppConfig
-from django.utils.functional import cached_property
-from django.utils.translation import gettext_lazy as _
-
-from pretix import __version__ as version
-
-
-class CheckinlistsApp(AppConfig):
-    name = 'pretix.plugins.checkinlists'
-    verbose_name = _("Check-in lists")
-
-    class PretixPluginMeta:
-        name = _("Check-in list exporter")
-        author = _("the pretix team")
-        version = version
-        visible = False
-        description = _("This plugin allows you to generate check-in lists for your conference.")
-
-    def ready(self):
-        from . import signals  # NOQA
-
-    @cached_property
-    def compatibility_errors(self):
-        errs = []
-        try:
-            import reportlab  # NOQA
-        except ImportError:
-            errs.append("Python package 'reportlab' is not installed.")
-        return errs
-
-
-default_app_config = 'pretix.plugins.checkinlists.CheckinlistsApp'

@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -21,9 +21,15 @@
 #
 import contextlib
 
-from django.db import transaction
-from django.db.models import Aggregate, Field, Lookup
-from django.db.models.expressions import OrderBy
+from django.conf import settings
+from django.contrib.postgres.indexes import BrinIndex
+from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
+from django.db import connection, transaction
+from django.db.models import (
+    Aggregate, Expression, F, Field, Func, IntegerField, JSONField, Lookup,
+    OrderBy, Value,
+)
+from django.utils.functional import lazy
 
 
 class DummyRollbackException(Exception):
@@ -59,44 +65,71 @@ def casual_reads():
     yield
 
 
-class FixedOrderBy(OrderBy):
-    # Workaround for https://code.djangoproject.com/ticket/28848
-    template = '%(expression)s %(ordering)s'
+@contextlib.contextmanager
+def repeatable_reads_transaction():
+    """
+    pretix, and Django, operate in the transaction isolation level READ COMMITTED by default. This is not a strong level
+    of isolation, but we NEED to use it: Otherwise e.g. our quota logic breaks, because we need to be able to get the
+    *current* number of tickets sold at any time in a transaction, not the number of tickets sold *before* our transaction
+    started.
 
-    def as_sql(self, compiler, connection, template=None, **extra_context):
-        if not template:
-            if self.nulls_last:
-                template = '%s NULLS LAST' % self.template
-            elif self.nulls_first:
-                template = '%s NULLS FIRST' % self.template
-        connection.ops.check_expression_support(self)
-        expression_sql, params = compiler.compile(self.expression)
-        placeholders = {
-            'expression': expression_sql,
-            'ordering': 'DESC' if self.descending else 'ASC',
-        }
-        placeholders.update(extra_context)
-        template = template or self.template
-        params = params * template.count('%(expression)s')
-        return (template % placeholders).rstrip(), params
+    However, this isolation mode has drawbacks, for example during reporting. When a user retrieves a report from the
+    system, it should return numbers that are consistent with each other. However, if the report makes multiple SQL
+    queries in READ COMMITTED mode, the results might be different for each query, causing numbers to be inconsistent
+    with each other.
+
+    This context manager creates a transaction that is running in REPEATABLE READ mode to avoid this problem.
+
+    **You should only make read-only queries during this transaction and not rely on quota calculations.**
+    """
+    is_under_test = 'tests.testdummy' in settings.INSTALLED_APPS
+    try:
+        with transaction.atomic(durable=not is_under_test):
+            if not is_under_test:
+                # We're not running this in tests, where we can basically not use this since the test runner does its
+                # own transaction logic for efficiency
+                with connection.cursor() as cursor:
+                    if 'postgresql' in settings.DATABASES['default']['ENGINE']:
+                        cursor.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;')
+                    elif 'sqlite' in settings.DATABASES['default']['ENGINE']:
+                        pass  # noop
+                    else:
+                        raise ImproperlyConfigured("Cannot set transaction isolation mode on this database backend")
+
+            connection.tx_in_repeatable_read = True
+            yield
+    finally:
+        connection.tx_in_repeatable_read = False
 
 
 class GroupConcat(Aggregate):
     function = 'group_concat'
-    template = '%(function)s(%(field)s, "%(separator)s")'
+    template = '%(function)s(%(distinct)s%(field)s, "%(separator)s")'
+    allow_distinct = True
 
-    def __init__(self, *expressions, **extra):
+    def __init__(self, *expressions, ordered=False, **extra):
+        self.ordered = ordered
         if 'separator' not in extra:
             # For PostgreSQL separator is an obligatory
             extra.update({'separator': ','})
         super().__init__(*expressions, **extra)
 
-    def as_postgresql(self, compiler, connection):
-        return super().as_sql(
+    def as_postgresql(self, compiler, connection, **extra_context):
+        if self.ordered:
+            template = "%(function)s(%(distinct)s%(field)s::text, '%(separator)s' ORDER BY %(field)s::text ASC)"
+        else:
+            template = "%(function)s(%(distinct)s%(field)s::text, '%(separator)s')"
+
+        template, params = super().as_sql(
             compiler, connection,
             function='string_agg',
-            template="%(function)s(%(field)s::text, '%(separator)s')",
+            template=template,
+            **extra_context,
         )
+        if self.ordered:
+            # ordered statement requires field parameters twice
+            params = params + params
+        return template, params
 
 
 class ReplicaRouter:
@@ -126,3 +159,168 @@ class NotEqual(Lookup):
         rhs, rhs_params = self.process_rhs(compiler, connection)
         params = lhs_params + rhs_params
         return '%s <> %s' % (lhs, rhs), params
+
+
+@JSONField.register_lookup
+class ContainsString(Lookup):
+    lookup_name = 'containsstring'
+
+    def as_sql(self, compiler, connection):
+        if connection.vendor != "postgresql":
+            raise NotImplementedError("Lookup in JSON Array not supported on this database")
+        lhs, lhs_params = self.process_lhs(compiler, connection)
+        rhs, rhs_params = self.process_rhs(compiler, connection)
+        params = lhs_params + rhs_params
+        return '%s ? %s' % (lhs, rhs), params
+
+
+class PostgresWindowFrame(Expression):
+    template = "%(frame_type)s BETWEEN %(start)s AND %(end)s"
+
+    def __init__(self, frame_type=None, start=None, end=None):
+        self.frame_type = frame_type
+        self.start = Value(start)
+        self.end = Value(end)
+
+    def set_source_expressions(self, exprs):
+        self.start, self.end = exprs
+
+    def get_source_expressions(self):
+        return [self.start, self.end]
+
+    def as_sql(self, compiler, connection):
+        return (
+            self.template
+            % {
+                "frame_type": self.frame_type,
+                "start": self.start.value,
+                "end": self.end.value,
+            },
+            [],
+        )
+
+    def __repr__(self):
+        return "<%s: %s>" % (self.__class__.__name__, self)
+
+    def get_group_by_cols(self, alias=None):
+        return []
+
+    def __str__(self):
+        return self.template % {
+            "frame_type": self.frame_type,
+            "start": self.start.value,
+            "end": self.end.value,
+        }
+
+
+# This is a short-hand for .select_for_update(of=("self,")), that falls back gracefully on databases that don't support
+# the SELECT FOR UPDATE OF ... query.
+OF_SELF = lazy(lambda: ("self",) if connection.features.has_select_for_update_of else (), tuple)()
+
+
+def get_deterministic_ordering(model, ordering):
+    """
+    Ensure a deterministic order across all database backends. Search for a
+    single field or unique together set of fields providing a total
+    ordering. If these are missing, augment the ordering with a descendant
+    primary key.
+
+    This has mostly been vendored from
+    https://github.com/django/django/blob/d8e1442ce2c56282785dd806e5c1147975e8c857/django/contrib/admin/views/main.py#L390
+    """
+    if isinstance(ordering, str):
+        ordering = (ordering,)
+    ordering = list(ordering)
+    ordering_fields = set()
+    total_ordering_fields = {"pk"} | {
+        field.attname
+        for field in model._meta.fields
+        if field.unique and not field.null
+    }
+    for part in ordering:
+        # Search for single field providing a total ordering.
+        field_name = None
+        if isinstance(part, str):
+            field_name = part.lstrip("-")
+        elif isinstance(part, F):
+            field_name = part.name
+        elif isinstance(part, OrderBy) and isinstance(part.expression, F):
+            field_name = part.expression.name
+        if field_name:
+            # Normalize attname references by using get_field().
+            try:
+                field = model._meta.get_field(field_name)
+            except FieldDoesNotExist:
+                # Could be "?" for random ordering or a related field
+                # lookup. Skip this part of introspection for now.
+                continue
+            # Ordering by a related field name orders by the referenced
+            # model's ordering. Skip this part of introspection for now.
+            if field.remote_field and field_name == field.name:
+                continue
+            if field.attname in total_ordering_fields:
+                break
+            ordering_fields.add(field.attname)
+    else:
+        # No single total ordering field, try unique_together and total
+        # unique constraints.
+        constraint_field_names = (
+            *model._meta.unique_together,
+            *(
+                constraint.fields
+                for constraint in model._meta.total_unique_constraints
+            ),
+        )
+        for field_names in constraint_field_names:
+            # Normalize attname references by using get_field().
+            fields = [
+                model._meta.get_field(field_name) for field_name in field_names
+            ]
+            # Composite unique constraints containing a nullable column
+            # cannot ensure total ordering.
+            if any(field.null for field in fields):
+                continue
+            if ordering_fields.issuperset(field.attname for field in fields):
+                break
+        else:
+            # If no set of unique fields is present in the ordering, rely
+            # on the primary key to provide total ordering.
+            ordering.append("-pk")
+    return ordering
+
+
+@contextlib.contextmanager
+def conditional_atomic(do_atomic, **kwargs):
+    if do_atomic:
+        with transaction.atomic(**kwargs):
+            yield
+    else:
+        yield
+
+
+class IgnoreOnSQLiteMixin:
+    # Mixin to allow defining PostgreSQL-specific indexes that will just not be created
+    # on SQLite. SQLite is supported for testing only anyways!
+    def create_sql(self, model, schema_editor, *args, **kwargs):
+        if "sqlite" in settings.DATABASES["default"]["ENGINE"]:
+            return ""
+        return super().create_sql(model, schema_editor, *args, **kwargs)
+
+    def remove_sql(self, model, schema_editor, **kwargs):
+        if "sqlite" in settings.DATABASES["default"]["ENGINE"]:
+            return ""
+        return super().remove_sql(model, schema_editor, **kwargs)
+
+
+class BrinIndexIgnoredOnSQLite(IgnoreOnSQLiteMixin, BrinIndex):
+    pass
+
+
+class UnixTimestamp(Func):
+    output_field = IntegerField()
+
+    def as_postgresql(self, compiler, connection):
+        return self.as_sql(compiler, connection, template="EXTRACT(epoch from %(expressions)s)")
+
+    def as_sqlite(self, compiler, connection):
+        return self.as_sql(compiler, connection, template="CAST(strftime('%%%%s', datetime(%(expressions)s)) AS INT)")

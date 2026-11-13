@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -22,7 +22,7 @@
 import importlib.util
 
 from django.apps import apps
-from django.conf.urls import include, url
+from django.urls import include, re_path
 
 from pretix.multidomain.plugin_handler import plugin_event_urls
 from pretix.presale.urls import (
@@ -31,9 +31,9 @@ from pretix.presale.urls import (
 from pretix.urls import common_patterns
 
 presale_patterns = [
-    url(r'', include((locale_patterns + [
-        url(r'', include(organizer_patterns)),
-        url(r'^(?P<event>[^/]+)/', include(event_patterns)),
+    re_path(r'', include((locale_patterns + [
+        re_path(r'', include(organizer_patterns)),
+        re_path(r'^(?P<event>[^/]+)/', include(event_patterns)),
     ], 'presale')))
 ]
 
@@ -42,19 +42,24 @@ for app in apps.get_app_configs():
     if hasattr(app, 'PretixPluginMeta'):
         if importlib.util.find_spec(app.name + '.urls'):
             urlmod = importlib.import_module(app.name + '.urls')
-            if hasattr(urlmod, 'event_patterns'):
-                patterns = plugin_event_urls(urlmod.event_patterns, plugin=app.name)
-                raw_plugin_patterns.append(
-                    url(r'^(?P<event>[^/]+)/', include((patterns, app.label)))
-                )
+            single_plugin_patterns = []
+
             if hasattr(urlmod, 'organizer_patterns'):
-                patterns = urlmod.organizer_patterns
+                single_plugin_patterns += plugin_event_urls(urlmod.organizer_patterns, plugin=app.name)
+
+            if hasattr(urlmod, 'event_patterns'):
+                plugin_event_patterns = plugin_event_urls(urlmod.event_patterns, plugin=app.name)
+                single_plugin_patterns.append(
+                    re_path(r'^(?P<event>[^/]+)/', include(plugin_event_patterns))
+                )
+
+            if single_plugin_patterns:
                 raw_plugin_patterns.append(
-                    url(r'', include((patterns, app.label)))
+                    re_path(r'', include((single_plugin_patterns, app.label)))
                 )
 
 plugin_patterns = [
-    url(r'', include((raw_plugin_patterns, 'plugins')))
+    re_path(r'', include((raw_plugin_patterns, 'plugins')))
 ]
 
 # The presale namespace comes last, because it contains a wildcard catch

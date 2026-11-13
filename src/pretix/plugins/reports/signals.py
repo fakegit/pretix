@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -21,7 +21,9 @@
 #
 from django.dispatch import receiver
 
-from pretix.base.signals import register_data_exporters
+from pretix.base.signals import (
+    register_data_exporters, register_multievent_data_exporters,
+)
 
 
 @receiver(register_data_exporters, dispatch_uid="export_overview_report_pdf")
@@ -40,3 +42,10 @@ def register_report_ordertaxlist(sender, **kwargs):
 def register_report_ordertaxlistpdf(sender, **kwargs):
     from .exporters import OrderTaxListReportPDF
     return OrderTaxListReportPDF
+
+
+@receiver(register_data_exporters, dispatch_uid="export_accounting_report_pdf")
+@receiver(register_multievent_data_exporters, dispatch_uid="multi_export_accounting_report_pdf")
+def register_report_accounting_report_pdf(sender, **kwargs):
+    from .accountingreport import ReportExporter
+    return ReportExporter

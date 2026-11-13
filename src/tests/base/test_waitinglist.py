@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -30,6 +30,7 @@ from pretix.base.models import (
     Event, Item, ItemVariation, Organizer, Quota, Voucher, WaitingListEntry,
 )
 from pretix.base.models.waitinglist import WaitingListException
+from pretix.base.reldate import RelativeDate, RelativeDateWrapper
 from pretix.base.services.waitinglist import (
     assign_automatically, process_waitinglist,
 )
@@ -37,15 +38,13 @@ from pretix.testutils.scope import classscope
 
 
 class WaitingListTestCase(TestCase):
-    @classmethod
-    def setUpTestData(cls):
-        cls.o = Organizer.objects.create(name='Dummy', slug='dummy')
-        cls.event = Event.objects.create(
-            organizer=cls.o, name='Dummy', slug='dummy',
-            date_from=now(), live=True
-        )
 
     def setUp(self):
+        self.o = Organizer.objects.create(name='Dummy', slug='dummy')
+        self.event = Event.objects.create(
+            organizer=self.o, name='Dummy', slug='dummy',
+            date_from=now(), live=True
+        )
         djmail.outbox = []
         with scope(organizer=self.o):
             self.quota = Quota.objects.create(name="Test", size=2, event=self.event)
@@ -67,6 +66,25 @@ class WaitingListTestCase(TestCase):
         )
         with self.assertRaises(WaitingListException):
             wle.send_voucher()
+
+    @classscope(attr='o')
+    def test_send_no_seat(self):
+        self.quota.items.add(self.item1)
+        self.quota.size = 10
+        self.quota.save()
+        self.event.seat_category_mappings.create(
+            layout_category='Stalls', product=self.item1
+        )
+        self.event.seats.create(seat_number="Foo", product=self.item1, seat_guid="Foo", blocked=True)
+        self.event.seats.create(seat_number="Bar", product=self.item1, seat_guid="Bar", blocked=True)
+        self.event.seats.create(seat_number="Baz", product=self.item1, seat_guid="Baz", blocked=True)
+        wle = WaitingListEntry.objects.create(
+            event=self.event, item=self.item1, email='foo@bar.com'
+        )
+        with self.assertRaises(WaitingListException):
+            wle.send_voucher()
+        self.event.seats.create(seat_number="Baz", product=self.item1, seat_guid="Baz", blocked=False)
+        wle.send_voucher()
 
     @classscope(attr='o')
     def test_send_double(self):
@@ -103,12 +121,16 @@ class WaitingListTestCase(TestCase):
     def test_send_custom_validity(self):
         self.event.settings.set('waiting_list_hours', 24)
         wle = WaitingListEntry.objects.create(
-            event=self.event, item=self.item2, variation=self.var1, email='foo@bar.com'
+            event=self.event, item=self.item2, variation=self.var1, email='foo@bar.com',
+            name_parts={'_legacy': 'Max'}
         )
         wle.send_voucher()
         wle.refresh_from_db()
 
         assert 3600 * 23 < (wle.voucher.valid_until - now()).seconds < 3600 * 24
+
+        assert 'foo@bar.com' in wle.voucher.comment
+        assert 'Max' in wle.voucher.comment
 
     def test_send_auto(self):
         with scope(organizer=self.o):
@@ -172,10 +194,49 @@ class WaitingListTestCase(TestCase):
             assert WaitingListEntry.objects.filter(voucher__isnull=True).count() == 10
             assert Voucher.objects.count() == 10
 
+    def test_send_auto_no_seat(self):
+        with scope(organizer=self.o):
+            self.quota.items.add(self.item1)
+            self.quota.size = 10
+            self.quota.save()
+            self.event.seat_category_mappings.create(
+                layout_category='Stalls', product=self.item1
+            )
+            self.event.seats.create(seat_number="Foo", product=self.item1, seat_guid="Foo", blocked=True)
+            self.event.seats.create(seat_number="Bar", product=self.item1, seat_guid="Bar", blocked=True)
+            self.event.seats.create(seat_number="Baz", product=self.item1, seat_guid="Baz", blocked=True)
+            WaitingListEntry.objects.create(
+                event=self.event, item=self.item1, email='foo@bar.com'
+            )
+            assign_automatically.apply(args=(self.event.pk,))
+            assert Voucher.objects.count() == 0
+            self.event.seats.create(seat_number="Baz", product=self.item1, seat_guid="Baz", blocked=False)
+            assign_automatically.apply(args=(self.event.pk,))
+            assert Voucher.objects.count() == 1
+
     def test_send_periodic_event_over(self):
         self.event.settings.set('waiting_list_enabled', True)
         self.event.settings.set('waiting_list_auto', True)
         self.event.presale_end = now() - timedelta(days=1)
+        self.event.save()
+        with scope(organizer=self.o):
+            for i in range(5):
+                WaitingListEntry.objects.create(
+                    event=self.event, item=self.item2, variation=self.var1, email='foo{}@bar.com'.format(i)
+                )
+        process_waitinglist(None)
+        with scope(organizer=self.o):
+            assert WaitingListEntry.objects.filter(voucher__isnull=True).count() == 5
+            assert Voucher.objects.count() == 0
+            self.event.presale_end = now() + timedelta(days=1)
+            self.event.save()
+
+    def test_send_periodic_auto_disable(self):
+        self.event.settings.set('waiting_list_enabled', True)
+        self.event.settings.set('waiting_list_auto', True)
+        self.event.settings.waiting_list_auto_disable = RelativeDateWrapper(
+            RelativeDate(days=0, time=None, base_date_name='event__date_from', minutes=20, is_after=False)
+        )
         self.event.save()
         with scope(organizer=self.o):
             for i in range(5):

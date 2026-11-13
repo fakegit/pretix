@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,26 +19,3 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
-from django.apps import AppConfig
-from django.utils.translation import gettext_lazy as _
-
-from pretix import __version__ as version
-
-
-class ReturnURLApp(AppConfig):
-    name = 'pretix.plugins.returnurl'
-    verbose_name = _("Redirection from order page")
-
-    class PretixPluginMeta:
-        name = _("Redirection from order page")
-        author = _("the pretix team")
-        version = version
-        category = 'API'
-        description = _("This plugin allows to link to payments and redirect back afterwards. This is useful in "
-                        "combination with our API.")
-
-    def ready(self):
-        from . import signals  # NOQA
-
-
-default_app_config = 'pretix.plugins.returnurl.ReturnURLApp'

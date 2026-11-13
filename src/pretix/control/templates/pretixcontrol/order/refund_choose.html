@@ -8,6 +8,7 @@
 {% block content %}
     <h1>
         {% trans "Refund order" %}
+        <small class="text-muted">{{ full_refund|money:request.event.currency }}</small>
         <a class="btn btn-link btn-lg"
                 href="{% url "control:event.order" event=request.event.slug organizer=request.event.organizer.slug code=order.code %}">
             {% blocktrans trimmed with order=order.code %}
@@ -22,9 +23,9 @@
             <legend>{% trans "How should the refund be sent?" %}</legend>
             <p>
                 {% blocktrans trimmed %}
-                    Any payments that you selected for automatical refunds will be immediately communicate the refund
-                    request to the respective payment provider. Manual refunds will be created as pending refunds, you
-                    can then later mark them as done once you actually transferred the money back to the customer.
+                    Any payments you selected for automatic refunds will have the refund request sent immediately to the
+                    respective payment provider. Manual refunds will be created as pending refunds, which you can later
+                    mark as done once you have actually transferred the money back to the customer.
                 {% endblocktrans %}
             </p>
 
@@ -50,9 +51,9 @@
                                     <div class="input-group">
                                         <input type="text" name="refund-{{ p.pk }}"
                                                 {% if p.propose_refund %}
-                                                    value="{{ p.propose_refund|floatformat:2 }}"
+                                                    value="{{ p.propose_refund|money_numberfield:request.event.currency }}"
                                                 {% else %}
-                                                    placeholder="{{ p.propose_refund|floatformat:2 }}"
+                                                    placeholder="{{ p.propose_refund|money_numberfield:request.event.currency }}"
                                                 {% endif %}
                                                 title="" class="form-control">
                                         <span class="input-group-addon">
@@ -62,7 +63,7 @@
                                 {% elif p.full_refund_possible %}
                                     <label class="checkbox">
                                         <input type="checkbox" name="refund-{{ p.pk }}"
-                                                value="{{ p.amount|floatformat:2 }}"
+                                                value="{{ p.amount|money_numberfield:request.event.currency }}"
                                                 {% if p.propose_refund == p.amount %}checked{% endif %}>
                                         {% trans "Full amount" %} ({{ p.amount|money:request.event.currency }})
                                     </label>
@@ -100,7 +101,7 @@
                             <td class="text-right flip refund-amount">
                                 <div class="input-group">
                                     <input type="text" name="newrefund-{{ prov }}"
-                                            placeholder="{{ 0|floatformat:2 }}"
+                                            placeholder="{{ 0|money_numberfield:request.event.currency }}"
                                             title="" class="form-control">
                                     <span class="input-group-addon">
                                         {{ request.event.currency }}
@@ -118,7 +119,7 @@
                         <td class="text-right flip refund-amount">
                             <div class="input-group">
                                 <input type="text" name="refund-offsetting"
-                                        title="" class="form-control" placeholder="{{ 0|floatformat:2 }}">
+                                        title="" class="form-control" placeholder="{{ 0|money_numberfield:request.event.currency }}">
                                 <span class="input-group-addon">
                                     {{ request.event.currency }}
                                 </span>
@@ -143,9 +144,9 @@
                                 <input type="text" name="refund-new-giftcard"
                                         title="" class="form-control"
                                         {% if giftcard_proposal %}
-                                            value="{{ giftcard_proposal|floatformat:2 }}"
+                                            value="{{ giftcard_proposal|money_numberfield:request.event.currency }}"
                                         {% else %}
-                                            placeholder="{{ giftcard_proposal|floatformat:2 }}"
+                                            placeholder="{{ giftcard_proposal|money_numberfield:request.event.currency }}"
                                         {% endif %}
                                 >
                                 <span class="input-group-addon">
@@ -171,9 +172,9 @@
                             <div class="input-group">
                                 <input type="text" name="refund-manual"
                                         {% if remainder %}
-                                            value="{{ remainder|floatformat:2 }}"
+                                            value="{{ remainder|money_numberfield:request.event.currency }}"
                                         {% else %}
-                                            placeholder="{{ remainder|floatformat:2 }}"
+                                            placeholder="{{ remainder|money_numberfield:request.event.currency }}"
                                         {% endif %}
                                         title="" class="form-control">
                                 <span class="input-group-addon">
@@ -191,6 +192,7 @@
         <input type="hidden" name="start-action" value="{{ start_form.cleaned_data.action }}">
         <input type="hidden" name="start-mode" value="{{ start_form.cleaned_data.mode }}">
         <input type="hidden" name="start-partial_amount" value="{{ partial_amount }}">
+        <input type="hidden" name="last_known_refund_id" value="{{ last_known_refund_id }}">
 
         <div class="form-group">
             <label class="control-label" for="id_comment">{% trans "Refund reason" %}</label>

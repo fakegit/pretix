@@ -1,7 +1,7 @@
 .. highlight:: python
    :linenothreshold: 5
 
-.. spelling:: answ contrib
+.. spelling:word-list:: answ contrib
 
 Data model
 ==========
@@ -32,9 +32,6 @@ Organizers and events
    :members:
 
 .. autoclass:: pretix.base.models.TeamAPIToken
-   :members:
-
-.. autoclass:: pretix.base.models.RequiredAction
    :members:
 
 .. autoclass:: pretix.base.models.EventMetaProperty
@@ -93,6 +90,9 @@ Carts and Orders
    :members:
 
 .. autoclass:: pretix.base.models.OrderRefund
+   :members:
+
+.. autoclass:: pretix.base.models.Transaction
    :members:
 
 .. autoclass:: pretix.base.models.CartPosition

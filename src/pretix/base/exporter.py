@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -33,31 +33,26 @@
 # License for the specific language governing permissions and limitations under the License.
 
 import io
-import re
 import tempfile
 from collections import OrderedDict, namedtuple
 from decimal import Decimal
-from typing import Tuple
+from typing import Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from defusedcsv import csv
 from django import forms
+from django.conf import settings
 from django.db.models import QuerySet
 from django.utils.formats import localize
 from django.utils.translation import gettext, gettext_lazy as _
-from openpyxl import Workbook
-from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE, KNOWN_TYPES
 
 from pretix.base.models import Event
+from pretix.base.models.auth import PermissionHolder
+from pretix.helpers.safe_openpyxl import (  # NOQA: backwards compatibility for plugins using excel_safe
+    SafeWorkbook, remove_invalid_excel_chars as excel_safe,
+)
 
-
-def excel_safe(val):
-    if not isinstance(val, KNOWN_TYPES):
-        val = str(val)
-
-    if isinstance(val, str):
-        val = re.sub(ILLEGAL_CHARACTERS_RE, '', val)
-
-    return val
+__ = excel_safe  # just so the compatibility import above is "used" and doesn't get removed by linter
 
 
 class BaseExporter:
@@ -65,17 +60,31 @@ class BaseExporter:
     This is the base class for all data exporters
     """
 
-    def __init__(self, event, progress_callback=lambda v: None):
+    def __init__(self, event, organizer, permission_holder: PermissionHolder=None, progress_callback=lambda v: None):
+        """
+        :param event: Event context, can also be a queryset of events for multi-event exports
+        :param organizer: Organizer context
+        :param user: The user who triggered the export (or None).
+        :param token: The API token that triggered the export (or None).
+        :param device: The device that triggered the export (or None)
+        :param progress_callback: Callback function with progress
+        """
         self.event = event
+        self.organizer = organizer
         self.progress_callback = progress_callback
         self.is_multievent = isinstance(event, QuerySet)
+        self.permission_holder = permission_holder
         if isinstance(event, QuerySet):
             self.events = event
             self.event = None
-            self.timezone = self.events.first().timezone
+            e = self.events.first()
+            self.timezone = e.timezone if e else ZoneInfo(settings.TIME_ZONE)
         else:
             self.events = Event.objects.filter(pk=event.pk)
             self.timezone = event.timezone
+
+        if hasattr(self, 'organizer_required_permission'):
+            raise TypeError("Deprecated attribute organizer_required_permission no longer supported.")
 
     def __str__(self):
         return self.identifier
@@ -84,9 +93,42 @@ class BaseExporter:
     def verbose_name(self) -> str:
         """
         A human-readable name for this exporter. This should be short but
-        self-explaining. Good examples include 'JSON' or 'Microsoft Excel'.
+        self-explaining. Good examples include 'Orders as JSON' or 'Orders as Microsoft Excel'.
         """
         raise NotImplementedError()  # NOQA
+
+    @property
+    def description(self) -> str:
+        """
+        A description for this exporter.
+        """
+        return ""
+
+    @property
+    def category(self) -> Optional[str]:
+        """
+        A category name for this exporter, or ``None``.
+        """
+        return None
+
+    @property
+    def featured(self) -> bool:
+        """
+        If ``True``, this exporter will be highlighted.
+        """
+        return False
+
+    @property
+    def repeatable_read(self) -> bool:
+        """
+        If ``True``, this exporter will be run in a REPEATABLE READ transaction. This ensures consistent results for
+        all queries performed by the exporter, but creates a performance burden on the database server. We recommend to
+        disable this for exporters that take very long to run and do not rely on this behavior, such as export of lists
+        to CSV files.
+
+        Defaults to ``True`` for now, but default may change in future versions.
+        """
+        return True
 
     @property
     def identifier(self) -> str:
@@ -123,7 +165,7 @@ class BaseExporter:
         """
         return {}
 
-    def render(self, form_data: dict) -> Tuple[str, str, bytes]:
+    def render(self, form_data: dict) -> Tuple[str, str, Optional[bytes]]:
         """
         Render the exported file and return a tuple consisting of a filename, a file type
         and file content.
@@ -139,6 +181,38 @@ class BaseExporter:
         tasks.
         """
         raise NotImplementedError()  # NOQA
+
+    def available_for_user(self, user) -> bool:
+        """
+        Allows to do additional checks whether an exporter is available based on the user who calls it. Note that
+        ``user`` may be ``None`` e.g. during API usage.
+        """
+        return True
+
+    @classmethod
+    def get_required_event_permission(cls) -> Optional[str]:
+        """
+        The permission level required to use this exporter for events. For multi-event-exports, this will be used
+        to limit the selection of events. Will be ignored if the ``OrganizerLevelExportMixin`` mixin is used.
+        The default implementation returns ``"event.orders:read"``.
+        """
+        return 'event.orders:read'
+
+
+class OrganizerLevelExportMixin:
+    @classmethod
+    def get_required_event_permission(cls):
+        raise TypeError("required_event_permission may not be called on OrganizerLevelExportMixin")
+
+    @classmethod
+    def get_required_organizer_permission(cls) -> Optional[str]:
+        """
+        The permission level required to use this exporter. Must be set for organizer-level exports. Set to `None` to
+        allow everyone with any access to the organizer.
+
+        ``get_required_event_permission`` will be ignored on this class.
+        """
+        raise NotImplementedError()
 
 
 class ListExporter(BaseExporter):
@@ -173,10 +247,13 @@ class ListExporter(BaseExporter):
     def get_filename(self):
         return 'export'
 
+    def get_csv_encoding(self):
+        return 'utf-8'
+
     def _render_csv(self, form_data, output_file=None, **kwargs):
         if output_file:
             if 'b' in output_file.mode:
-                output_file = io.TextIOWrapper(output_file, encoding='utf-8', newline='')
+                output_file = io.TextIOWrapper(output_file, encoding=self.get_csv_encoding(), errors='replace', newline='')
             writer = csv.writer(output_file, **kwargs)
             total = 0
             counter = 0
@@ -212,13 +289,17 @@ class ListExporter(BaseExporter):
                     if counter % max(10, total // 100) == 0:
                         self.progress_callback(counter / total * 100)
                 writer.writerow(line)
-            return self.get_filename() + '.csv', 'text/csv', output.getvalue().encode("utf-8")
+            return self.get_filename() + '.csv', 'text/csv', output.getvalue().encode(self.get_csv_encoding(), errors='replace')
+
+    def prepare_xlsx_sheet(self, ws):
+        pass
 
     def _render_xlsx(self, form_data, output_file=None):
-        wb = Workbook(write_only=True)
+        wb = SafeWorkbook(write_only=True)
         ws = wb.create_sheet()
+        self.prepare_xlsx_sheet(ws)
         try:
-            ws.title = str(self.verbose_name)
+            ws.title = str(self.verbose_name)[:30]
         except:
             pass
         total = 0
@@ -228,8 +309,7 @@ class ListExporter(BaseExporter):
                 total = line.total
                 continue
             ws.append([
-                excel_safe(val) if not isinstance(val, KNOWN_TYPES) else val
-                for val in line
+                val for val in line
             ])
             if total:
                 counter += 1
@@ -334,10 +414,10 @@ class MultiSheetListExporter(ListExporter):
             return self.get_filename() + '.csv', 'text/csv', output.getvalue().encode("utf-8")
 
     def _render_xlsx(self, form_data, output_file=None):
-        wb = Workbook(write_only=True)
+        wb = SafeWorkbook(write_only=True)
         n_sheets = len(self.sheets)
         for i_sheet, (s, l) in enumerate(self.sheets):
-            ws = wb.create_sheet(str(l))
+            ws = wb.create_sheet(str(l)[:30])
             if hasattr(self, 'prepare_xlsx_sheet_' + s):
                 getattr(self, 'prepare_xlsx_sheet_' + s)(ws)
 
@@ -348,8 +428,7 @@ class MultiSheetListExporter(ListExporter):
                     total = line.total
                     continue
                 ws.append([
-                    excel_safe(val)
-                    for val in line
+                    val for val in line
                 ])
                 if total:
                     counter += 1

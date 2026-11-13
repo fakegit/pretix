@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -32,35 +32,34 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
 
-from django.dispatch import Signal
-
-from pretix.base.signals import DeprecatedSignal, EventPluginSignal
-
-html_page_start = Signal(
-    providing_args=[]
+from pretix.base.signals import (
+    DeprecatedSignal, EventPluginSignal, GlobalSignal, OrganizerPluginSignal,
 )
+
+html_page_start = GlobalSignal()
 """
 This signal allows you to put code in the beginning of the main page for every
-page in the backend. You are expected to return HTML.
+page in the backend. You are expected to return a SafeString containing HTML, or
+a string that will be HTML-escaped.
 
 The ``sender`` keyword argument will contain the request.
 """
 
-html_head = EventPluginSignal(
-    providing_args=["request"]
-)
+html_head = EventPluginSignal()
 """
+Arguments: ``request``
+
 This signal allows you to put code inside the HTML ``<head>`` tag
 of every page in the backend. You will get the request as the keyword argument
 ``request`` and are expected to return plain HTML.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 """
 
-nav_event = EventPluginSignal(
-    providing_args=["request"]
-)
+nav_event = EventPluginSignal()
 """
+Arguments: ``request``
+
 This signal allows you to add additional views to the admin panel
 navigation. You will get the request as a keyword argument ``request``.
 Receivers are expected to return a list of dictionaries. The dictionaries
@@ -79,13 +78,13 @@ The latter method also allows you to register navigation items as a sub-item of 
 If you use this, you should read the documentation on :ref:`how to deal with URLs <urlconf>`
 in pretix.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 """
 
-nav_topbar = Signal(
-    providing_args=["request"]
-)
+nav_topbar = GlobalSignal()
 """
+Arguments: ``request``
+
 This signal allows you to add additional views to the top navigation bar.
 You will get the request as a keyword argument ``request``.
 Receivers are expected to return a list of dictionaries. The dictionaries
@@ -101,10 +100,10 @@ This is no ``EventPluginSignal``, so you do not get the event in the ``sender`` 
 and you may get the signal regardless of whether your plugin is active.
 """
 
-nav_global = Signal(
-    providing_args=["request"]
-)
+nav_global = GlobalSignal()
 """
+Arguments: ``request``
+
 This signal allows you to add additional views to the navigation bar when no event is
 selected. You will get the request as a keyword argument ``request``.
 Receivers are expected to return a list of dictionaries. The dictionaries
@@ -126,42 +125,40 @@ This is no ``EventPluginSignal``, so you do not get the event in the ``sender`` 
 and you may get the signal regardless of whether your plugin is active.
 """
 
-event_dashboard_top = EventPluginSignal(
-    providing_args=['request']
-)
+event_dashboard_top = EventPluginSignal()
 """
-This signal is sent out to include custom HTML in the top part of the the event dashboard.
-Receivers should return HTML.
+Arguments: 'request'
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+This signal is sent out to include custom HTML in the top part of the the event dashboard.
+Receivers should return a SafeString containing HTML, or a string that will be HTML-escaped.
+
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 An additional keyword argument ``subevent`` *can* contain a sub-event.
 """
 
-event_dashboard_widgets = EventPluginSignal(
-    providing_args=[]
-)
+event_dashboard_widgets = EventPluginSignal()
 """
 This signal is sent out to include widgets in the event dashboard. Receivers
 should return a list of dictionaries, where each dictionary can have the keys:
 
-* content (str, containing HTML)
+* content (SafeString, containing HTML)
 * display_size (str, one of "full" (whole row), "big" (half a row) or "small"
   (quarter of a row). May be ignored on small displays, default is "small")
 * priority (int, used for ordering, higher comes first, default is 1)
 * url (str, optional, if the full widget should be a link)
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 An additional keyword argument ``subevent`` *can* contain a sub-event.
 """
 
-user_dashboard_widgets = Signal(
-    providing_args=['user']
-)
+user_dashboard_widgets = GlobalSignal()
 """
+Arguments: 'user'
+
 This signal is sent out to include widgets in the personal user dashboard. Receivers
 should return a list of dictionaries, where each dictionary can have the keys:
 
-* content (str, containing HTML)
+* content (SafeString, containing HTML)
 * display_size (str, one of "full" (whole row), "big" (half a row) or "small"
   (quarter of a row). May be ignored on small displays, default is "small")
 * priority (int, used for ordering, higher comes first, default is 1)
@@ -170,20 +167,21 @@ should return a list of dictionaries, where each dictionary can have the keys:
 This is a regular django signal (no pretix event signal).
 """
 
-voucher_form_html = EventPluginSignal(
-    providing_args=['form']
-)
+voucher_form_html = EventPluginSignal()
 """
+Arguments: 'form'
+
 This signal allows you to add additional HTML to the form that is used for modifying vouchers.
 You receive the form object in the ``form`` keyword argument.
+Receivers should return a SafeString containing HTML, or a string that will be HTML-escaped.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 """
 
-voucher_form_class = EventPluginSignal(
-    providing_args=['cls']
-)
+voucher_form_class = EventPluginSignal()
 """
+Arguments: ``cls``
+
 This signal allows you to replace the form class that is used for modifying vouchers.
 You will receive the default form class (or the class set by a previous plugin) in the
 ``cls`` argument so that you can inherit from it.
@@ -193,42 +191,54 @@ an asynchronous context. For the bulk creation form, ``save()`` is not called. I
 you can implement ``post_bulk_save(saved_vouchers)`` which may be called multiple times
 for every batch persisted to the database.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 """
 
-voucher_form_validation = EventPluginSignal(
-    providing_args=['form']
-)
+voucher_form_validation = EventPluginSignal()
 """
+Arguments: 'form'
+
 This signal allows you to add additional validation to the form that is used for
 creating and modifying vouchers. You will receive the form instance in the ``form``
 argument and the current data state in the ``data`` argument.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 """
 
-quota_detail_html = EventPluginSignal(
-    providing_args=['quota']
-)
+quota_detail_html = EventPluginSignal()
 """
+Arguments: 'quota'
+
 This signal allows you to append HTML to a Quota's detail view. You receive the
 quota as argument in the ``quota`` keyword argument.
+Receivers should return a SafeString containing HTML, or a string that will be HTML-escaped.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 """
 
-organizer_edit_tabs = DeprecatedSignal(
-    providing_args=['organizer', 'request']
-)
+subevent_detail_html = EventPluginSignal()
 """
+Arguments: 'subevent'
+
+This signal allows you to append HTML to a SubEvent's detail view. You receive the
+subevent as argument in the ``subevent`` keyword argument.
+Receivers should return a SafeString containing HTML, or a string that will be HTML-escaped.
+
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
+"""
+
+organizer_edit_tabs = DeprecatedSignal()
+"""
+Arguments: 'organizer', 'request'
+
 Deprecated signal, no longer works. We just keep the definition so old plugins don't
 break the installation.
 """
 
-nav_organizer = Signal(
-    providing_args=['organizer', 'request']
-)
+nav_organizer = OrganizerPluginSignal(allow_legacy_plugins=True)
 """
+Arguments: 'organizer', 'request'
+
 This signal is sent out to include tab links on the detail page of an organizer.
 Receivers are expected to return a list of dictionaries. The dictionaries
 should contain at least the keys ``label`` and ``url``. You should also return
@@ -245,34 +255,53 @@ If your linked view should stay in the tab-like context of this page, we recomme
 that you use ``pretix.control.views.organizer.OrganizerDetailViewMixin`` for your view
 and your template inherits from ``pretixcontrol/organizers/base.html``.
 
-This is a regular django signal (no pretix event signal). Receivers will be passed
-the keyword arguments ``organizer`` and ``request``.
+This is an organizer plugin signal (not an event-level signal). Organizer and
+hybrid plugins, will receive it if they're active for the current organizer.
+
+**Deprecation Notice:** Currently, event plugins can always receive this signal,
+regardless of activation. In the future, event plugins will not be allowed to register
+to organizer-level signals.
+
+Receivers will be passed the keyword arguments ``organizer`` and ``request``.
 """
 
-order_info = EventPluginSignal(
-    providing_args=["order", "request"]
-)
+order_info = EventPluginSignal()
 """
-This signal is sent out to display additional information on the order detail page
+Arguments: ``order``, ``request``
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+This signal is sent out to display additional information on the order detail page.
+Receivers should return a SafeString containing HTML, or a string that will be HTML-escaped.
+
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 Additionally, the argument ``order`` and ``request`` are available.
 """
 
-order_position_buttons = EventPluginSignal(
-    providing_args=["order", "position", "request"]
-)
+order_approve_info = EventPluginSignal()
 """
+Arguments: ``order``, ``request``
+
+This signal is sent out to display additional information on the order approve page.
+Receivers should return a SafeString containing HTML, or a string that will be HTML-escaped.
+
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
+Additionally, the argument ``order`` and ``request`` are available.
+"""
+
+order_position_buttons = EventPluginSignal()
+"""
+Arguments: ``order``, ``position``, ``request``
+
 This signal is sent out to display additional buttons for a single position of an order.
+Receivers should return a SafeString containing HTML, or a string that will be HTML-escaped.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 Additionally, the argument ``order`` and ``request`` are available.
 """
 
-nav_event_settings = EventPluginSignal(
-    providing_args=['request']
-)
+nav_event_settings = EventPluginSignal()
 """
+Arguments: 'request'
+
 This signal is sent out to include tab links on the settings page of an event.
 Receivers are expected to return a list of dictionaries. The dictionaries
 should contain at least the keys ``label`` and ``url``. You should also return
@@ -283,38 +312,47 @@ If your linked view should stay in the tab-like context of this page, we recomme
 that you use ``pretix.control.views.event.EventSettingsViewMixin`` for your view
 and your template inherits from ``pretixcontrol/event/settings_base.html``.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 A second keyword argument ``request`` will contain the request object.
 """
 
-event_settings_widget = EventPluginSignal(
-    providing_args=['request']
-)
+event_settings_widget = EventPluginSignal()
 """
+Arguments: 'request'
+
 This signal is sent out to include template snippets on the settings page of an event
 that allows generating a pretix Widget code.
+Receivers should return a SafeString containing HTML, or a string that will be HTML-escaped.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 A second keyword argument ``request`` will contain the request object.
 """
 
-item_forms = EventPluginSignal(
-    providing_args=['request', 'item']
-)
+item_forms = EventPluginSignal()
 """
+Arguments: 'request', 'item'
+
 This signal allows you to return additional forms that should be rendered on the product
 modification page. You are passed ``request`` and ``item`` arguments and are expected to return
 an instance of a form class that you bind yourself when appropriate. Your form will be executed
 as part of the standard validation and rendering cycle and rendered using default bootstrap
 styles. It is advisable to set a prefix for your form to avoid clashes with other plugins.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+Your forms may also have special properties:
+
+- ``template`` with a template that will be included to render the form. Your template will be passed a ``form``
+  variable with your form.
+- ``title``, which will be used as a headline.
+- ``ìs_layouts = True``, if your form should be grouped with the ticket layout settings (mutually exclusive with setting ``title``).
+- ``group_with_formset = True``, if your form should be grouped with a formset of the same ``title``
+
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 """
 
-item_formsets = EventPluginSignal(
-    providing_args=['request', 'item']
-)
+item_formsets = EventPluginSignal()
 """
+Arguments: 'request', 'item'
+
 This signal allows you to return additional formsets that should be rendered on the product
 modification page. You are passed ``request`` and ``item`` arguments and are expected to return
 an instance of a formset class that you bind yourself when appropriate. Your formset will be
@@ -326,13 +364,13 @@ Your formset needs to have two special properties: ``template`` with a template 
 included to render the formset and ``title`` that will be used as a headline. Your template
 will be passed a ``formset`` variable with your formset.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 """
 
-subevent_forms = EventPluginSignal(
-    providing_args=['request', 'subevent', 'copy_from']
-)
+subevent_forms = EventPluginSignal()
 """
+Arguments: 'request', 'subevent', 'copy_from'
+
 This signal allows you to return additional forms that should be rendered on the subevent creation
 or modification page. You are passed ``request`` and ``subevent`` arguments and are expected to return
 an instance of a form class that you bind yourself when appropriate. Your form will be executed
@@ -343,20 +381,24 @@ styles. It is advisable to set a prefix for your form to avoid clashes with othe
 your form instance will automatically being set to the subevent that has just been created. During
 creation, ``copy_from`` can be a subevent that is being copied from.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+Your forms may also have two special properties: ``template`` with a template that will be
+included to render the form, and ``title``, which will be used as a headline. Your template
+will be passed a ``form`` variable with your form.
+
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 """
 
-oauth_application_registered = Signal(
-    providing_args=["user", "application"]
-)
+oauth_application_registered = GlobalSignal()
 """
+Arguments: ``user``, ``application``
+
 This signal will be called whenever a user registers a new OAuth application.
 """
 
-order_search_filter_q = Signal(
-    providing_args=["query"]
-)
+order_search_filter_q = GlobalSignal()
 """
+Arguments: ``query``
+
 This signal will be called whenever a free-text order search is performed. You are expected to return one
 Q object that will be OR-ed with existing search queries. As order search exists on a global level as well,
 this is not an Event signal and will be called even if your plugin is not active. ``sender`` will contain the
@@ -364,10 +406,10 @@ event if the search is performed within an event, and ``None`` otherwise. The se
 ``query``.
 """
 
-order_search_forms = EventPluginSignal(
-    providing_args=['request']
-)
+order_search_forms = EventPluginSignal()
 """
+Arguments: 'request'
+
 This signal allows you to return additional forms that should be rendered in the advanced order search.
 You are passed ``request`` argument and are expected to return an instance of a form class that you bind
 yourself when appropriate. Your form will be executed as part of the standard validation and rendering
@@ -377,5 +419,5 @@ You are required to set ``prefix`` on your form instance. You are required to im
 method on your form that returns a new, filtered query set. You are required to implement a ``filter_to_strings()``
 method on your form that returns a list of strings describing the currently active filters.
 
-As with all plugin signals, the ``sender`` keyword argument will contain the event.
+As with all event plugin signals, the ``sender`` keyword argument will contain the event.
 """

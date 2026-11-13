@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,6 +19,7 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+from django.core.exceptions import ValidationError
 from django.http import Http404, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils.functional import cached_property
@@ -35,11 +36,10 @@ class DownloadView(TemplateView):
     def object(self) -> CachedFile:
         try:
             o = get_object_or_404(CachedFile, id=self.kwargs['id'], web_download=True)
-            if o.session_key:
-                if o.session_key != self.request.session.session_key:
-                    raise Http404()
+            if not o.allowed_for_session(self.request):
+                raise Http404()
             return o
-        except ValueError:   # Invalid URLs
+        except (ValueError, ValidationError):   # Invalid URLs
             raise Http404()
 
     def get(self, request: HttpRequest, *args, **kwargs) -> HttpResponse:
@@ -47,7 +47,7 @@ class DownloadView(TemplateView):
             return HttpResponse('1' if self.object.file else '0')
         elif self.object.file:
             resp = ChunkBasedFileResponse(self.object.file.file, content_type=self.object.type)
-            resp['Content-Disposition'] = 'attachment; filename="{}"'.format(self.object.filename)
+            resp['Content-Disposition'] = 'attachment; filename="{}"'.format(self.object.filename).encode('ascii', 'ignore')
             return resp
         else:
             return super().get(request, *args, **kwargs)

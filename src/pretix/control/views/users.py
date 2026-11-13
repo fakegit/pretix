@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,27 +19,57 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import hmac
 import json
+from contextlib import contextmanager
 
 from django.conf import settings
 from django.contrib import messages
+from django.contrib.auth import (
+    BACKEND_SESSION_KEY, HASH_SESSION_KEY, get_user_model, load_backend, login,
+    logout,
+)
 from django.contrib.auth.mixins import LoginRequiredMixin
+from django.contrib.auth.views import redirect_to_login
+from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse
+from django.utils.crypto import get_random_string, salted_hmac
 from django.utils.functional import cached_property
 from django.utils.translation import gettext_lazy as _
 from django.views import View
 from django.views.generic import ListView, TemplateView
-from hijack.helpers import login_user, release_hijack
+from django_otp import devices_for_user
+from django_otp.plugins.otp_static.models import StaticDevice
+from hijack import signals
 
 from pretix.base.auth import get_auth_backends
 from pretix.base.models import User
-from pretix.base.services.mail import SendMailException
 from pretix.control.forms.filter import UserFilterForm
 from pretix.control.forms.users import UserEditForm
 from pretix.control.permissions import AdministratorPermissionRequiredMixin
 from pretix.control.views import CreateView, UpdateView
 from pretix.control.views.user import RecentAuthenticationRequiredMixin
+
+
+def get_used_backend(request):
+    # vendored from hijack/views.py
+    backend_str = request.session[BACKEND_SESSION_KEY]
+    backend = load_backend(backend_str)
+    return backend
+
+
+@contextmanager
+def keep_session_age(session):
+    # vendored from hijack/views.py
+    try:
+        session_expiry = session["_session_expiry"]
+    except KeyError:
+        yield
+    else:
+        yield
+        session["_session_expiry"] = session_expiry
 
 
 class UserListView(AdministratorPermissionRequiredMixin, ListView):
@@ -78,11 +108,15 @@ class UserEditView(AdministratorPermissionRequiredMixin, RecentAuthenticationReq
         ctx['backend'] = (
             b[self.object.auth_backend].verbose_name if self.object.auth_backend in b else self.object.auth_backend
         )
+
+        ctx['devices'] = devices_for_user(self.object)
+
         return ctx
 
     def get_success_url(self):
         return reverse('control:users.edit', kwargs=self.kwargs)
 
+    @transaction.atomic
     def form_valid(self, form):
         messages.success(self.request, _('Your changes have been saved.'))
 
@@ -112,15 +146,60 @@ class UserResetView(AdministratorPermissionRequiredMixin, RecentAuthenticationRe
 
     def post(self, request, *args, **kwargs):
         self.object = get_object_or_404(User, pk=self.kwargs.get("id"))
-        try:
-            self.object.send_password_reset()
-        except SendMailException:
-            messages.error(request, _('There was an error sending the mail. Please try again later.'))
-            return redirect(self.get_success_url())
+        self.object.send_password_reset()
 
         self.object.log_action('pretix.control.auth.user.forgot_password.mail_sent',
                                user=request.user)
-        messages.success(request, _('We sent out an e-mail containing further instructions.'))
+        messages.success(request, _('We sent out an email containing further instructions.'))
+        return redirect(self.get_success_url())
+
+    def get_success_url(self):
+        return reverse('control:users.edit', kwargs=self.kwargs)
+
+
+class UserEmergencyTokenView(AdministratorPermissionRequiredMixin, RecentAuthenticationRequiredMixin, View):
+
+    def get(self, request, *args, **kwargs):
+        return redirect(reverse('control:users.edit', kwargs=self.kwargs))
+
+    def post(self, request, *args, **kwargs):
+        self.object = get_object_or_404(User, pk=self.kwargs.get("id"))
+
+        d, __ = StaticDevice.objects.get_or_create(user=self.object, name='emergency')
+        token = d.token_set.create(token=get_random_string(length=12, allowed_chars='1234567890'))
+        self.object.log_action('pretix.user.settings.2fa.emergency', user=self.request.user)
+        self.object.send_security_notice([
+            _('A two-factor emergency code has been generated by a system administrator. This will usually happen '
+              'if you lost access to your two-factor credentials and requested a reset of the credentials.')
+        ])
+
+        messages.success(request, _(
+            'The emergency token for this user is "{token}". It can only be used once. Please make sure to transmit '
+            'this code only over an authenticated channel (other than email, if possible). Any previous emergency '
+            'tokens for this user remain active.'
+        ).format(
+            token=token.token
+        ))
+
+        return redirect(self.get_success_url())
+
+    def get_success_url(self):
+        return reverse('control:users.edit', kwargs=self.kwargs)
+
+
+class Reset2FADriftThrottleView(AdministratorPermissionRequiredMixin, RecentAuthenticationRequiredMixin, View):
+
+    def get(self, request, *args, **kwargs):
+        return redirect(reverse('control:users.edit', kwargs=self.kwargs))
+
+    def post(self, request, *args, **kwargs):
+        self.object = get_object_or_404(User, pk=self.kwargs.get("id"))
+        self.object.totpdevice_set.update(drift=0, throttling_failure_timestamp=None, throttling_failure_count=0)
+        self.object.staticdevice_set.update(throttling_failure_timestamp=None, throttling_failure_count=0)
+        self.object.log_action('pretix.user.settings.2fa.resetdrift', user=self.request.user)
+        messages.success(request, _(
+            'The drift values for TOTP devices have been reset.'
+        ))
         return redirect(self.get_success_url())
 
     def get_success_url(self):
@@ -139,10 +218,12 @@ class UserAnonymizeView(AdministratorPermissionRequiredMixin, RecentAuthenticati
         self.object = get_object_or_404(User, pk=self.kwargs.get("id"))
         self.object.log_action('pretix.user.anonymized',
                                user=request.user)
-        self.object.email = "{}@disabled.pretix.eu".format(self.object.pk)
+        self.object.email = "{}.{}@disabled.pretix.eu".format(self.object.pk, self.object.auth_backend)
         self.object.fullname = ""
         self.object.is_active = False
         self.object.notifications_send = False
+        self.object.auth_backend = 'anonymized'
+        self.object.auth_backend_identifier = None
         self.object.save()
         for le in self.object.all_logentries.filter(action_type="pretix.user.settings.changed"):
             d = le.parsed_data
@@ -164,14 +245,51 @@ class UserImpersonateView(AdministratorPermissionRequiredMixin, RecentAuthentica
 
     def post(self, request, *args, **kwargs):
         self.object = get_object_or_404(User, pk=self.kwargs.get("id"))
+        staff_session = request.user.get_active_staff_session(request.session.session_key)
         self.request.user.log_action('pretix.control.auth.user.impersonated',
                                      user=request.user,
                                      data={
                                          'other': self.kwargs.get("id"),
-                                         'other_email': self.object.email
+                                         'other_email': self.object.email,
+                                         'staff_session': staff_session.pk,
                                      })
         oldkey = request.session.session_key
-        login_user(request, self.object)
+
+        hijacker = request.user
+        hijacked = self.object
+
+        hijack_history = request.session.get("hijack_history", [])
+        hijack_history.append({
+            "user": request.user.pk,
+            # We include the auth_hash, because it is unguessable. So should an attacker gain an attack vector to
+            # modify hijack_history, they can't just insert or change a user that shouldn't be there. We HMAC it
+            # again, though, since we also do not want the auth_hash of the admin user to be in the session of an
+            # unprivileged user to contain the risk if there is some leak of session data.
+            "auth_hash": salted_hmac(key_salt=b"hijack-history-hash", value=request.session[HASH_SESSION_KEY],
+                                     algorithm="sha256", secret=settings.SECRET_KEY).hexdigest(),
+        })
+
+        backend = get_used_backend(request)
+        backend = f"{backend.__module__}.{backend.__class__.__name__}"
+
+        with signals.no_update_last_login(), keep_session_age(request.session):
+            login(request, hijacked, backend=backend)
+
+        request.session.save()
+        staff_session.logs.create(
+            method='(NOTE)',
+            url=f'Begin impersonating user #{hijacked.pk} (request session {oldkey[:8]} -> {request.session.session_key[:8]})',
+        )
+
+        request.session["hijack_history"] = hijack_history
+
+        signals.hijack_started.send(
+            sender=None,
+            request=request,
+            hijacker=hijacker,
+            hijacked=hijacked,
+        )
+
         request.session['hijacker_session'] = oldkey
         return redirect(reverse('control:index'))
 
@@ -179,20 +297,58 @@ class UserImpersonateView(AdministratorPermissionRequiredMixin, RecentAuthentica
 class UserImpersonateStopView(LoginRequiredMixin, View):
 
     def post(self, request, *args, **kwargs):
-        impersonated = request.user
-        hijs = request.session['hijacker_session']
-        release_hijack(request)
-        ss = request.user.get_active_staff_session(hijs)
-        if ss:
-            request.session.save()
-            ss.session_key = request.session.session_key
-            ss.save()
+        staff_session_key = request.session['hijacker_session']
+        prev_session_key = request.session.session_key
+        hijack_history = request.session.get("hijack_history", [])
+        hijacked = request.user
+        prev_session = hijack_history.pop()
+        hijacker = get_object_or_404(get_user_model(), pk=prev_session["user"])
+        staff_session = hijacker.get_active_staff_session(staff_session_key)
+        if not staff_session:
+            raise PermissionDenied
+
+        expected_hash = salted_hmac(
+            key_salt=b"hijack-history-hash",
+            value=hijacker.get_session_auth_hash(),
+            algorithm="sha256",
+            secret=settings.SECRET_KEY
+        ).hexdigest()
+        if not hmac.compare_digest(expected_hash, prev_session["auth_hash"]):
+            # Could be an attacker-controlled hijack history, but could also be e.g. a password change of the admin user
+            # that happened during the hijack session
+            logout(request)
+            return redirect_to_login(request.get_full_path())
+
+        backend = get_used_backend(request)
+        backend = f"{backend.__module__}.{backend.__class__.__name__}"
+        with signals.no_update_last_login(), keep_session_age(request.session):
+            login(request, hijacker, backend=backend)
+
+        request.session["hijack_history"] = hijack_history
+
+        signals.hijack_ended.send(
+            sender=None,
+            request=request,
+            hijacker=hijacker,
+            hijacked=hijacked,
+        )
+
+        request.session.save()
+        staff_session.session_key = request.session.session_key
+        staff_session.save()
+
+        staff_session.logs.create(
+            method='(NOTE)',
+            url=f'Stop impersonating user #{hijacked.pk} (request session {prev_session_key[:8]}, '
+                f'staff session {staff_session_key[:8]} -> {request.session.session_key[:8]})',
+        )
 
         request.user.log_action('pretix.control.auth.user.impersonate_stopped',
                                 user=request.user,
                                 data={
-                                    'other': impersonated.pk,
-                                    'other_email': impersonated.email
+                                    'other': hijacked.pk,
+                                    'other_email': hijacked.email,
+                                    'staff_session': staff_session.pk,
                                 })
         return redirect(reverse('control:index'))
 

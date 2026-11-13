@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -33,43 +33,53 @@
 # License for the specific language governing permissions and limitations under the License.
 
 from django.conf import settings
-from django.conf.urls import include, url
+from django.conf.urls.static import static
+from django.urls import include, re_path
 from django.views.generic import RedirectView
 
 import pretix.control.urls
 import pretix.presale.urls
-from pretix.base.views import js_helpers
+from pretix.base.views import applepay, js_helpers
 
 from .base.views import (
     cachedfiles, csp, health, js_catalog, metrics, redirect, source,
+    webmanifest,
 )
 
 base_patterns = [
-    url(r'^download/(?P<id>[^/]+)/$', cachedfiles.DownloadView.as_view(),
-        name='cachedfile.download'),
-    url(r'^healthcheck/$', health.healthcheck,
-        name='healthcheck'),
-    url(r'^redirect/$', redirect.redir_view, name='redirect'),
-    url(r'^jsi18n/(?P<lang>[a-zA-Z-_]+)/$', js_catalog.js_catalog, name='javascript-catalog'),
-    url(r'^metrics$', metrics.serve_metrics,
-        name='metrics'),
-    url(r'^csp_report/$', csp.csp_report, name='csp.report'),
-    url(r'^agpl_source$', source.get_source, name='source'),
-    url(r'^js_helpers/states/$', js_helpers.states, name='js_helpers.states'),
-    url(r'^api/v1/', include(('pretix.api.urls', 'pretixapi'), namespace='api-v1')),
-    url(r'^api/$', RedirectView.as_view(url='/api/v1/'), name='redirect-api-version')
+    re_path(r'^download/(?P<id>[^/]+)/$', cachedfiles.DownloadView.as_view(),
+            name='cachedfile.download'),
+    re_path(r'^healthcheck/$', health.healthcheck,
+            name='healthcheck'),
+    re_path(r'^redirect/$', redirect.redir_view, name='redirect'),
+    re_path(r'^site.webmanifest$', webmanifest.webmanifest, name='site.webmanifest'),
+    re_path(r'^jsi18n/(?P<lang>[a-zA-Z0-9_-]+)/$', js_catalog.js_catalog, name='javascript-catalog'),
+    re_path(r'^metrics$', metrics.serve_metrics,
+            name='metrics'),
+    re_path(r'^csp_report/$', csp.csp_report, name='csp.report'),
+    re_path(r'^agpl_source$', source.get_source, name='source'),
+
+    re_path(r'^js_helpers/address_form/$', js_helpers.address_form, name='js_helpers.address_form'),
+    # deprecated name, keep for compatibility with old plugins
+    re_path(r'^js_helpers/states/$', js_helpers.address_form, name='js_helpers.states'),
+
+    re_path(r'^api/v1/', include(('pretix.api.urls', 'pretixapi'), namespace='api-v1')),
+    re_path(r'^api/$', RedirectView.as_view(url='/api/v1/'), name='redirect-api-version'),
+    re_path(r'^.well-known/apple-developer-merchantid-domain-association$',
+            applepay.association, name='applepay.association'),
 ]
 
 control_patterns = [
-    url(r'^control/', include((pretix.control.urls, 'control'))),
+    re_path(r'^control/', include((pretix.control.urls, 'control'))),
 ]
 
 debug_patterns = []
 if settings.DEBUG:
+    base_patterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
     try:
         import debug_toolbar
 
-        debug_patterns.append(url(r'^__debug__/', include(debug_toolbar.urls)))
+        debug_patterns.append(re_path(r'^__debug__/', include(debug_toolbar.urls)))
     except ImportError:
         pass
 

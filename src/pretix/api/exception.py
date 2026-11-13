@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,10 +19,16 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import logging
+
+import ujson
+from rest_framework import exceptions
 from rest_framework.response import Response
 from rest_framework.views import exception_handler, status
 
 from pretix.base.services.locking import LockTimeoutException
+
+logger = logging.getLogger(__name__)
 
 
 def custom_exception_handler(exc, context):
@@ -36,5 +42,8 @@ def custom_exception_handler(exc, context):
                 'Retry-After': 5
             }
         )
+
+    if isinstance(exc, exceptions.APIException):
+        logger.info(f'API Exception [{exc.status_code}]: {ujson.dumps(exc.detail)}')
 
     return response

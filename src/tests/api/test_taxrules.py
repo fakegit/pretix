@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -27,11 +27,16 @@ from django_scopes import scopes_disabled
 from pretix.base.models import TaxRule
 
 TEST_TAXRULE_RES = {
+    'internal_name': None,
+    'keep_gross_if_rate_changes': False,
     'name': {'en': 'VAT'},
     'rate': '19.00',
+    'default': True,
+    'code': 'S/standard',
     'price_includes_tax': True,
     'eu_reverse_charge': False,
-    'home_country': ''
+    'home_country': '',
+    'custom_rules': None,
 }
 
 
@@ -56,17 +61,21 @@ def test_rule_detail(token_client, organizer, event, taxrule):
 
 @pytest.mark.django_db
 def test_rule_create(token_client, organizer, event):
-    resp = token_client.post(
-        '/api/v1/organizers/{}/events/{}/taxrules/'.format(organizer.slug, event.slug),
-        {
-            "name": {"en": "VAT", "de": "MwSt"},
-            "rate": "19.00",
-            "price_includes_tax": True,
-            "eu_reverse_charge": False,
-            "home_country": "DE"
-        },
-        format='json'
-    )
+    url = '/api/v1/organizers/{}/events/{}/taxrules/'.format(organizer.slug, event.slug)
+    payload = {
+        "name": {"en": "VAT", "de": "MwSt"},
+        "rate": "19.00",
+        "price_includes_tax": True,
+        "eu_reverse_charge": False,
+        "home_country": "DE",
+        "default": False,
+    }
+    # fail as only one rule exists and must be default
+    resp = token_client.post(url, payload, format='json')
+    assert resp.status_code == 400
+
+    del payload["default"]
+    resp = token_client.post(url, payload, format='json')
     assert resp.status_code == 201
     rule = TaxRule.objects.get(pk=resp.data['id'])
     assert rule.name.data == {"en": "VAT", "de": "MwSt"}
@@ -74,6 +83,46 @@ def test_rule_create(token_client, organizer, event):
     assert rule.price_includes_tax is True
     assert rule.eu_reverse_charge is False
     assert str(rule.home_country) == "DE"
+    assert rule.default is True
+
+
+@pytest.mark.django_db
+def test_rule_create_auto_default(token_client, organizer, event):
+    resp = token_client.post(
+        '/api/v1/organizers/{}/events/{}/taxrules/'.format(organizer.slug, event.slug),
+        {
+            "name": {"en": "VAT", "de": "MwSt"},
+            "rate": "19.00",
+            "price_includes_tax": True,
+            "eu_reverse_charge": False,
+            "home_country": "DE",
+        },
+        format='json'
+    )
+    assert resp.status_code == 201
+    rule = TaxRule.objects.get(pk=resp.data['id'])
+    assert rule.default
+
+
+@pytest.mark.django_db
+def test_rule_create_only_one_default(token_client, taxrule, organizer, event):
+    assert taxrule.default
+    resp = token_client.post(
+        '/api/v1/organizers/{}/events/{}/taxrules/'.format(organizer.slug, event.slug),
+        {
+            "name": {"en": "VAT", "de": "MwSt"},
+            "rate": "19.00",
+            "price_includes_tax": True,
+            "eu_reverse_charge": False,
+            "home_country": "DE",
+            "default": True,
+        },
+        format='json'
+    )
+    assert resp.status_code == 201
+
+    taxrule.refresh_from_db()
+    assert not taxrule.default
 
 
 @pytest.mark.django_db
@@ -82,6 +131,10 @@ def test_rule_update(token_client, organizer, event, taxrule):
         '/api/v1/organizers/{}/events/{}/taxrules/{}/'.format(organizer.slug, event.slug, taxrule.pk),
         {
             "rate": "20.00",
+            "custom_rules": [
+                {"country": "AT", "address_type": "", "action": "vat", "rate": "19.00",
+                 "invoice_text": {"en": "Austrian VAT applies"}}
+            ]
         },
         format='json'
     )
@@ -109,3 +162,20 @@ def test_rule_delete_forbidden(token_client, organizer, event, taxrule):
     )
     assert resp.status_code == 403
     assert event.tax_rules.exists()
+
+
+@pytest.mark.django_db
+def test_rule_update_invalid_rules(token_client, organizer, event, taxrule):
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/taxrules/{}/'.format(organizer.slug, event.slug, taxrule.pk),
+        {
+            "custom_rules": [
+                {"foo": "bar"}
+            ]
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.data["custom_rules"][0].startswith(
+        "Your set of rules is not valid. Error message: 'country' is a required property"
+    )

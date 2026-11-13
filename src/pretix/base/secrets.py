@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -22,6 +22,9 @@
 import base64
 import inspect
 import struct
+from collections import namedtuple
+from datetime import datetime
+from typing import Optional
 
 from cryptography.hazmat.backends.openssl.backend import Backend
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -29,14 +32,15 @@ from cryptography.hazmat.primitives.serialization import (
     Encoding, NoEncryption, PrivateFormat, PublicFormat, load_pem_private_key,
     load_pem_public_key,
 )
-from django.conf import settings
 from django.dispatch import receiver
 from django.utils.crypto import get_random_string
-from django.utils.translation import ugettext_lazy as _
+from django.utils.translation import gettext_lazy as _
 
 from pretix.base.models import Item, ItemVariation, SubEvent
 from pretix.base.secretgenerators import pretix_sig1_pb2
 from pretix.base.signals import register_ticket_secret_generators
+
+ParsedSecret = namedtuple('AnalyzedSecret', 'item variation subevent attendee_name opaque_id')
 
 
 class BaseTicketSecretGenerator:
@@ -73,11 +77,21 @@ class BaseTicketSecretGenerator:
         """
         return False
 
+    def parse_secret(self, secret: str) -> Optional[ParsedSecret]:
+        """
+        Given a ``secret``, return an ``ParsedSecret`` with the information decoded from the secret, if possible.
+        Any value of ``ParsedSecret`` may be ``None``, and if parsing is not possible at all, you can ``None`` (as
+        the default implementation does).
+        """
+        return None
+
     def generate_secret(self, item: Item, variation: ItemVariation = None, subevent: SubEvent = None,
-                        attendee_name: str = None, current_secret: str = None, force_invalidate=False) -> str:
+                        attendee_name: str = None, valid_from: datetime = None, valid_until: datetime = None,
+                        current_secret: str = None, force_invalidate=False) -> str:
         """
         Generate a new secret for a ticket with product ``item``, variation ``variation``, subevent ``subevent``,
-        attendee name ``attendee_name`` (can be ``None``) and the current secret ``current_secret`` (if any).
+        attendee name ``attendee_name`` (can be ``None``), earliest validity ``valid_from``, lastest validity
+         ``valid_until``, and the current secret ``current_secret`` (if any).
 
         The result must be a string that should only contain the characters ``A-Za-z0-9+/=``.
 
@@ -107,11 +121,12 @@ class RandomTicketSecretGenerator(BaseTicketSecretGenerator):
     use_revocation_list = False
 
     def generate_secret(self, item: Item, variation: ItemVariation = None, subevent: SubEvent = None,
-                        attendee_name: str = None, current_secret: str = None, force_invalidate=False):
+                        attendee_name: str = None, valid_from: datetime = None, valid_until: datetime = None,
+                        current_secret: str = None, force_invalidate=False) -> str:
         if current_secret and not force_invalidate:
             return current_secret
         return get_random_string(
-            length=settings.ENTROPY['ticket_secret'],
+            length=self.event.settings.ticket_secret_length,
             # Exclude o,0,1,i,l to avoid confusion with bad fonts/printers
             allowed_chars='abcdefghjkmnpqrstuvwxyz23456789'
         )
@@ -132,8 +147,8 @@ class Sig1TicketSecretGenerator(BaseTicketSecretGenerator):
     The resulting string is REVERSED, to avoid all secrets of same length beginning with the same 10
     characters, which would make it impossible to search for secrets manually.
     """
-    verbose_name = _('pretix signature scheme 1 (for very large events, does not work with pretixSCAN on iOS and '
-                     'changes semantics of offline scanning – please refer to documentation or support for details)')
+    verbose_name = _('pretix signature scheme 1 (for very large events, changes semantics of offline scanning – '
+                     'please refer to documentation or support for details)')
     identifier = 'pretix_sig1'
     use_revocation_list = True
 
@@ -182,15 +197,32 @@ class Sig1TicketSecretGenerator(BaseTicketSecretGenerator):
         except:
             return None
 
+    def parse_secret(self, secret: str) -> Optional[ParsedSecret]:
+        ticket = self._parse(secret)
+        if ticket:
+            item = self.event.items.filter(pk=ticket.item).first() if ticket.item else None
+            subevent = self.event.subevents.filter(pk=ticket.subevent).first() if ticket.subevent else None
+            variation = item.variations.filter(pk=ticket.variation).first() if item and ticket.subevent else None
+            opaque_id = ticket.seed
+            return self.ParsedSecret(item=item, subevent=subevent, variation=variation, opaque_id=opaque_id, attendee_name=None)
+
+    def _encode_time(self, t):
+        if t is None:
+            return 0
+        return int(t.timestamp())
+
     def generate_secret(self, item: Item, variation: ItemVariation = None, subevent: SubEvent = None,
-                        current_secret: str = None, force_invalidate=False):
+                        attendee_name: str = None, valid_from: datetime = None, valid_until: datetime = None,
+                        current_secret: str = None, force_invalidate=False) -> str:
         if current_secret and not force_invalidate:
             ticket = self._parse(current_secret)
             if ticket:
                 unchanged = (
                     ticket.item == item.pk and
                     ticket.variation == (variation.pk if variation else 0) and
-                    ticket.subevent == (subevent.pk if subevent else 0)
+                    ticket.subevent == (subevent.pk if subevent else 0) and
+                    ticket.validFromUnixTime == self._encode_time(valid_from) and
+                    ticket.validUntilUnixTime == self._encode_time(valid_until)
                 )
                 if unchanged:
                     return current_secret
@@ -200,6 +232,8 @@ class Sig1TicketSecretGenerator(BaseTicketSecretGenerator):
         t.item = item.pk
         t.variation = variation.pk if variation else 0
         t.subevent = subevent.pk if subevent else 0
+        t.validFromUnixTime = self._encode_time(valid_from)
+        t.validUntilUnixTime = self._encode_time(valid_until)
         payload = t.SerializeToString()
         result = base64.b64encode(self._sign_payload(payload)).decode()[::-1]
         return result
@@ -211,13 +245,23 @@ def recv_classic(sender, **kwargs):
 
 
 def assign_ticket_secret(event, position, force_invalidate_if_revokation_list_used=False, force_invalidate=False, save=True):
+    if position.pk and position.issued_gift_cards.exists():
+        return
+
     gen = event.ticket_secret_generator
     if gen.use_revocation_list and force_invalidate_if_revokation_list_used:
         force_invalidate = True
 
     kwargs = {}
-    if 'attendee_name' in inspect.signature(gen.generate_secret).parameters:
+    params = inspect.signature(gen.generate_secret).parameters
+    if 'attendee_name' in params:
         kwargs['attendee_name'] = position.attendee_name
+    if 'valid_from' in params:
+        kwargs['valid_from'] = position.valid_from
+    if 'valid_until' in params:
+        kwargs['valid_until'] = position.valid_until
+    if 'order_datetime' in params:
+        kwargs['order_datetime'] = position.order.datetime
     secret = gen.generate_secret(
         item=position.item,
         variation=position.variation,
@@ -227,7 +271,7 @@ def assign_ticket_secret(event, position, force_invalidate_if_revokation_list_us
         **kwargs
     )
     changed = position.secret != secret
-    if position.secret and changed and gen.use_revocation_list:
+    if position.secret and changed and gen.use_revocation_list and position.pk:
         position.revoked_secrets.create(event=event, secret=position.secret)
     position.secret = secret
     if save and changed:

@@ -3,6 +3,7 @@
 {% load bootstrap3 %}
 {% load static %}
 {% load compress %}
+{% load vite %}
 {% block title %}
     {% if checkinlist %}
         {% blocktrans with name=checkinlist.name %}Check-in list: {{ name }}{% endblocktrans %}
@@ -12,7 +13,15 @@
 {% endblock %}
 {% block inside %}
     {% if checkinlist %}
-        <h1>{% blocktrans with name=checkinlist.name %}Check-in list: {{ name }}{% endblocktrans %}</h1>
+        <h1>
+            {% blocktrans with name=checkinlist.name %}Check-in list: {{ name }}{% endblocktrans %}
+            <a href="{% url "control:event.orders.checkinlists.simulator" event=request.event.slug organizer=request.event.organizer.slug list=checkinlist.pk %}"
+               target="_blank"
+               class="btn btn-default">
+                <span class="fa fa-flask"></span>
+                {% trans "Check-in simulator" %}
+            </a>
+        </h1>
     {% else %}
         <h1>{% trans "Check-in list" %}</h1>
     {% endif %}
@@ -21,6 +30,8 @@
                 id="product-select2">{% url "control:event.items.select2" event=request.event.slug organizer=request.organizer.slug %}</script>
         <script type="text/plain"
                 id="variations-select2">{% url "control:event.items.variations.select2" event=request.event.slug organizer=request.organizer.slug %}</script>
+        <script type="text/plain"
+                id="gates-select2">{% url "control:organizer.gates.select2" organizer=request.organizer.slug %}</script>
         {% csrf_token %}
         {% bootstrap_form_errors form %}
         <div class="tabbed-form">
@@ -48,25 +59,24 @@
                         Make sure to always use the latest version of our scanning apps for these options to work.
                     {% endblocktrans %}
                     <br>
-                    <strong>
-                        {% blocktrans trimmed %}
-                            If you make use of these advanced options, we recommend using our Android and Desktop apps.
-                            Custom check-in rules do not work offline with our iOS scanning app.
-                        {% endblocktrans %}
-                    </strong>
+                    {% blocktrans trimmed %}
+                        If you make use of these advanced options, we recommend using our Android and Desktop apps.
+                    {% endblocktrans %}
                 </div>
 
                 {% bootstrap_field form.allow_multiple_entries layout="control" %}
                 {% bootstrap_field form.allow_entry_after_exit layout="control" %}
+                {% bootstrap_field form.addon_match layout="control" %}
                 {% bootstrap_field form.exit_all_at layout="control" %}
-                {% bootstrap_field form.auto_checkin_sales_channels layout="control" %}
                 {% if form.gates %}
                     {% bootstrap_field form.gates layout="control" %}
                 {% endif %}
+                {% bootstrap_field form.consider_tickets_used layout="control" %}
+                {% bootstrap_field form.ignore_in_statistics layout="control" %}
 
                 <h3>{% trans "Custom check-in rule" %}</h3>
-                <div id="rules-editor" class="form-inline">
-                    <checkin-rules-editor></checkin-rules-editor>
+                <div id="rules-editor">
+                    <!-- Vue app mount point -->
                 </div>
                 <div class="disabled-withoutjs sr-only">
                     {{ form.rules }}
@@ -79,8 +89,22 @@
             </button>
         </div>
     </form>
+    {% if items %}
+        {{ items|json_script:"items" }}
+    {% endif %}
+
     {% compress js %}
-        <script type="text/javascript" src="{% static "vuejs/vue.js" %}"></script>
-        <script type="text/javascript" src="{% static "pretixcontrol/js/ui/checkinrules.js" %}"></script>
+        <script type="text/javascript" src="{% static "d3/d3.v6.js" %}"></script>
+        <script type="text/javascript" src="{% static "d3/d3-color.v2.js" %}"></script>
+        <script type="text/javascript" src="{% static "d3/d3-dispatch.v2.js" %}"></script>
+        <script type="text/javascript" src="{% static "d3/d3-ease.v2.js" %}"></script>
+        <script type="text/javascript" src="{% static "d3/d3-interpolate.v2.js" %}"></script>
+        <script type="text/javascript" src="{% static "d3/d3-selection.v2.js" %}"></script>
+        <script type="text/javascript" src="{% static "d3/d3-timer.v2.js" %}"></script>
+        <script type="text/javascript" src="{% static "d3/d3-transition.v2.js" %}"></script>
+        <script type="text/javascript" src="{% static "d3/d3-drag.v2.js" %}"></script>
+        <script type="text/javascript" src="{% static "d3/d3-zoom.v2.js" %}"></script>
     {% endcompress %}
+    {% vite_hmr %}
+    {% vite_asset "src/pretix/static/pretixcontrol/js/ui/checkinrules/index.ts" %}
 {% endblock %}

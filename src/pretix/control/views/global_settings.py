@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -31,16 +31,19 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the Apache License 2.0 is
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
+from importlib import metadata as metadata
 
-import pkg_resources
+from django.conf import settings
 from django.contrib import messages
-from django.http import JsonResponse
+from django.db import transaction
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, reverse
 from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
 from django.views import View
 from django.views.generic import FormView, TemplateView
 
+from pretix.base.i18n import language
 from pretix.base.models import LogEntry, OrderPayment, OrderRefund
 from pretix.base.services.update_check import check_result_table, update_check
 from pretix.base.settings import GlobalSettingsObject
@@ -50,12 +53,14 @@ from pretix.control.forms.global_settings import (
 from pretix.control.permissions import (
     AdministratorPermissionRequiredMixin, StaffMemberRequiredMixin,
 )
+from pretix.control.sysreport import SysReport
 
 
 class GlobalSettingsView(AdministratorPermissionRequiredMixin, FormView):
     template_name = 'pretixcontrol/global_settings.html'
     form_class = GlobalSettingsForm
 
+    @transaction.atomic
     def form_valid(self, form):
         form.save()
         messages.success(self.request, _('Your changes have been saved.'))
@@ -106,7 +111,18 @@ class MessageView(TemplateView):
 class LogDetailView(AdministratorPermissionRequiredMixin, View):
     def get(self, request, *args, **kwargs):
         le = get_object_or_404(LogEntry, pk=request.GET.get('pk'))
-        return JsonResponse({'data': le.parsed_data})
+        try:
+            object_repr = repr(le.content_object)
+        except Exception as e:
+            object_repr = 'Error: ' + str(e)
+        return JsonResponse({
+            'datetime': le.datetime.isoformat(),
+            'action_type': le.action_type,
+            'content_type': str(le.content_type),
+            'object_id': le.object_id,
+            'object_repr': object_repr,
+            'data': le.parsed_data,
+        })
 
 
 class PaymentDetailView(AdministratorPermissionRequiredMixin, View):
@@ -132,11 +148,14 @@ class LicenseCheckView(StaffMemberRequiredMixin, FormView):
         if not d:
             d['source_notice'] = 'pretix (AGPLv3 with additional terms): https://github.com/pretix/pretix'
             seen = set()
-            for entry_point in pkg_resources.iter_entry_points(group='pretix.plugin', name=None):
-                if entry_point.dist.key not in seen:
-                    license, url = self._get_license_for_pkg(entry_point.dist.key)
-                    d['source_notice'] += f'\n{entry_point.dist.key} ({license}): {url}'
-                    seen.add(entry_point.dist.key)
+            for entry_point in metadata.entry_points(group='pretix.plugin'):
+                if entry_point.dist.name not in seen:
+                    try:
+                        license, url = self._get_license_for_pkg(entry_point.dist.name)
+                    except FileNotFoundError:
+                        license, url = '?', '?'
+                    d['source_notice'] += f'\n{entry_point.dist.name} ({license}): {url}'
+                    seen.add(entry_point.dist.name)
 
         return d
 
@@ -165,17 +184,20 @@ class LicenseCheckView(StaffMemberRequiredMixin, FormView):
     def _get_license_for_pkg(self, pkg):
         license, url = None, None
         try:
-            pkgs = pkg_resources.require(pkg)
-            pkg = pkgs[0]
+            pkg = metadata.distribution(pkg)
         except:
             return None, None
-        for line in pkg.get_metadata_lines('PKG-INFO'):
-            if ': ' in line:
-                (k, v) = line.split(': ', 1)
+        try:
+            for k, v in pkg.metadata.items():
+                if k == "License-Expression":
+                    license = v
                 if k == "License":
                     license = v
                 if k == "Home-page":
                     url = v
+        except FileNotFoundError:
+            license = '?'
+            url = '?'
         return license, url
 
     def _check_results(self, input):
@@ -226,35 +248,57 @@ class LicenseCheckView(StaffMemberRequiredMixin, FormView):
                       'restrictions). Make sure to keep it up to date!')
                 ))
 
-        for entry_point in pkg_resources.iter_entry_points(group='pretix.plugin', name=None):
-            license, url = self._get_license_for_pkg(entry_point.dist.key)
+        for entry_point in metadata.entry_points(group='pretix.plugin'):
+            license, url = self._get_license_for_pkg(entry_point.dist.name)
+
+            if not license or not any(l in license for l in ('Apache', 'MIT', 'BSD', 'pretix Enterprise', 'GPL')):
+                res.append((
+                    'muted', 'warning',
+                    _('We found the plugin "{plugin}" with license "{license}" which this tool does not know about and '
+                      'therefore cannot give any recommendations.').format(plugin=entry_point.dist.name, license=license)
+                ))
+                continue
 
             if not input.get('plugins_enterprise') and 'pretix Enterprise' in license:
                 res.append((
                     'danger', 'exclamation-circle',
                     _('You selected that you have no active pretix Enterprise licenses, but we found the following '
-                      'Enterprise plugin: {plugin}').format(plugin=entry_point.dist.key)
+                      'Enterprise plugin: {plugin}').format(plugin=entry_point.dist.name)
                 ))
 
             if not input.get('plugins_copyleft') and any(l in license for l in ('GPL',)):
                 res.append((
                     'danger', 'exclamation-circle',
                     _('You selected that you have no copyleft-licensed plugins installed, but we found the '
-                      'plugin "{plugin}" with license "{license}".').format(plugin=entry_point.dist.key, license=license)
+                      'plugin "{plugin}" with license "{license}".').format(plugin=entry_point.dist.name, license=license)
                 ))
 
             if not input.get('plugins_free') and any(l in license for l in ('Apache', 'MIT', 'BSD')):
                 res.append((
                     'danger', 'exclamation-circle',
                     _('You selected that you have no free plugins installed, but we found the '
-                      'plugin "{plugin}" with license "{license}".').format(plugin=entry_point.dist.key, license=license)
-                ))
-
-            if not license or not any(l in license for l in ('Apache', 'MIT', 'BSD', 'pretix Enterprise', 'GPL')):
-                res.append((
-                    'muted', 'warning',
-                    _('We found the plugin "{plugin}" with license "{license}" which this tool does not know about and '
-                      'therefore cannot give any recommendations.').format(plugin=entry_point.dist.key, license=license)
+                      'plugin "{plugin}" with license "{license}".').format(plugin=entry_point.dist.name, license=license)
                 ))
 
         return res
+
+
+class SysReportView(AdministratorPermissionRequiredMixin, TemplateView):
+    template_name = 'pretixcontrol/global_sysreport.html'
+
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    def post(self, request, *args, **kwargs):
+        with language("en"):
+            try:
+                month = int(request.POST.get("month"))
+            except ValueError:
+                return super().get(request, *args, **kwargs)
+            if month < 1 or month > 12:
+                return super().get(request, *args, **kwargs)
+            name, mime, data = SysReport(month, settings.TIME_ZONE).render()
+            resp = HttpResponse(data)
+            resp['Content-Type'] = mime
+            resp['Content-Disposition'] = 'inline; filename="{}"'.format(name)
+            return resp

@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -34,6 +34,8 @@ class TicketLayoutForm(forms.ModelForm):
 
 
 class TicketLayoutItemForm(forms.ModelForm):
+    is_layouts = True
+
     class Meta:
         model = TicketLayoutItem
         fields = ('layout',)
@@ -41,20 +43,21 @@ class TicketLayoutItemForm(forms.ModelForm):
     def __init__(self, *args, **kwargs):
         self.event = kwargs.pop('event')
         self.sales_channel = kwargs.pop('sales_channel')
+        queryset = kwargs.pop('queryset')
         super().__init__(*args, **kwargs)
         if self.sales_channel.identifier != 'web':
             self.fields['layout'].label = _('PDF ticket layout for {channel}').format(
-                channel=self.sales_channel.verbose_name
+                channel=self.sales_channel.label
             )
-            self.fields['layout'].empty_label = _('(Same as above)')
+            self.fields['layout'].empty_label = _('(Same as PDF ticket layout)')
         else:
             self.fields['layout'].label = _('PDF ticket layout')
             self.fields['layout'].empty_label = _('(Event default)')
-        self.fields['layout'].queryset = self.event.ticket_layouts.all()
+        self.fields['layout'].queryset = queryset
         self.fields['layout'].required = False
 
     def save(self, commit=True):
-        self.instance.sales_channel = self.sales_channel.identifier
+        self.instance.sales_channel = self.sales_channel
         if self.cleaned_data['layout'] is None:
             if self.instance.pk:
                 self.instance.delete()

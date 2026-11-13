@@ -20,6 +20,11 @@ html.rtl {
   }
 }
 
+.force-ltr {
+  direction: ltr !important;
+  unicode-bidi: embed;
+}
+
 @media(min-width: $screen-sm-min) {
   html.rtl .nameparts-form-group {
     input, select {
@@ -41,4 +46,10 @@ html.rtl {
       margin-right: 0;
     }
   }
+}
+
+input[lang=ar], textarea[lang=ar], div[lang=ar], pre[lang=ar],
+input[lang=he], textarea[lang=he], div[lang=he], pre[lang=he] {
+  /* Keep list of languages in sync with pretix._base_settings.LANGUAGES_RTL */
+  direction: rtl;
 }

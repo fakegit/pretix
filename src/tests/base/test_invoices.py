@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -33,19 +33,21 @@
 # License for the specific language governing permissions and limitations under the License.
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
-from django.core.serializers.json import DjangoJSONEncoder
 from django.db import DatabaseError, transaction
+from django.utils.itercompat import is_iterable
 from django.utils.timezone import now
 from django_countries.fields import Country
 from django_scopes import scope, scopes_disabled
+from i18nfield.strings import LazyI18nString
 
+from pretix.base.invoice import addon_aware_groupby
 from pretix.base.models import (
-    Event, Invoice, InvoiceAddress, Item, ItemVariation, Order, OrderPosition,
-    Organizer,
+    Event, ExchangeRate, Invoice, InvoiceAddress, Item, ItemVariation, Order,
+    OrderPosition, Organizer,
 )
 from pretix.base.models.orders import OrderFee
 from pretix.base.services.invoices import (
@@ -53,7 +55,6 @@ from pretix.base.services.invoices import (
     invoice_pdf_task, invoice_qualified, regenerate_invoice,
 )
 from pretix.base.services.orders import OrderChangeManager
-from pretix.base.settings import GlobalSettingsObject
 
 
 @pytest.fixture
@@ -62,13 +63,15 @@ def env():
     with scope(organizer=o):
         event = Event.objects.create(
             organizer=o, name='Dummy', slug='dummy',
-            date_from=now(), plugins='pretix.plugins.banktransfer'
+            date_from=datetime(2024, 12, 1, 9, 0, 0, tzinfo=timezone.utc),
+            plugins='pretix.plugins.banktransfer'
         )
         o = Order.objects.create(
             code='FOO', event=event, email='dummy@dummy.test',
             status=Order.STATUS_PENDING,
             datetime=now(), expires=now() + timedelta(days=10),
-            total=0, locale='en'
+            total=0, locale='en',
+            sales_channel=event.organizer.sales_channels.get(identifier="web"),
         )
         tr = event.tax_rules.create(rate=Decimal('19.00'))
         o.fees.create(fee_type=OrderFee.FEE_TYPE_PAYMENT, value=Decimal('0.25'), tax_rate=Decimal('19.00'),
@@ -102,9 +105,7 @@ def env():
             positionid=3,
             canceled=True
         )
-        gs = GlobalSettingsObject()
-        gs.settings.ecb_rates_date = date.today()
-        gs.settings.ecb_rates_dict = json.dumps({
+        rates = {
             "USD": "1.1648",
             "RON": "4.5638",
             "CZK": "26.024",
@@ -117,7 +118,13 @@ def env():
             "PLN": "4.2408",
             "GBP": "0.89350",
             "SEK": "9.5883"
-        }, cls=DjangoJSONEncoder)
+        }
+        for currency, rate in rates.items():
+            ExchangeRate.objects.create(source_date=date.today(), source='eu:ecb:eurofxref-daily', source_currency='EUR', other_currency=currency, rate=rate)
+        ExchangeRate.objects.create(source_date=date.today(), source='cz:cnb:rate-fixing-daily', source_currency='EUR',
+                                    other_currency='CZK', rate=Decimal('25.0000'))
+        ExchangeRate.objects.create(source_date=date.today(), source='pl:nbp:table-a', source_currency='EUR',
+                                    other_currency='PLN', rate=Decimal('4.2355'))
         yield event, o
 
 
@@ -232,6 +239,8 @@ def test_reverse_charge_note(env):
     assert inv.foreign_currency_display == "PLN"
     assert inv.foreign_currency_rate == Decimal("4.2408")
     assert inv.foreign_currency_rate_date == date.today()
+    assert inv.foreign_currency_source == 'eu:ecb:eurofxref-daily'
+    assert inv.lines.first().tax_code == "AE"
 
 
 @pytest.mark.django_db
@@ -247,6 +256,7 @@ def test_custom_tax_note(env):
             'address_type': '',
             'action': 'vat',
             'rate': '20',
+            'code': 'S/reduced',
             'invoice_text': {
                 'de': 'Polnische Steuer anwendbar',
                 'en': 'Polish tax applies'
@@ -266,13 +276,13 @@ def test_custom_tax_note(env):
 
     inv = generate_invoice(order)
     assert "Polish tax applies" in inv.additional_text
+    assert inv.lines.first().tax_code == "S/reduced"
 
 
 @pytest.mark.django_db
 def test_reverse_charge_foreign_currency_data_too_old(env):
     event, order = env
-    gs = GlobalSettingsObject()
-    gs.settings.ecb_rates_date = date.today() - timedelta(days=14)
+    ExchangeRate.objects.update(source_date=date.today() - timedelta(days=14))
 
     tr = event.tax_rules.first()
     tr.eu_reverse_charge = True
@@ -296,9 +306,9 @@ def test_reverse_charge_foreign_currency_data_too_old(env):
 
 
 @pytest.mark.django_db
-def test_reverse_charge_foreign_currency_disabvled(env):
+def test_reverse_charge_foreign_currency_disabled(env):
     event, order = env
-    event.settings.invoice_eu_currencies = False
+    event.settings.invoice_eu_currencies = 'False'
 
     tr = event.tax_rules.first()
     tr.eu_reverse_charge = True
@@ -319,6 +329,58 @@ def test_reverse_charge_foreign_currency_disabvled(env):
     assert "reverse charge" in inv.additional_text.lower()
     assert inv.foreign_currency_rate is None
     assert inv.foreign_currency_rate_date is None
+
+
+@pytest.mark.django_db
+def test_invoice_indirect_currency_conversion(env):
+    event, order = env
+    event.currency = 'SEK'
+    event.save()
+
+    event.settings.set('invoice_language', 'en')
+    InvoiceAddress.objects.create(company='Acme Company', street='221B Baker Street', zipcode='12345', city='Warsaw',
+                                  country=Country('PL'), vat_id='PL123456780', vat_id_validated=True, order=order,
+                                  is_business=True)
+
+    inv = generate_invoice(order)
+    assert inv.foreign_currency_display == "PLN"
+    assert inv.foreign_currency_rate == Decimal("0.4423")
+    assert inv.foreign_currency_rate_date == date.today()
+    assert inv.foreign_currency_source == 'eu:ecb:eurofxref-daily'
+
+
+@pytest.mark.django_db
+def test_invoice_pln_currency_conversion(env):
+    event, order = env
+    event.settings.invoice_eu_currencies = 'PLN'
+
+    event.settings.set('invoice_language', 'en')
+    InvoiceAddress.objects.create(company='Acme Company', street='221B Baker Street', zipcode='12345', city='Warsaw',
+                                  country=Country('PL'), vat_id='PL123456780', vat_id_validated=True, order=order,
+                                  is_business=True)
+
+    inv = generate_invoice(order)
+    assert inv.foreign_currency_display == "PLN"
+    assert inv.foreign_currency_rate == Decimal("4.2355")
+    assert inv.foreign_currency_rate_date == date.today()
+    assert inv.foreign_currency_source == 'pl:nbp:table-a'
+
+
+@pytest.mark.django_db
+def test_invoice_czk_currency_conversion(env):
+    event, order = env
+    event.settings.invoice_eu_currencies = 'CZK'
+
+    event.settings.set('invoice_language', 'en')
+    InvoiceAddress.objects.create(company='Acme Company', street='221B Baker Street', zipcode='12345', city='Warsaw',
+                                  country=Country('PL'), vat_id='PL123456780', vat_id_validated=True, order=order,
+                                  is_business=True)
+
+    inv = generate_invoice(order)
+    assert inv.foreign_currency_display == "CZK"
+    assert inv.foreign_currency_rate == Decimal("25.0000")
+    assert inv.foreign_currency_rate_date == date.today()
+    assert inv.foreign_currency_source == 'cz:cnb:rate-fixing-daily'
 
 
 @pytest.mark.django_db
@@ -341,6 +403,7 @@ def test_positions(env):
     assert last.gross_value == fee.value
     assert last.tax_rate == fee.tax_rate
     assert last.tax_value == fee.tax_value
+    assert last.fee_type == 'payment'
     assert inv.invoice_to == ""
 
 
@@ -406,16 +469,18 @@ def test_invoice_numbers(env):
         status=Order.STATUS_PENDING,
         datetime=now(), expires=now() + timedelta(days=10),
         total=0,
-        locale='en'
+        locale='en',
+        sales_channel=event.organizer.sales_channels.get(identifier="web"),
     )
     order2.fees.create(fee_type=OrderFee.FEE_TYPE_PAYMENT, value=Decimal('0.25'), tax_rate=Decimal('0.00'),
                        tax_value=Decimal('0.00'))
     testorder = Order.objects.create(
-        code='BAR', event=event, email='dummy2@dummy.test',
+        code='TESTBAR', event=event, email='dummy2@dummy.test',
         status=Order.STATUS_PENDING,
         datetime=now(), expires=now() + timedelta(days=10),
         total=0, testmode=True,
-        locale='en'
+        locale='en',
+        sales_channel=event.organizer.sales_channels.get(identifier="web"),
     )
     inv1 = generate_invoice(order)
     inv2 = generate_invoice(order)
@@ -446,8 +511,8 @@ def test_invoice_numbers(env):
     # expected behaviour for switching between numbering formats or dealing with gaps
     assert inv1.invoice_no == '00001'
     assert inv2.invoice_no == '00002'
-    assert inv3.invoice_no == '{}-3'.format(order.code)
-    assert inv4.invoice_no == '{}-4'.format(order.code)
+    assert inv3.invoice_no == '{}-1'.format(order.code)
+    assert inv4.invoice_no == '{}-2'.format(order.code)
     assert inv5.invoice_no == '00003'
     assert inv6.invoice_no == '00004'
     assert inv7.invoice_no == '00005'
@@ -464,10 +529,10 @@ def test_invoice_numbers(env):
 
     # test Invoice.number, too
     assert inv1.number == '{}-00001'.format(event.slug.upper())
-    assert inv3.number == '{}-{}-3'.format(event.slug.upper(), order.code)
+    assert inv3.number == '{}-{}-1'.format(event.slug.upper(), order.code)
 
     assert invt1.number == '{}-TEST-00001'.format(event.slug.upper())
-    assert invt2.number == '{}-TEST-{}-2'.format(event.slug.upper(), testorder.code)
+    assert invt2.number == '{}-TEST-{}-1'.format(event.slug.upper(), testorder.code)
     assert invt3.number == '{}-TEST-00002'.format(event.slug.upper())
 
 
@@ -483,7 +548,8 @@ def test_invoice_number_prefixes(env):
         status=Order.STATUS_PENDING,
         datetime=now(), expires=now() + timedelta(days=10),
         total=0,
-        locale='en'
+        locale='en',
+        sales_channel=event2.organizer.sales_channels.get(identifier="web"),
     )
     order2.fees.create(fee_type=OrderFee.FEE_TYPE_PAYMENT, value=Decimal('0.25'), tax_rate=Decimal('0.00'),
                        tax_value=Decimal('0.00'))
@@ -512,8 +578,8 @@ def test_invoice_number_prefixes(env):
 
     event.settings.set('invoice_numbers_consecutive', False)
     event2.settings.set('invoice_numbers_consecutive', False)
-    assert generate_invoice(order).number == 'shared_{}-6'.format(order.code)
-    assert generate_invoice(order2).number == 'shared_{}-6'.format(order2.code)
+    assert generate_invoice(order).number == 'shared_{}-1'.format(order.code)
+    assert generate_invoice(order2).number == 'shared_{}-1'.format(order2.code)
 
     event2.settings.set('invoice_numbers_prefix', 'inv_')
     event2.settings.set('invoice_numbers_prefix_cancellations', 'crd_')
@@ -521,8 +587,16 @@ def test_invoice_number_prefixes(env):
     event2.settings.set('invoice_numbers_counter_length', 4)
     i = generate_invoice(order2)
     assert i.number == 'inv_0001'
-    assert generate_cancellation(i).number == 'crd_0001'
+    ci = generate_cancellation(i)
+    assert ci.number == 'crd_0001'
+    assert ci.full_invoice_no == 'crd_0001'
 
+    event2.settings.set('invoice_numbers_consecutive', False)
+    i = generate_invoice(order2)
+    assert i.number == f'inv_{order2.code}-1'
+    assert generate_cancellation(i).number == f'crd_{order2.code}-1'
+
+    event2.settings.set('invoice_numbers_consecutive', True)
     event2.settings.set('invoice_numbers_prefix', 'inv_%Y%m%d_')
     i = generate_invoice(order2)
     assert i.number == 'inv_%s_0001' % now().date().strftime('%Y%m%d')
@@ -555,3 +629,225 @@ def test_sales_channels_qualify(env):
 
     event.settings.set('invoice_generate_sales_channels', [])
     assert invoice_qualified(order) is False
+
+
+@pytest.mark.django_db
+def test_business_only(env):
+    event, order = env
+    event.settings.set('invoice_generate', 'admin')
+    event.settings.set('invoice_generate_only_business', True)
+    order.total = Decimal('42.00')
+
+    ia = InvoiceAddress.objects.create(company='Acme Company', street='221B Baker Street', is_business=True,
+                                       zipcode='12345', city='London', country_old='England', country='', order=order)
+
+    assert invoice_qualified(order) is True
+
+    ia.is_business = False
+    ia.save()
+
+    # Order with default Sales Channel (web)
+    assert invoice_qualified(order) is False
+
+
+def test_addon_aware_groupby():
+    def is_addon(item):
+        is_addon, id, price = item
+        return is_addon
+
+    def key(item):
+        return item
+
+    def listify(it):
+        return [listify(i) if is_iterable(i) else i for i in it]
+
+    assert listify(addon_aware_groupby([
+        (False, 1, 5.00),
+        (False, 1, 5.00),
+        (False, 1, 5.00),
+        (False, 2, 7.00),
+    ], key, is_addon)) == [
+        [[False, 1, 5.00], [
+            [False, 1, 5.00],
+            [False, 1, 5.00],
+            [False, 1, 5.00],
+        ]],
+        [[False, 2, 7.00], [
+            [False, 2, 7.00],
+        ]],
+    ]
+
+    assert listify(addon_aware_groupby([
+        (False, 1, 5.00),
+        (True, 101, 2.00),
+        (False, 1, 5.00),
+        (True, 101, 2.00),
+        (False, 1, 5.00),
+        (True, 102, 3.00),
+    ], key, is_addon)) == [
+        [[False, 1, 5.00], [
+            [False, 1, 5.00],
+            [False, 1, 5.00],
+        ]],
+        [[True, 101, 2.00], [
+            [True, 101, 2.00],
+            [True, 101, 2.00],
+        ]],
+        [[False, 1, 5.00], [
+            [False, 1, 5.00],
+        ]],
+        [[True, 102, 3.00], [
+            [True, 102, 3.00],
+        ]],
+    ]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("period", ["auto", "event_date"])
+def test_period_from_event_start(env, period):
+    event, order = env
+    event.settings.invoice_period = period
+    inv = generate_invoice(order)
+    l1 = inv.lines.first()
+    assert l1.period_start == event.date_from
+    assert l1.period_end == event.date_from
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("period", ["auto", "event_date"])
+def test_period_from_event_range(env, period):
+    event, order = env
+    event.date_to = event.date_from + timedelta(days=1)
+    event.settings.invoice_period = period
+    inv = generate_invoice(order)
+    l1 = inv.lines.first()
+    assert l1.period_start == event.date_from
+    assert l1.period_end == event.date_to
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("period", ["auto", "auto_no_event"])
+def test_period_from_ticket_validity(env, period):
+    event, order = env
+    p1 = order.positions.first()
+    p1.valid_from = datetime(2025, 1, 1, 0, 0, 0, tzinfo=event.timezone)
+    p1.valid_until = datetime(2025, 12, 31, 23, 59, 59, tzinfo=event.timezone)
+    p1.save()
+    event.date_to = event.date_from + timedelta(days=1)
+    event.settings.invoice_period = period
+    inv = generate_invoice(order)
+    l1 = inv.lines.first()
+    assert l1.period_start == p1.valid_from
+    assert l1.period_end == p1.valid_until
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("period", ["auto", "auto_no_event"])
+def test_period_from_subevent(env, period):
+    event, order = env
+    event.has_subevents = True
+    event.save()
+    se1 = event.subevents.create(
+        name=event.name,
+        active=True,
+        date_from=datetime((now().year + 1), 7, 31, 9, 0, 0, tzinfo=timezone.utc),
+        date_to=datetime((now().year + 1), 7, 31, 17, 0, 0, tzinfo=timezone.utc),
+    )
+    p1 = order.positions.first()
+    p1.subevent = se1
+    p1.save()
+    event.date_to = event.date_from + timedelta(days=1)
+    event.settings.invoice_period = period
+    inv = generate_invoice(order)
+    l1 = inv.lines.first()
+    assert l1.period_start == se1.date_from
+    assert l1.period_end == se1.date_to
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("period", ["auto", "auto_no_event"])
+def test_period_from_memberships(env, period):
+    event, order = env
+    event.date_to = event.date_from + timedelta(days=1)
+    event.settings.invoice_period = period
+    p1 = order.positions.first()
+    membershiptype = event.organizer.membership_types.create(
+        name=LazyI18nString({"en": "Week pass"}),
+        transferable=True,
+        allow_parallel_usage=False,
+        max_usages=15,
+    )
+    customer = event.organizer.customers.create(
+        identifier="8WSAJCJ",
+        email="foo@example.org",
+        name_parts={"_legacy": "Foo"},
+        name_cached="Foo",
+        is_verified=False,
+    )
+    m = customer.memberships.create(
+        membership_type=membershiptype,
+        granted_in=p1,
+        date_start=datetime(2021, 4, 1, 0, 0, 0, 0, tzinfo=timezone.utc),
+        date_end=datetime(2021, 4, 8, 23, 59, 59, 999999, tzinfo=timezone.utc),
+        attendee_name_parts={
+            "_scheme": "given_family",
+            'given_name': 'John',
+            'family_name': 'Doe',
+        }
+    )
+    inv = generate_invoice(order)
+    l1 = inv.lines.first()
+    assert l1.period_start == m.date_start
+    assert l1.period_end == m.date_end
+
+
+@pytest.mark.django_db
+def test_period_auto_no_event_from_invoice(env):
+    event, order = env
+    event.settings.invoice_period = "auto_no_event"
+    inv = generate_invoice(order)
+    l1 = inv.lines.first()
+    assert abs(l1.period_start - now()) < timedelta(seconds=10)
+    assert abs(l1.period_end - now()) < timedelta(seconds=10)
+
+
+@pytest.mark.django_db
+def test_period_always_invoice_date(env):
+    event, order = env
+    p1 = order.positions.first()
+    p1.valid_from = datetime(2025, 1, 1, 0, 0, 0, tzinfo=event.timezone)
+    p1.valid_until = datetime(2025, 12, 31, 23, 59, 59, tzinfo=event.timezone)
+    p1.save()
+    event.settings.invoice_period = "invoice_date"
+    inv = generate_invoice(order)
+    l1 = inv.lines.first()
+    assert abs(l1.period_start - now()) < timedelta(seconds=10)
+    assert abs(l1.period_end - now()) < timedelta(seconds=10)
+
+
+@pytest.mark.django_db
+def test_period_always_event_date(env):
+    event, order = env
+    p1 = order.positions.first()
+    p1.valid_from = datetime(2025, 1, 1, 0, 0, 0, tzinfo=event.timezone)
+    p1.valid_until = datetime(2025, 12, 31, 23, 59, 59, tzinfo=event.timezone)
+    p1.save()
+    event.settings.invoice_period = "event_date"
+    inv = generate_invoice(order)
+    l1 = inv.lines.first()
+    assert l1.period_start == event.date_from
+    assert l1.period_end == event.date_from
+
+
+@pytest.mark.django_db
+def test_period_always_order_date(env):
+    event, order = env
+    p1 = order.positions.first()
+    p1.valid_from = datetime(2025, 1, 1, 0, 0, 0, tzinfo=event.timezone)
+    p1.valid_until = datetime(2025, 12, 31, 23, 59, 59, tzinfo=event.timezone)
+    p1.save()
+    event.settings.invoice_period = "order_date"
+    inv = generate_invoice(order)
+    l1 = inv.lines.first()
+    assert l1.period_start == order.datetime
+    assert l1.period_end == order.datetime

@@ -1,44 +1,45 @@
-before_script:
 tests:
+    image:
+        name: pretix/ci-image
     stage: test
+    before_script:
+        - pip install -U pip uv
+        - uv pip install --system -U wheel setuptools
     script:
-        - virtualenv env
-        - source env/bin/activate
-        - pip install -U pip wheel setuptools
-        - XDG_CACHE_HOME=/cache pip3 install -r src/requirements.txt --no-use-pep517 -Ur src/requirements/dev.txt
+        - uv pip install --system -e ".[dev]"
         - cd src
         - python manage.py check
         - make all compress
-        - py.test --reruns 3 -n 3 tests
-    tags:
-        - python3
+        - PRETIX_CONFIG_FILE=tests/ci_sqlite.cfg py.test -n 3 tests --ignore=tests/e2e --maxfail=100
     except:
-        - pypi
+        - '/^v.*$/'
 pypi:
     stage: release
+    image:
+        name: pretix/ci-image
+    before_script:
+        - cat $PYPIRC > ~/.pypirc
+        - pip install -U pip uv
+        - uv pip install --system -U wheel setuptools twine build pretix-plugin-build check-manifest
     script:
-        - cp /keys/.pypirc ~/.pypirc
-        - virtualenv env
-        - source env/bin/activate
-        - pip install -U pip wheel setuptools check-manifest twine
-        - XDG_CACHE_HOME=/cache pip3 install -Ur src/requirements.txt -r src/requirements/dev.txt
-        - cd src
+        - uv pip install --system -e ".[dev]"
         - python setup.py sdist
-        - pip install dist/pretix-*.tar.gz
+        - uv pip install --system dist/pretix-*.tar.gz
         - python -m pretix migrate
         - python -m pretix check
-        - check-manifest
+        - cd src
         - make npminstall
-        - python setup.py sdist bdist_wheel
+        - cd ..
+        - check-manifest
+        - python -m build
         - twine check dist/*
         - twine upload dist/*
-    tags:
-        - python3
     only:
-        - pypi
+        - '/^v.*$/'
     artifacts:
         paths:
             - src/dist/
+
 stages:
     - test
     - build

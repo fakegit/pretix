@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -26,7 +26,7 @@ from io import BytesIO
 import pytest
 from django.utils.timezone import now
 from django_scopes import scope
-from PyPDF2 import PdfFileReader
+from pypdf import PdfReader
 
 from pretix.base.models import (
     Event, Item, ItemVariation, Order, OrderPosition, Organizer,
@@ -46,6 +46,7 @@ def env0():
         status=Order.STATUS_PENDING,
         datetime=now(), expires=now() + timedelta(days=10),
         total=Decimal('13.37'),
+        sales_channel=o.sales_channels.get(identifier="web"),
     )
     shirt = Item.objects.create(event=event, name='T-Shirt', default_price=12)
     shirt_red = ItemVariation.objects.create(item=shirt, default_price=14, value="Red")
@@ -70,5 +71,5 @@ def test_generate_pdf(env0):
         o = PdfTicketOutput(event)
         fname, ftype, buf = o.generate(order.positions.first())
         assert ftype == 'application/pdf'
-        pdf = PdfFileReader(BytesIO(buf))
-        assert pdf.numPages == 1
+        pdf = PdfReader(BytesIO(buf))
+        assert len(pdf.pages) == 1

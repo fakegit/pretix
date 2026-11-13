@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -38,13 +38,15 @@ from collections import OrderedDict
 from decimal import Decimal
 from zipfile import ZipFile
 
-import dateutil.parser
 from django import forms
 from django.db.models import CharField, Exists, F, OuterRef, Q, Subquery, Sum
 from django.dispatch import receiver
 from django.utils.formats import date_format
 from django.utils.functional import cached_property
-from django.utils.translation import gettext, gettext_lazy as _, pgettext
+from django.utils.timezone import now
+from django.utils.translation import (
+    gettext, gettext_lazy as _, pgettext, pgettext_lazy,
+)
 
 from pretix.base.models import Invoice, InvoiceLine, OrderPayment
 
@@ -52,34 +54,29 @@ from ...control.forms.filter import get_all_payment_providers
 from ...helpers import GroupConcat
 from ...helpers.iter import chunked_iterable
 from ..exporter import BaseExporter, MultiSheetListExporter
+from ..invoicing.transmission import get_transmission_types
 from ..services.export import ExportError
 from ..services.invoices import invoice_pdf_task
 from ..signals import (
     register_data_exporters, register_multievent_data_exporters,
 )
+from ..timeframes import DateFrameField, resolve_timeframe_to_dates_inclusive
 
 
 class InvoiceExporterMixin:
+    category = pgettext_lazy('export_category', 'Invoices')
 
     @property
     def invoice_exporter_form_fields(self):
         return OrderedDict(
             [
-                ('date_from',
-                 forms.DateField(
-                     label=_('Start date'),
-                     widget=forms.DateInput(attrs={'class': 'datepickerfield'}),
+                ('date_range',
+                 DateFrameField(
+                     label=_('Date range'),
+                     include_future_frames=False,
                      required=False,
-                     help_text=_('Only include invoices issued on or after this date. Note that the invoice date does '
+                     help_text=_('Only include invoices issued in this time frame. Note that the invoice date does '
                                  'not always correspond to the order or payment date.')
-                 )),
-                ('date_to',
-                 forms.DateField(
-                     label=_('End date'),
-                     widget=forms.DateInput(attrs={'class': 'datepickerfield'}),
-                     required=False,
-                     help_text=_('Only include invoices issued on or before this date. Note that the invoice date '
-                                 'does not always correspond to the order or payment date.')
                  )),
                 ('payment_provider',
                  forms.ChoiceField(
@@ -90,6 +87,7 @@ class InvoiceExporterMixin:
                          ('', _('All payment providers')),
                      ] + [
                          (k, v.verbose_name) for k, v in self.event.get_payment_providers().items()
+                         if not v.is_meta
                      ],
                      required=False,
                      help_text=_('Only include invoices for orders that have at least one payment attempt '
@@ -107,21 +105,19 @@ class InvoiceExporterMixin:
             qs = qs.annotate(
                 has_payment_with_provider=Exists(
                     OrderPayment.objects.filter(
-                        Q(order=OuterRef('order_id')) & Q(provider=form_data.get('payment_provider'))
+                        Q(order=OuterRef('order_id')) & Q(provider=form_data.get('payment_provider')),
+                        state__in=(OrderPayment.PAYMENT_STATE_CONFIRMED, OrderPayment.PAYMENT_STATE_REFUNDED,
+                                   OrderPayment.PAYMENT_STATE_PENDING, OrderPayment.PAYMENT_STATE_CREATED),
                     )
                 )
             )
             qs = qs.filter(has_payment_with_provider=1)
-        if form_data.get('date_from'):
-            date_value = form_data.get('date_from')
-            if isinstance(date_value, str):
-                date_value = dateutil.parser.parse(date_value).date()
-            qs = qs.filter(date__gte=date_value)
-        if form_data.get('date_to'):
-            date_value = form_data.get('date_to')
-            if isinstance(date_value, str):
-                date_value = dateutil.parser.parse(date_value).date()
-            qs = qs.filter(date__lte=date_value)
+        if form_data.get('date_range'):
+            d_start, d_end = resolve_timeframe_to_dates_inclusive(now(), form_data['date_range'], self.timezone)
+            if d_start:
+                qs = qs.filter(date__gte=d_start)
+            if d_end:
+                qs = qs.filter(date__lte=d_end)
 
         return qs
 
@@ -129,6 +125,8 @@ class InvoiceExporterMixin:
 class InvoiceExporter(InvoiceExporterMixin, BaseExporter):
     identifier = 'invoices'
     verbose_name = _('All invoices')
+    description = _('Download all invoices created by the system as a ZIP file of PDF files.')
+    repeatable_read = False
 
     def render(self, form_data: dict, output_file=None):
         qs = self.invoices_queryset(form_data).filter(shredded=False)
@@ -162,7 +160,7 @@ class InvoiceExporter(InvoiceExporterMixin, BaseExporter):
                         self.progress_callback(counter / total * 100)
 
             if self.is_multievent:
-                filename = '{}_invoices.zip'.format(self.events.first().organizer.slug)
+                filename = '{}_invoices.zip'.format(self.organizer.slug)
             else:
                 filename = '{}_invoices.zip'.format(self.event.slug)
 
@@ -180,6 +178,11 @@ class InvoiceExporter(InvoiceExporterMixin, BaseExporter):
 class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
     identifier = 'invoicedata'
     verbose_name = _('Invoice data')
+    description = _('Download a spreadsheet with the data of all invoices created by the system. The spreadsheet '
+                    'includes two sheets, one with a line for every invoice, and one with a line for every position of '
+                    'every invoice.')
+    featured = True
+    repeatable_read = False
 
     @property
     def additional_form_fields(self):
@@ -195,11 +198,11 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
     def iterate_sheet(self, form_data, sheet):
         _ = gettext
         if sheet == 'invoices':
-            yield [
+            headers = [
                 _('Invoice number'),
                 _('Date'),
                 _('Order code'),
-                _('E-mail address'),
+                _('Email address'),
                 _('Invoice type'),
                 _('Cancellation of'),
                 _('Language'),
@@ -207,6 +210,7 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
                 _('Invoice sender:') + ' ' + _('Address'),
                 _('Invoice sender:') + ' ' + _('ZIP code'),
                 _('Invoice sender:') + ' ' + _('City'),
+                _('Invoice sender:') + ' ' + pgettext('address', 'State'),
                 _('Invoice sender:') + ' ' + _('Country'),
                 _('Invoice sender:') + ' ' + _('Tax ID'),
                 _('Invoice sender:') + ' ' + _('VAT ID'),
@@ -227,7 +231,17 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
                 _('Total value (without taxes)'),
                 _('Payment matching IDs'),
                 _('Payment providers'),
+                _('Transmission type'),
+                _('Transmission status'),
+                _('Transmission date'),
             ]
+
+            transmission_types = get_transmission_types()
+            for tt in transmission_types:
+                for c in tt.describe_info_columns():
+                    headers.append(str(tt.verbose_name) + ': ' + str(c))
+
+            yield headers
 
             p_providers = OrderPayment.objects.filter(
                 order=OuterRef('order'),
@@ -239,7 +253,7 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
                 'm'
             ).order_by()
 
-            base_qs = self.invoices_queryset(form_data)\
+            base_qs = self.invoices_queryset(form_data)
 
             qs = base_qs.select_related(
                 'order', 'refers'
@@ -277,7 +291,7 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
                                 if mid:
                                     pmis.append(mid)
                     pmi = '\n'.join(pmis)
-                    yield [
+                    line = [
                         i.full_invoice_no,
                         date_format(i.date, "SHORT_DATE_FORMAT"),
                         i.order.code,
@@ -289,6 +303,7 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
                         i.invoice_from,
                         i.invoice_from_zipcode,
                         i.invoice_from_city,
+                        i.invoice_from_state,
                         i.invoice_from_country,
                         i.invoice_from_tax_id,
                         i.invoice_from_vat_id,
@@ -311,8 +326,20 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
                         ', '.join([
                             str(self.providers.get(p, p)) for p in sorted(set((i.payment_providers or '').split(',')))
                             if p and p != 'free'
-                        ])
+                        ]),
+                        i.transmission_type_instance.verbose_name,
+                        i.get_transmission_status_display(),
+                        date_format(i.transmission_date, "SHORT_DATETIME_FORMAT") if i.transmission_date else "",
                     ]
+                    for tt in transmission_types:
+                        if tt.identifier == i.transmission_type:
+                            described = dict(tt.describe_info(i.invoice_to_transmission_info, i.invoice_to_country, i.invoice_to_is_business))
+                            for c in tt.describe_info_columns():
+                                line.append(described.get(c, ""))
+                        else:
+                            for c in tt.describe_info_columns():
+                                line.append("")
+                    yield line
         elif sheet == 'lines':
             yield [
                 _('Invoice number'),
@@ -324,10 +351,9 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
                 _('Tax rate'),
                 _('Tax name'),
                 _('Event start date'),
-
                 _('Date'),
                 _('Order code'),
-                _('E-mail address'),
+                _('Email address'),
                 _('Invoice type'),
                 _('Cancellation of'),
                 _('Invoice sender:') + ' ' + _('Name'),
@@ -348,6 +374,8 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
                 _('Invoice recipient:') + ' ' + _('Beneficiary'),
                 _('Invoice recipient:') + ' ' + _('Internal reference'),
                 _('Payment providers'),
+                _('Event end date'),
+                _('Location'),
             ]
 
             p_providers = OrderPayment.objects.filter(
@@ -406,7 +434,9 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
                     ', '.join([
                         str(self.providers.get(p, p)) for p in sorted(set((l.payment_providers or '').split(',')))
                         if p and p != 'free'
-                    ])
+                    ]),
+                    date_format(l.event_date_to, "SHORT_DATE_FORMAT") if l.event_date_to else "",
+                    l.event_location or "",
                 ]
 
     @cached_property
@@ -415,7 +445,7 @@ class InvoiceDataExporter(InvoiceExporterMixin, MultiSheetListExporter):
 
     def get_filename(self):
         if self.is_multievent:
-            return '{}_invoices'.format(self.events.first().organizer.slug)
+            return '{}_invoices'.format(self.organizer.slug)
         else:
             return '{}_invoices'.format(self.event.slug)
 

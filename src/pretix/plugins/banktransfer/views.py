@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -37,15 +37,16 @@ import csv
 import itertools
 import json
 import logging
+from collections import defaultdict
 from datetime import timedelta
 from decimal import Decimal
 from typing import Set
 
 from django import forms
 from django.contrib import messages
+from django.core.exceptions import PermissionDenied
 from django.db import transaction
 from django.db.models import Count, Q, QuerySet
-from django.db.models.functions import Concat
 from django.http import FileResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -58,15 +59,13 @@ from localflavor.generic.forms import BICFormField, IBANFormField
 
 from pretix.base.forms.widgets import DatePickerWidget
 from pretix.base.models import Event, Order, OrderPayment, OrderRefund, Quota
-from pretix.base.services.mail import SendMailException
+from pretix.base.models.organizer import TeamQuerySet
 from pretix.base.settings import SettingsSandbox
 from pretix.base.templatetags.money import money_filter
-from pretix.control.permissions import (
-    EventPermissionRequiredMixin, OrganizerPermissionRequiredMixin,
-)
+from pretix.control.permissions import EventPermissionRequiredMixin
 from pretix.control.views.organizer import OrganizerDetailViewMixin
 from pretix.helpers.json import CustomJSONEncoder
-from pretix.plugins.banktransfer import csvimport, mt940import
+from pretix.plugins.banktransfer import camtimport, csvimport, mt940import
 from pretix.plugins.banktransfer.models import (
     BankImportJob, BankTransaction, RefundExport,
 )
@@ -74,13 +73,15 @@ from pretix.plugins.banktransfer.payment import BankTransfer
 from pretix.plugins.banktransfer.refund_export import (
     build_sepa_xml, get_refund_export_csv,
 )
-from pretix.plugins.banktransfer.tasks import process_banktransfers
+from pretix.plugins.banktransfer.tasks import (
+    notify_incomplete_payment, process_banktransfers,
+)
 
 logger = logging.getLogger('pretix.plugins.banktransfer')
 
 
 class ActionView(View):
-    permission = 'can_change_orders'
+    permission = 'event.orders:write'
 
     def _discard(self, trans):
         trans.state = BankTransaction.STATE_DISCARDED
@@ -94,6 +95,11 @@ class ActionView(View):
         return self._accept_ignore_amount(trans)
 
     def _accept_ignore_amount(self, trans):
+        if trans.currency and trans.order and trans.currency != trans.order.event.currency:
+            return JsonResponse({
+                'status': 'error',
+                'message': _('Currencies do not match.')
+            })
         if trans.amount < Decimal('0.00'):
             ref = trans.order.refunds.filter(
                 amount=trans.amount * -1,
@@ -155,17 +161,17 @@ class ActionView(View):
             p.confirm(user=self.request.user)
         except Quota.QuotaExceededException:
             pass
-        except SendMailException:
-            return JsonResponse({
-                'status': 'error',
-                'message': _('Problem sending email.')
-            })
         trans.state = BankTransaction.STATE_VALID
         trans.save()
         trans.order.payments.filter(
             provider='banktransfer',
             state__in=(OrderPayment.PAYMENT_STATE_CREATED, OrderPayment.PAYMENT_STATE_PENDING),
         ).update(state=OrderPayment.PAYMENT_STATE_CANCELED)
+
+        trans.order.refresh_from_db()
+        if trans.order.pending_sum > Decimal('0.00') and trans.order.status == Order.STATUS_PENDING:
+            notify_incomplete_payment(trans.order)
+
         return JsonResponse({
             'status': 'ok',
         })
@@ -176,6 +182,11 @@ class ActionView(View):
                 trans.order = self.order_qs().get(code=code.rsplit('-', 1)[1], event__slug__iexact=code.rsplit('-', 1)[0])
             else:
                 trans.order = self.order_qs().get(code=code.rsplit('-', 1)[-1])
+            if trans.currency and trans.order and trans.currency != trans.order.event.currency:
+                return JsonResponse({
+                    'status': 'error',
+                    'message': _('Currencies do not match.')
+                })
         except Order.DoesNotExist:
             return JsonResponse({
                 'status': 'error',
@@ -194,6 +205,7 @@ class ActionView(View):
             'plain': comment,
         })
 
+    @transaction.atomic()
     def post(self, request, *args, **kwargs):
         for k, v in request.POST.items():
             if not k.startswith('action_'):
@@ -227,7 +239,7 @@ class ActionView(View):
             })
 
     def get(self, request, *args, **kwargs):
-        u = request.GET.get('query', '')
+        u = request.GET.get('query', '').strip()
         if len(u) < 2:
             return JsonResponse({'results': []})
 
@@ -236,16 +248,24 @@ class ActionView(View):
                     & Q(code__icontains=Order.normalize_code(u.split("-")[1])))
         else:
             code = Q(code__icontains=Order.normalize_code(u))
-        qs = self.order_qs().order_by('pk').annotate(inr=Concat('invoices__prefix', 'invoices__invoice_no')).filter(
+
+        invoice_nos = {u, u.upper()}
+        if u.isdigit():
+            if hasattr(request, 'event'):
+                invoice_nos.add(u.zfill(request.event.settings.invoice_numbers_counter_length))
+            else:
+                for i in range(2, 12):
+                    invoice_nos.add(u.zfill(i))
+
+        qs = self.order_qs().order_by('pk').filter(
             code
             | Q(email__icontains=u)
             | Q(all_positions__attendee_name_cached__icontains=u)
             | Q(all_positions__attendee_email__icontains=u)
             | Q(invoice_address__name_cached__icontains=u)
             | Q(invoice_address__company__icontains=u)
-            | Q(invoices__invoice_no=u)
-            | Q(invoices__invoice_no=u.zfill(5))
-            | Q(inr=u)
+            | Q(invoices__invoice_no__in=invoice_nos)
+            | Q(invoices__full_invoice_no=u)
         ).select_related('event').annotate(pcnt=Count('invoices')).distinct()
         # Yep, we wouldn't need to count the invoices here. However, having this Count() statement in there
         # tricks Django into generating a GROUP BY clause that it otherwise wouldn't and that is required to
@@ -267,7 +287,7 @@ class ActionView(View):
 
 class JobDetailView(DetailView):
     template_name = 'pretixplugins/banktransfer/job_detail.html'
-    permission = 'can_change_orders'
+    permission = 'event.orders:write'
     context_objectname = 'job'
 
     def redirect_form(self):
@@ -356,7 +376,7 @@ class BankTransactionFilterForm(forms.Form):
 
 class ImportView(ListView):
     template_name = 'pretixplugins/banktransfer/import_form.html'
-    permission = 'can_change_orders'
+    permission = 'event.orders:write'
     context_object_name = 'transactions_unhandled'
     paginate_by = 30
 
@@ -396,9 +416,13 @@ class ImportView(ListView):
         elif 'file' in self.request.FILES and (
             '.txt' in self.request.FILES.get('file').name.lower()
             or '.sta' in self.request.FILES.get('file').name.lower()
+            or '.mta' in self.request.FILES.get('file').name.lower()  # Volksbank's structure
             or '.swi' in self.request.FILES.get('file').name.lower()  # Rabobank's MT940 Structured
         ):
             return self.process_mt940()
+
+        elif 'file' in self.request.FILES and '.xml' in self.request.FILES.get('file').name.lower():
+            return self.process_camt()
 
         elif self.request.FILES.get('file') is None:
             messages.error(self.request, _('You must choose a file to import.'))
@@ -413,6 +437,14 @@ class ImportView(ListView):
     def settings(self):
         return SettingsSandbox('payment', 'banktransfer', getattr(self.request, 'event', self.request.organizer))
 
+    def process_camt(self):
+        try:
+            return self.start_processing(camtimport.parse(self.request.FILES.get('file')))
+        except:
+            logger.exception('Failed to import CAMT file')
+            messages.error(self.request, _('We were unable to process your input.'))
+            return self.redirect_back()
+
     def process_mt940(self):
         try:
             return self.start_processing(mt940import.parse(self.request.FILES.get('file')))
@@ -420,6 +452,11 @@ class ImportView(ListView):
             logger.exception('Failed to import MT940 file')
             messages.error(self.request, _('We were unable to process your input.'))
             return self.redirect_back()
+
+    def _hint_settings_name(self, currency):
+        if len(self.currencies) > 1:
+            return f'banktransfer_csvhint_{currency}'
+        return 'banktransfer_csvhint'
 
     def process_csv_file(self):
         o = getattr(self.request, 'event', self.request.organizer)
@@ -435,8 +472,8 @@ class ImportView(ListView):
             messages.error(self.request, _('I\'m sorry, but we detected this file as empty. Please '
                                            'contact support for help.'))
 
-        if o.settings.get('banktransfer_csvhint') is not None:
-            hint = o.settings.get('banktransfer_csvhint', as_type=dict)
+        if o.settings.get(self._hint_settings_name(self.request.POST.get('currency'))) is not None:
+            hint = o.settings.get(self._hint_settings_name(self.request.POST.get('currency')), as_type=dict)
 
             try:
                 parsed, good = csvimport.parse(data, hint)
@@ -466,7 +503,7 @@ class ImportView(ListView):
             return self.assign_view(data)
         o = getattr(self.request, 'event', self.request.organizer)
         try:
-            o.settings.set('banktransfer_csvhint', hint)
+            o.settings.set(self._hint_settings_name(self.request.POST.get('currency')), hint)
         except Exception as e:  # TODO: narrow down
             logger.error('Import using stored hint failed: ' + str(e))
             pass
@@ -516,6 +553,15 @@ class ImportView(ListView):
             kwargs['event'] = self.kwargs['event']
         return redirect(reverse('plugins:banktransfer:import', kwargs=kwargs))
 
+    @cached_property
+    def currencies(self):
+        if hasattr(self.request, 'event'):
+            return [self.request.event.currency]
+        else:
+            return list(
+                self.request.organizer.events.order_by('currency').values_list('currency', flat=True).distinct()
+            )
+
     def start_processing(self, parsed):
         if self.job_running:
             messages.error(self.request,
@@ -524,7 +570,15 @@ class ImportView(ListView):
         if 'event' in self.kwargs:
             job = BankImportJob.objects.create(event=self.request.event, organizer=self.request.organizer)
         else:
-            job = BankImportJob.objects.create(organizer=self.request.organizer)
+            if len(self.currencies) != 1:
+                currency = self.request.POST.get("currency")
+                if not currency or currency not in self.currencies:
+                    messages.error(self.request,
+                                   _('No currency has been selected.'))
+                    return self.redirect_back()
+                job = BankImportJob.objects.create(organizer=self.request.organizer, currency=currency)
+            else:
+                job = BankImportJob.objects.create(organizer=self.request.organizer, currency=self.currencies[0])
         process_banktransfers.apply_async(kwargs={
             'job': job.pk,
             'data': parsed
@@ -542,6 +596,9 @@ class ImportView(ListView):
         ctx['job_running'] = self.job_running
         ctx['no_more_payments'] = False
         ctx['filter_form'] = BankTransactionFilterForm(self.request.GET or None)
+
+        if not hasattr(self.request, 'event'):
+            ctx['currencies'] = self.currencies
 
         if 'event' in self.kwargs:
             ctx['basetpl'] = 'pretixplugins/banktransfer/import_base.html'
@@ -576,54 +633,63 @@ class ImportView(ListView):
 
 class OrganizerBanktransferView:
     def dispatch(self, request, *args, **kwargs):
-        if len(request.organizer.events.order_by('currency').values_list('currency', flat=True).distinct()) > 1:
-            messages.error(request, _('Please perform per-event bank imports as this organizer has events with '
-                                      'multiple currencies.'))
-            return redirect('control:organizer', organizer=request.organizer.slug)
+        # Users can use the bank transfer views if they have sufficient permission for at least one event.
+        # Yes, this allows them to cauase changes in events they don't have access to. This is an accepted
+        # risk because every other way, the bank transfer feature becomes basically unusable.
+        has_any_event_perm = request.user.get_events_with_permission(
+            "event.orders:write", request=request
+        ).filter(organizer=request.organizer).exists()
+        if not has_any_event_perm:
+            raise PermissionDenied()
         return super().dispatch(request, *args, **kwargs)
 
 
 class EventImportView(EventPermissionRequiredMixin, ImportView):
-    permission = 'can_change_orders'
+    permission = 'event.orders:write'
 
 
-class OrganizerImportView(OrganizerBanktransferView, OrganizerPermissionRequiredMixin, OrganizerDetailViewMixin,
+class OrganizerImportView(OrganizerBanktransferView, OrganizerDetailViewMixin,
                           ImportView):
-    permission = 'can_change_orders'
+    pass
 
 
 class EventJobDetailView(EventPermissionRequiredMixin, JobDetailView):
-    permission = 'can_change_orders'
+    permission = 'event.orders:write'
 
 
-class OrganizerJobDetailView(OrganizerBanktransferView, OrganizerPermissionRequiredMixin, OrganizerDetailViewMixin,
+class OrganizerJobDetailView(OrganizerBanktransferView, OrganizerDetailViewMixin,
                              JobDetailView):
-    permission = 'can_change_orders'
+    pass
 
 
 class EventActionView(EventPermissionRequiredMixin, ActionView):
-    permission = 'can_change_orders'
+    permission = 'event.orders:write'
 
 
-class OrganizerActionView(OrganizerBanktransferView, OrganizerPermissionRequiredMixin, OrganizerDetailViewMixin,
+class OrganizerActionView(OrganizerBanktransferView, OrganizerDetailViewMixin,
                           ActionView):
-    permission = 'can_change_orders'
 
     def order_qs(self):
-        all = self.request.user.teams.filter(organizer=self.request.organizer, can_change_orders=True,
-                                             can_view_orders=True, all_events=True).exists()
+        all = self.request.user.teams.filter(
+            TeamQuerySet.event_permission_q("event.orders:read"),
+            TeamQuerySet.event_permission_q("event.orders:write"),
+            all_events=True,
+            organizer=self.request.organizer,
+        ).exists()
         if self.request.user.has_active_staff_session(self.request.session.session_key) or all:
             return Order.objects.filter(event__organizer=self.request.organizer)
         else:
             return Order.objects.filter(
                 event_id__in=self.request.user.teams.filter(
-                    organizer=self.request.organizer, can_change_orders=True, can_view_orders=True
+                    TeamQuerySet.event_permission_q("event.orders:read"),
+                    TeamQuerySet.event_permission_q("event.orders:write"),
+                    organizer=self.request.organizer,
                 ).values_list('limit_events__id', flat=True)
             )
 
 
 def _row_key_func(row):
-    return row['iban'], row['bic']
+    return row['iban'], row.get('bic') or ''
 
 
 def _unite_transaction_rows(transaction_rows):
@@ -634,6 +700,7 @@ def _unite_transaction_rows(transaction_rows):
         united_transactions_rows.append({
             "iban": iban,
             "bic": bic,
+            "locale": rows[0].get('locale', 'en'),
             "id": ", ".join(sorted(set(r['id'] for r in rows))),
             "payer": ", ".join(sorted(set(r['payer'] for r in rows))),
             "amount": sum(r['amount'] for r in rows),
@@ -678,26 +745,29 @@ class RefundExportListView(ListView):
                 valid_refunds.add(refund)
 
         if valid_refunds:
-            transaction_rows = []
+            transaction_rows = defaultdict(list)
 
             for refund in valid_refunds:
                 data = refund.info_data
-                transaction_rows.append({
+                transaction_rows[refund.order.event.currency].append({
                     "amount": refund.amount,
                     "id": refund.full_id,
                     "comment": refund.comment,
+                    "locale": refund.order.locale,
                     **{key: data.get(key) for key in ("payer", "iban", "bic")}
                 })
                 refund.done(user=self.request.user)
 
             if unite_transactions:
-                transaction_rows = _unite_transaction_rows(transaction_rows)
+                for currency, rows in transaction_rows.items():
+                    transaction_rows[currency] = _unite_transaction_rows(rows)
 
-            rows_data = json.dumps(transaction_rows, cls=CustomJSONEncoder)
-            if hasattr(request, 'event'):
-                RefundExport.objects.create(event=self.request.event, testmode=self.request.event.testmode, rows=rows_data)
-            else:
-                RefundExport.objects.create(organizer=self.request.organizer, testmode=False, rows=rows_data)
+            for currency, rows in transaction_rows.items():
+                rows_data = json.dumps(rows, cls=CustomJSONEncoder)
+                if hasattr(request, 'event'):
+                    RefundExport.objects.create(event=self.request.event, testmode=self.request.event.testmode, rows=rows_data, currency=currency)
+                else:
+                    RefundExport.objects.create(organizer=self.request.organizer, testmode=False, rows=rows_data, currency=currency)
 
         else:
             messages.warning(request, _('No valid orders have been found.'))
@@ -706,7 +776,7 @@ class RefundExportListView(ListView):
 
 
 class EventRefundExportListView(EventPermissionRequiredMixin, RefundExportListView):
-    permission = 'can_change_orders'
+    permission = 'event.orders:write'
 
     def get_success_url(self):
         return reverse('plugins:banktransfer:refunds.list', kwargs={
@@ -728,15 +798,7 @@ class EventRefundExportListView(EventPermissionRequiredMixin, RefundExportListVi
         )
 
 
-class OrganizerRefundExportListView(OrganizerPermissionRequiredMixin, RefundExportListView):
-    permission = 'can_change_orders'
-
-    def dispatch(self, request, *args, **kwargs):
-        if len(request.organizer.events.order_by('currency').values_list('currency', flat=True).distinct()) > 1:
-            messages.error(request, _('Please perform per-event refund exports as this organizer has events with '
-                                      'multiple currencies.'))
-            return redirect('control:organizer', organizer=request.organizer.slug)
-        return super().dispatch(request, *args, **kwargs)
+class OrganizerRefundExportListView(OrganizerBanktransferView, RefundExportListView):
 
     def get_success_url(self):
         return reverse('plugins:banktransfer:refunds.list', kwargs={
@@ -751,7 +813,7 @@ class OrganizerRefundExportListView(OrganizerPermissionRequiredMixin, RefundExpo
     def get_unexported(self):
         return OrderRefund.objects.filter(
             order__event__organizer=self.request.organizer,
-            provider='banktransfer',
+            provider__in=['banktransfer', 'sepadebit'],
             state=OrderRefund.REFUND_STATE_CREATED,
             order__testmode=False,
         )
@@ -769,7 +831,7 @@ class DownloadRefundExportView(DetailView):
 
 
 class EventDownloadRefundExportView(EventPermissionRequiredMixin, DownloadRefundExportView):
-    permission = 'can_change_orders'
+    permission = 'event.orders:write'
 
     def get_object(self, *args, **kwargs):
         return get_object_or_404(
@@ -779,8 +841,7 @@ class EventDownloadRefundExportView(EventPermissionRequiredMixin, DownloadRefund
         )
 
 
-class OrganizerDownloadRefundExportView(OrganizerPermissionRequiredMixin, OrganizerDetailViewMixin, DownloadRefundExportView):
-    permission = 'can_change_orders'
+class OrganizerDownloadRefundExportView(OrganizerBanktransferView, OrganizerDetailViewMixin, DownloadRefundExportView):
 
     def get_object(self, *args, **kwargs):
         return get_object_or_404(
@@ -796,7 +857,7 @@ class SepaXMLExportForm(forms.Form):
     bic = BICFormField(label="BIC")
 
     def set_initial_from_event(self, event: Event):
-        banktransfer = event.get_payment_providers(cached=True)[BankTransfer.identifier]
+        banktransfer = BankTransfer(event)
         self.initial["account_holder"] = banktransfer.settings.get("bank_details_sepa_name")
         self.initial["iban"] = banktransfer.settings.get("bank_details_sepa_iban")
         self.initial["bic"] = banktransfer.settings.get("bank_details_sepa_bic")
@@ -808,9 +869,9 @@ class SepaXMLExportView(SingleObjectMixin, FormView):
     template_name = 'pretixplugins/banktransfer/sepa_export.html'
     context_object_name = "export"
 
-    def setup(self, request, *args, **kwargs):
-        super().setup(request, *args, **kwargs)
+    def dispatch(self, request, *args, **kwargs):
         self.object: RefundExport = self.get_object()
+        return super().dispatch(request, *args, **kwargs)
 
     def form_valid(self, form):
         self.object.downloaded = True
@@ -827,7 +888,7 @@ class SepaXMLExportView(SingleObjectMixin, FormView):
 
 
 class EventSepaXMLExportView(EventPermissionRequiredMixin, SepaXMLExportView):
-    permission = 'can_change_orders'
+    permission = 'event.orders:write'
 
     def get_object(self, *args, **kwargs):
         return get_object_or_404(
@@ -842,8 +903,7 @@ class EventSepaXMLExportView(EventPermissionRequiredMixin, SepaXMLExportView):
         return form
 
 
-class OrganizerSepaXMLExportView(OrganizerPermissionRequiredMixin, OrganizerDetailViewMixin, SepaXMLExportView):
-    permission = 'can_change_orders'
+class OrganizerSepaXMLExportView(OrganizerBanktransferView, OrganizerDetailViewMixin, SepaXMLExportView):
 
     def get_object(self, *args, **kwargs):
         return get_object_or_404(

@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -35,10 +35,9 @@
 import copy
 import tempfile
 from collections import OrderedDict, defaultdict
-from datetime import date, datetime, time, timedelta
+from datetime import timedelta
 from decimal import Decimal
 
-import pytz
 from dateutil.parser import parse
 from django import forms
 from django.conf import settings
@@ -47,25 +46,77 @@ from django.db import models
 from django.db.models import DateTimeField, Max, OuterRef, Subquery, Sum
 from django.template.defaultfilters import floatformat
 from django.utils.formats import date_format, localize
-from django.utils.timezone import get_current_timezone, make_aware, now
-from django.utils.translation import gettext as _, gettext_lazy, pgettext
+from django.utils.html import format_html
+from django.utils.timezone import get_current_timezone, now
+from django.utils.translation import (
+    gettext as _, gettext_lazy, pgettext, pgettext_lazy,
+)
 from django_countries.fields import Country
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
-from reportlab.platypus import PageBreak
+from reportlab.lib.units import mm
+from reportlab.lib.utils import simpleSplit
+from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfgen.canvas import Canvas
+from reportlab.platypus import PageBreak, Spacer, Table, TableStyle
 
 from pretix.base.decimal import round_decimal
 from pretix.base.exporter import BaseExporter, MultiSheetListExporter
-from pretix.base.forms.widgets import DatePickerWidget
 from pretix.base.models import Order, OrderPosition
 from pretix.base.models.event import SubEvent
 from pretix.base.models.orders import OrderFee, OrderPayment
 from pretix.base.services.stats import order_overview
+from pretix.base.timeframes import (
+    DateFrameField, resolve_timeframe_to_dates_inclusive,
+    resolve_timeframe_to_datetime_start_inclusive_end_exclusive,
+)
 from pretix.control.forms.filter import OverviewFilterForm
+from pretix.helpers.reportlab import (
+    PlainTextParagraph, register_ttf_font_if_new,
+)
+from pretix.presale.style import get_fonts
+
+
+class NumberedCanvas(Canvas):
+    def __init__(self, *args, **kwargs):
+        self.font_regular = kwargs.pop('font_regular')
+        self.x = kwargs.pop('x', 15 * mm)
+        self.y = kwargs.pop('y', 10 * mm)
+        super().__init__(*args, **kwargs)
+        self._saved_page_states = []
+
+    def showPage(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        num_pages = len(self._saved_page_states)
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            self.draw_page_number(num_pages)
+            Canvas.showPage(self)
+        Canvas.save(self)
+
+    def draw_page_number(self, page_count):
+        self.saveState()
+        self.setFont(self.font_regular, 8)
+        self.drawString(self.x, self.y, _("Page %d of %d") % (self._pageNumber, page_count,))
+        self.restoreState()
 
 
 class ReportlabExportMixin:
     multiBuild = False  # noqa
+    numbered_canvas = False
+
+    def canvas_class(self, doc):
+        if self.numbered_canvas:
+            def _cl(*args, **kwargs):
+                kwargs['font_regular'] = 'OpenSans'
+                kwargs['x'] = doc.leftMargin
+                kwargs['y'] = 10 * mm
+                return NumberedCanvas(*args, **kwargs)
+            return _cl
+        return Canvas
 
     @property
     def pagesize(self):
@@ -78,17 +129,23 @@ class ReportlabExportMixin:
         return 'report-%s.pdf' % self.event.slug, 'application/pdf', self.create(form_data)
 
     def get_filename(self):
-        tz = pytz.timezone(self.event.settings.timezone)
+        tz = self.event.timezone
         return "%s-%s.pdf" % (self.name, now().astimezone(tz).strftime("%Y-%m-%d-%H-%M-%S"))
 
     @staticmethod
     def register_fonts():
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
+        register_ttf_font_if_new('OpenSans', finders.find('fonts/OpenSans-Regular.ttf'))
+        register_ttf_font_if_new('OpenSansIt', finders.find('fonts/OpenSans-Italic.ttf'))
+        register_ttf_font_if_new('OpenSansBd', finders.find('fonts/OpenSans-Bold.ttf'))
 
-        pdfmetrics.registerFont(TTFont('OpenSans', finders.find('fonts/OpenSans-Regular.ttf')))
-        pdfmetrics.registerFont(TTFont('OpenSansIt', finders.find('fonts/OpenSans-Italic.ttf')))
-        pdfmetrics.registerFont(TTFont('OpenSansBd', finders.find('fonts/OpenSans-Bold.ttf')))
+        for family, styles in get_fonts(None, pdf_support_required=True).items():
+            register_ttf_font_if_new(family, finders.find(styles['regular']['truetype']))
+            if 'italic' in styles:
+                register_ttf_font_if_new(family + ' I', finders.find(styles['italic']['truetype']))
+            if 'bold' in styles:
+                register_ttf_font_if_new(family + ' B', finders.find(styles['bold']['truetype']))
+            if 'bolditalic' in styles:
+                register_ttf_font_if_new(family + ' B I', finders.find(styles['bolditalic']['truetype']))
 
     def get_doc_template(self):
         from reportlab.platypus import BaseDocTemplate
@@ -110,9 +167,9 @@ class ReportlabExportMixin:
                 PageTemplate(id='All', frames=self.get_frames(doc), onPage=self.on_page, pagesize=self.pagesize)
             ])
             if self.multiBuild:
-                doc.multiBuild(self.get_story(doc, form_data))
+                doc.multiBuild(self.get_story(doc, form_data), canvasmaker=self.canvas_class(doc))
             else:
-                doc.build(self.get_story(doc, form_data))
+                doc.build(self.get_story(doc, form_data), canvasmaker=self.canvas_class(doc))
             f.seek(0)
             return f.read()
 
@@ -151,15 +208,18 @@ class ReportlabExportMixin:
 
         tz = get_current_timezone()
         canvas.setFont('OpenSans', 8)
-        canvas.drawString(15 * mm, 10 * mm, _("Page %d") % (doc.page,))
-        canvas.drawRightString(self.pagesize[0] - 15 * mm, 10 * mm,
-                               _("Created: %s") % now().astimezone(tz).strftime("%d.%m.%Y %H:%M:%S"))
+        if not self.numbered_canvas:
+            canvas.drawString(doc.leftMargin, 10 * mm, _("Page %d") % (doc.page,))
+        canvas.drawRightString(self.pagesize[0] - doc.rightMargin, 10 * mm,
+                               _("Created: %s") % date_format(now().astimezone(tz), 'SHORT_DATETIME_FORMAT'))
 
     def get_right_header_string(self):
         return settings.PRETIX_INSTANCE_NAME
 
     def get_left_header_string(self):
-        if self.event.has_subevents:
+        if self.is_multievent:
+            return str(self.organizer.name)
+        elif self.event.has_subevents:
             return "%s – %s" % (self.event.organizer.name, self.event.name)
         else:
             return "%s – %s – %s" % (self.event.organizer.name, self.event.name,
@@ -168,17 +228,28 @@ class ReportlabExportMixin:
     def page_header(self, canvas, doc):
         from reportlab.lib.units import mm
 
-        canvas.setFont('OpenSans', 10)
-        canvas.drawString(15 * mm, self.pagesize[1] - 15 * mm, self.get_left_header_string())
-        canvas.drawRightString(self.pagesize[0] - 15 * mm, self.pagesize[1] - 15 * mm,
-                               self.get_right_header_string())
+        font_name = 'OpenSans'
+        font_size = 10
+        left_string = self.get_left_header_string()
+        right_string = self.get_right_header_string()
+        right_width = stringWidth(right_string, font_name, font_size)
+        max_left_width = self.pagesize[0] - doc.leftMargin - doc.rightMargin - right_width - 5 * mm
+        left_string_lines = simpleSplit(left_string, font_name, font_size, max_left_width)
+        if len(left_string_lines) > 1:
+            left_string = left_string_lines[0] + " …"
+
+        canvas.setFont(font_name, font_size)
+        canvas.drawString(doc.leftMargin, self.pagesize[1] - 15 * mm, left_string)
+        canvas.drawRightString(self.pagesize[0] - doc.rightMargin, self.pagesize[1] - 15 * mm,
+                               right_string)
         canvas.setStrokeColorRGB(0, 0, 0)
-        canvas.line(15 * mm, self.pagesize[1] - 17 * mm,
-                    self.pagesize[0] - 15 * mm, self.pagesize[1] - 17 * mm)
+        canvas.line(doc.leftMargin, self.pagesize[1] - 17 * mm,
+                    self.pagesize[0] - doc.rightMargin, self.pagesize[1] - 17 * mm)
 
 
 class Report(ReportlabExportMixin, BaseExporter):
     name = "report"
+    numbered_canvas = True
 
     def verbose_name(self) -> str:
         raise NotImplementedError()
@@ -194,6 +265,8 @@ class OverviewReport(Report):
     name = "overview"
     identifier = 'pdfreport'
     verbose_name = gettext_lazy('Order overview (PDF)')
+    category = pgettext_lazy('export_category', 'Analysis')
+    description = gettext_lazy('Download a PDF version of the key sales numbers per ticket type.')
 
     @property
     def pagesize(self):
@@ -208,19 +281,79 @@ class OverviewReport(Report):
         if form_data.get('date_until'):
             form_data['date_until'] = parse(form_data['date_until'])
 
-        story = self._table_story(doc, form_data)
+        story = self._header_story(doc, form_data, net=False) + self._filter_story(doc, form_data, net=False) + self._table_story(doc, form_data)
         if self.event.tax_rules.exists():
             story += [PageBreak()]
+            story += self._header_story(doc, form_data, net=True)
+            story += self._filter_story(doc, form_data, net=True)
             story += self._table_story(doc, form_data, net=True)
         return story
 
-    def _table_story(self, doc, form_data, net=False):
-        from reportlab.lib.units import mm
-        from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
-
+    def _header_story(self, doc, form_data, net=False):
         headlinestyle = self.get_style()
         headlinestyle.fontSize = 15
         headlinestyle.fontName = 'OpenSansBd'
+        story = [
+            PlainTextParagraph(_('Orders by product') + ' ' + (_('(excl. taxes)') if net else _('(incl. taxes)')), headlinestyle),
+            Spacer(1, 5 * mm)
+        ]
+        return story
+
+    def _filter_story(self, doc, form_data, net=False):
+        story = []
+        if form_data.get('date_axis') and form_data.get('date_range'):
+            d_start, d_end = resolve_timeframe_to_dates_inclusive(now(), form_data['date_range'], self.timezone)
+            story += [
+                PlainTextParagraph(_('{axis} between {start} and {end}').format(
+                    axis=dict(OverviewFilterForm(event=self.event).fields['date_axis'].choices)[form_data.get('date_axis')],
+                    start=date_format(d_start, 'SHORT_DATE_FORMAT') if d_start else '–',
+                    end=date_format(d_end, 'SHORT_DATE_FORMAT') if d_end else '–',
+                ), self.get_style()),
+                Spacer(1, 5 * mm)
+            ]
+
+        if form_data.get('subevent'):
+            try:
+                subevent = self.event.subevents.get(pk=self.form_data.get('subevent'))
+            except SubEvent.DoesNotExist:
+                subevent = self.form_data.get('subevent')
+            story.append(PlainTextParagraph(pgettext('subevent', 'Date: {}').format(subevent), self.get_style()))
+            story.append(Spacer(1, 5 * mm))
+
+        if form_data.get('subevent_date_range'):
+            d_start, d_end = resolve_timeframe_to_datetime_start_inclusive_end_exclusive(now(), form_data['subevent_date_range'], self.timezone)
+            story += [
+                PlainTextParagraph(_('{axis} between {start} and {end}').format(
+                    axis=_('Event date'),
+                    start=date_format(d_start, 'SHORT_DATE_FORMAT') if d_start else '–',
+                    end=date_format(d_end - timedelta(hours=1), 'SHORT_DATE_FORMAT') if d_end else '–',
+                ), self.get_style()),
+                Spacer(1, 5 * mm)
+            ]
+        return story
+
+    def _get_data(self, form_data):
+        if form_data.get('date_range'):
+            d_start, d_end = resolve_timeframe_to_dates_inclusive(now(), form_data['date_range'], self.timezone)
+        else:
+            d_start, d_end = None, None
+        if form_data.get('subevent_date_range'):
+            sd_start, sd_end = resolve_timeframe_to_datetime_start_inclusive_end_exclusive(now(), form_data['subevent_date_range'], self.timezone)
+        else:
+            sd_start, sd_end = None, None
+        return order_overview(
+            self.event,
+            subevent=form_data.get('subevent'),
+            date_filter=form_data.get('date_axis'),
+            date_from=d_start,
+            date_until=d_end,
+            subevent_date_from=sd_start,
+            subevent_date_until=sd_end,
+            fees=True,
+            skip_empty_lines=form_data.get("skip_empty_lines")
+        )
+
+    def _table_story(self, doc, form_data, net=False):
         colwidths = [
             a * doc.width for a in (
                 1 - (0.05 + 0.075) * 6,
@@ -242,7 +375,7 @@ class OverviewReport(Report):
             ('SPAN', (11, 1), (12, 1)),
             ('ALIGN', (0, 0), (-1, 1), 'CENTER'),
             ('ALIGN', (1, 2), (-1, -1), 'RIGHT'),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
             ('FONTNAME', (0, 0), (-1, 1), 'OpenSansBd'),
             ('FONTNAME', (0, -1), (-1, -1), 'OpenSansBd'),
             ('FONTSIZE', (0, 0), (-1, -1), 8),
@@ -260,37 +393,16 @@ class OverviewReport(Report):
         tstyle_bold.fontName = 'OpenSansBd'
         tstyle_th = copy.copy(tstyle_bold)
         tstyle_th.alignment = TA_CENTER
-        story = [
-            Paragraph(_('Orders by product') + ' ' + (_('(excl. taxes)') if net else _('(incl. taxes)')), headlinestyle),
-            Spacer(1, 5 * mm)
-        ]
-        if form_data.get('date_axis'):
-            story += [
-                Paragraph(_('{axis} between {start} and {end}').format(
-                    axis=dict(OverviewFilterForm(event=self.event).fields['date_axis'].choices)[form_data.get('date_axis')],
-                    start=date_format(form_data.get('date_from'), 'SHORT_DATE_FORMAT') if form_data.get('date_from') else '–',
-                    end=date_format(form_data.get('date_until'), 'SHORT_DATE_FORMAT') if form_data.get('date_until') else '–',
-                ), self.get_style()),
-                Spacer(1, 5 * mm)
-            ]
-
-        if form_data.get('subevent'):
-            try:
-                subevent = self.event.subevents.get(pk=self.form_data.get('subevent'))
-            except SubEvent.DoesNotExist:
-                subevent = self.form_data.get('subevent')
-            story.append(Paragraph(pgettext('subevent', 'Date: {}').format(subevent), self.get_style()))
-            story.append(Spacer(1, 5 * mm))
         tdata = [
             [
                 _('Product'),
-                Paragraph(_('Canceled'), tstyle_th),
+                PlainTextParagraph(_('Canceled'), tstyle_th),
                 '',
-                Paragraph(_('Expired'), tstyle_th),
+                PlainTextParagraph(_('Expired'), tstyle_th),
                 '',
-                Paragraph(_('Approval pending'), tstyle_th),
+                PlainTextParagraph(_('Approval pending'), tstyle_th),
                 '',
-                Paragraph(_('Purchased'), tstyle_th),
+                PlainTextParagraph(_('Purchased'), tstyle_th),
                 '', '', '', '', ''
             ],
             [
@@ -307,14 +419,7 @@ class OverviewReport(Report):
             ],
         ]
 
-        items_by_category, total = order_overview(
-            self.event,
-            subevent=form_data.get('subevent'),
-            date_filter=form_data.get('date_axis'),
-            date_from=form_data.get('date_from'),
-            date_until=form_data.get('date_until'),
-            fees=True
-        )
+        items_by_category, total = self._get_data(form_data)
         places = settings.CURRENCY_PLACES.get(self.event.currency, 2)
         states = (
             ('canceled', Order.STATUS_CANCELED),
@@ -328,14 +433,14 @@ class OverviewReport(Report):
         for tup in items_by_category:
             if tup[0]:
                 tdata.append([
-                    Paragraph(str(tup[0].name), tstyle_bold)
+                    PlainTextParagraph(str(tup[0]), tstyle_bold)
                 ])
                 for l, s in states:
                     tdata[-1].append(str(tup[0].num[l][0]))
                     tdata[-1].append(floatformat(tup[0].num[l][2 if net else 1], places))
             for item in tup[1]:
                 tdata.append([
-                    str(item)
+                    PlainTextParagraph(str(item), tstyle)
                 ])
                 for l, s in states:
                     tdata[-1].append(str(item.num[l][0]))
@@ -343,7 +448,7 @@ class OverviewReport(Report):
                 if item.has_variations:
                     for var in item.all_variations:
                         tdata.append([
-                            Paragraph("          " + str(var), tstyle)
+                            PlainTextParagraph("          " + str(var), tstyle)
                         ])
                         for l, s in states:
                             tdata[-1].append(str(var.num[l][0]))
@@ -358,20 +463,47 @@ class OverviewReport(Report):
 
         table = Table(tdata, colWidths=colwidths, repeatRows=3)
         table.setStyle(TableStyle(tstyledata))
-        story.append(table)
-        return story
+        return [table]
 
     @property
     def export_form_fields(self) -> dict:
         f = OverviewFilterForm(event=self.event)
+        f.fields = OrderedDict(f.fields.items())
         del f.fields['ordering']
+        del f.fields['date_from']
+        del f.fields['date_until']
+        if self.event.has_subevents:
+            f.fields['subevent_date_range'] = DateFrameField(
+                label=_('Event date'),
+                include_future_frames=True,
+                required=False,
+            )
+            f.fields.move_to_end("subevent_date_range", last=False)
+            f.fields.move_to_end("subevent", last=False)
+        f.fields['date_range'] = DateFrameField(
+            label=_('Date range'),
+            include_future_frames=False,
+            required=False,
+            help_text=format_html('<strong class="text-danger">{}</strong>', _(
+                'Filtering this report by date is not recommended as it might lead to misleading information since '
+                'this report only sees the current state of any order, not any changes made to the order previously. '
+                'This date filter might be removed in the future. '
+                'Use the "Accounting report" in the export section instead.'
+            ))
+        )
+        f.fields['skip_empty_lines'] = forms.BooleanField(
+            label=_("Skip empty lines"),
+            required=False,
+        )
         return f.fields
 
 
 class OrderTaxListReportPDF(Report):
     name = "ordertaxlist"
     identifier = 'ordertaxes'
-    verbose_name = gettext_lazy('List of orders with taxes (PDF)')
+    verbose_name = gettext_lazy('Tax split list (PDF)')
+    category = pgettext_lazy('export_category', 'Order data')
+    description = gettext_lazy("Download a PDF list with the tax amounts included in each order.")
 
     @property
     def export_form_fields(self):
@@ -407,12 +539,12 @@ class OrderTaxListReportPDF(Report):
 
     def get_story(self, doc, form_data):
         from reportlab.lib.units import mm
-        from reportlab.platypus import Paragraph, Spacer, Table, TableStyle
+        from reportlab.platypus import Spacer, Table, TableStyle
 
         headlinestyle = self.get_style()
         headlinestyle.fontSize = 15
         headlinestyle.fontName = 'OpenSansBd'
-        tz = pytz.timezone(self.event.settings.timezone)
+        tz = self.event.timezone
 
         tax_rates = set(
             a for a
@@ -448,7 +580,7 @@ class OrderTaxListReportPDF(Report):
             tstyledata.append(('SPAN', (5 + 2 * i, 0), (6 + 2 * i, 0)))
 
         story = [
-            Paragraph(_('Orders by tax rate ({currency})').format(currency=self.event.currency), headlinestyle),
+            PlainTextParagraph(_('Orders by tax rate ({currency})').format(currency=self.event.currency), headlinestyle),
             Spacer(1, 5 * mm)
         ]
         tdata = [
@@ -542,7 +674,10 @@ class OrderTaxListReportPDF(Report):
 
 class OrderTaxListReport(MultiSheetListExporter):
     identifier = 'ordertaxeslist'
-    verbose_name = gettext_lazy('List of orders with taxes')
+    verbose_name = gettext_lazy('Tax split list')
+    category = pgettext_lazy('export_category', 'Order data')
+    description = gettext_lazy("Download a spreadsheet with the tax amounts included in each order.")
+    repeatable_read = False
 
     @property
     def sheets(self):
@@ -586,48 +721,30 @@ class OrderTaxListReport(MultiSheetListExporter):
                      ),
                      required=False,
                  )),
-                ('date_from', forms.DateField(
-                    label=_('Date from'),
-                    required=False,
-                    widget=DatePickerWidget,
-                )),
-                ('date_until', forms.DateField(
-                    label=_('Date until'),
-                    required=False,
-                    widget=DatePickerWidget,
-                ))
+                ('date_range',
+                 DateFrameField(
+                     label=_('Date range'),
+                     include_future_frames=False,
+                     required=False,
+                     help_text=_('Only include orders created within this date range.')
+                 )),
             ]
         ))
         return f
 
     def filter_qs(self, qs, form_data):
-        date_from = form_data.get('date_from')
-        date_until = form_data.get('date_until')
+        date_range = form_data.get('date_range')
         date_filter = form_data.get('date_axis')
-        if date_from:
-            if isinstance(date_from, str):
-                date_from = parse(date_from).date()
-            if isinstance(date_from, date):
-                date_from = make_aware(datetime.combine(
-                    date_from,
-                    time(hour=0, minute=0, second=0, microsecond=0)
-                ), self.event.timezone)
 
-        if date_until:
-            if isinstance(date_until, str):
-                date_until = parse(date_until).date()
-            if isinstance(date_until, date):
-                date_until = make_aware(datetime.combine(
-                    date_until + timedelta(days=1),
-                    time(hour=0, minute=0, second=0, microsecond=0)
-                ), self.event.timezone)
+        if date_range:
+            dt_start, dt_end = resolve_timeframe_to_datetime_start_inclusive_end_exclusive(now(), date_range, self.timezone)
 
-        if date_filter == 'order_date':
-            if date_from:
-                qs = qs.filter(order__datetime__gte=date_from)
-            if date_until:
-                qs = qs.filter(order__datetime__lt=date_until)
-        elif date_filter == 'last_payment_date':
+        if date_filter == 'order_date' and date_range:
+            if dt_start:
+                qs = qs.filter(order__datetime__gte=dt_start)
+            if dt_end:
+                qs = qs.filter(order__datetime__lt=dt_end)
+        elif date_filter == 'last_payment_date' and date_range:
             p_date = OrderPayment.objects.filter(
                 order=OuterRef('order'),
                 state__in=[OrderPayment.PAYMENT_STATE_CONFIRMED, OrderPayment.PAYMENT_STATE_REFUNDED],
@@ -636,10 +753,10 @@ class OrderTaxListReport(MultiSheetListExporter):
                 m=Max('payment_date')
             ).values('m').order_by()
             qs = qs.annotate(payment_date=Subquery(p_date, output_field=DateTimeField()))
-            if date_from:
-                qs = qs.filter(payment_date__gte=date_from)
-            if date_until:
-                qs = qs.filter(payment_date__lt=date_until)
+            if dt_start:
+                qs = qs.filter(payment_date__gte=dt_start)
+            if dt_end:
+                qs = qs.filter(payment_date__lt=dt_end)
         return qs
 
     def iterate_sheet(self, form_data, sheet):

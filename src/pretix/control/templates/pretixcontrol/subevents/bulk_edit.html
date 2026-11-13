@@ -5,6 +5,7 @@
 {% load captureas %}
 {% load static %}
 {% load eventsignal %}
+{% load dialog %}
 {% block title %}{% trans "Change multiple dates" context "subevent" %}{% endblock %}
 {% block content %}
     <h1>
@@ -50,7 +51,7 @@
                             <div class="field-content">
                                 <div class="row">
                                     <div class="col-md-6">
-                                        {% bootstrap_field form.geo_lat layout="inline" %}
+                                        {% bootstrap_field form.geo_lat layout="inline" placeholder=_("Latitude") %}
                                         {% if global_settings.opencagedata_apikey %}
                                             <p class="attrib">
                                                 <a href="https://openstreetmap.org/" target="_blank" tabindex="-1">
@@ -60,7 +61,7 @@
                                         {% endif %}
                                     </div>
                                     <div class="col-md-6">
-                                        {% bootstrap_field form.geo_lon layout="inline" %}
+                                        {% bootstrap_field form.geo_lon layout="inline" placeholder=_("Longitude") %}
                                     </div>
                                 </div>
                             </div>
@@ -70,6 +71,7 @@
             </div>
             {% bootstrap_field form.frontpage_text layout="bulkedit" %}
             {% bootstrap_field form.is_public layout="bulkedit" %}
+            {% bootstrap_field form.comment layout="bulkedit" %}
             {% if meta_forms %}
                 <div class="form-group metadata-group">
                     <label class="col-md-3 control-label">{% trans "Meta data" %}</label>
@@ -114,73 +116,59 @@
                     {% bootstrap_field form.date_to_time layout="bulkedit_inline" form_group_class="" %}
                 </div>
             </div>
-            <div class="form-group">
-                <label class="col-md-3 control-label" for="{{ form.date_admission_day.id_for_label }}">
-                    {{ form.date_admission_day.label }}
-                </label>
-                <div class="col-md-5">
-                    {% bootstrap_field form.date_admission_day layout="bulkedit_inline" form_group_class="" %}
-                </div>
-                <div class="col-md-4">
-                    {% bootstrap_field form.date_admission_time layout="bulkedit_inline" form_group_class="" %}
-                </div>
-            </div>
-            <div class="form-group">
-                <label class="col-md-3 control-label" for="{{ form.presale_start_day.id_for_label }}">
-                    {{ form.presale_start_day.label }}
-                </label>
-                <div class="col-md-5">
-                    {% bootstrap_field form.presale_start_day layout="bulkedit_inline" form_group_class="" %}
-                </div>
-                <div class="col-md-4">
-                    {% bootstrap_field form.presale_start_time layout="bulkedit_inline" form_group_class="" %}
-                </div>
-            </div>
-            <div class="form-group">
-                <label class="col-md-3 control-label" for="{{ form.presale_end_day.id_for_label }}">
-                    {{ form.presale_end_day.label }}
-                </label>
-                <div class="col-md-5">
-                    {% bootstrap_field form.presale_end_day layout="bulkedit_inline" form_group_class="" %}
-                </div>
-                <div class="col-md-4">
-                    {% bootstrap_field form.presale_end_time layout="bulkedit_inline" form_group_class="" %}
-                </div>
-            </div>
+            {% bootstrap_field form.date_admission_rel layout="bulkedit" %}
+            {% bootstrap_field form.presale_start_rel layout="bulkedit" %}
+            {% bootstrap_field form.presale_end_rel layout="bulkedit" %}
         </fieldset>
         <fieldset>
             <legend>{% trans "Item prices" %}</legend>
             {% for f in itemvar_forms %}
-                <div class="form-group">
+                {% bootstrap_form_errors f %}
+                <div class="form-group subevent-itemvar-group">
                     <label class="col-md-3 control-label" for="id_{{ f.prefix }}-price">
                         {% if f.variation %}{{ f.item }} – {{ f.variation }}{% else %}{{ f.item }}{% endif %}
                     </label>
-                    <div class="col-md-6">
+                    <div class="col-md-4">
+                        <label for="{{ f.price.id_for_label }}" class="text-muted">{% trans "Price" %}</label><br>
                         {% bootstrap_field f.price addon_after=request.event.currency form_group_class="" layout="bulkedit_inline" %}
                     </div>
-                    <div class="col-md-3">
+                    <div class="col-md-5">
+                        <label class="text-muted">&nbsp;</label><br>
                         {% bootstrap_field f.disabled layout="bulkedit_inline" form_group_class="" %}
+                    </div>
+                </div>
+                <div class="form-group subevent-itemvar-group">
+                    <div class="col-md-4 col-md-offset-3">
+                        <label for="{{ f.available_from.id_for_label }}" class="text-muted">{% trans "Available from" %}</label>
+                        {% include "pretixcontrol/subevents/fragment_unavail_mode_indicator.html" with mode=f.available_from_mode %}<br>
+                        {% bootstrap_field f.available_from form_group_class="" layout="bulkedit_inline" %}
+                    </div>
+                    <div class="col-md-5">
+                        <label for="{{ f.available_until.id_for_label }}" class="text-muted">{% trans "Available until" %}</label>
+                        {% include "pretixcontrol/subevents/fragment_unavail_mode_indicator.html" with mode=f.available_until_mode %}<br>
+                        {% bootstrap_field f.available_until form_group_class="" layout="bulkedit_inline" %}
                     </div>
                 </div>
             {% endfor %}
         </fieldset>
         <fieldset>
             <legend>{% trans "Quotas" %}</legend>
-            {% if sampled_quotas|default_if_none:"NONE" == "NONE" %}
-                <div class="alert alert-warning">
-                    {% blocktrans trimmed %}
-                        You selected a set of dates that currently have different quota setups. You can therefore
-                        not change their quotas in bulk. If you want, you can set up a new set of quotas to
-                        <strong>replace</strong> the quota setup of all selected dates.
-                    {% endblocktrans %}
-                </div>
-            {% endif %}
-            <div class="bulk-edit-field-group">
+            <div class="bulk-edit-field-group"
+                 {% if sampled_quotas|default_if_none:"NONE" == "NONE" %}
+                 data-confirm-dialog="#confirm-override-quotas"
+                 {% endif %}>
                 <label class="field-toggle">
                     <input type="checkbox" name="_bulk" value="__quotas" {% if "__quotas" in bulk_selected %}checked{% endif %}>
                     {% trans "change" context "form_bulk" %}
                 </label>
                 <div class="field-content">
+                    {% if sampled_quotas|default_if_none:"NONE" == "NONE" %}
+                        <div class="alert alert-warning">
+                            {% trans "You selected a set of dates that currently have different quota setups." %}
+                            {% trans "Using this option will <strong>delete all current quotas</strong> from <strong>all selected dates</strong>." %}
+                        </div>
+                    {% endif %}
+
                     <div class="formset" data-formset data-formset-prefix="{{ formset.prefix }}">
                         {{ formset.management_form }}
                         {% bootstrap_formset_errors formset %}
@@ -209,6 +197,7 @@
                                         {% bootstrap_field form.size layout="control" %}
                                         {% bootstrap_field form.itemvars layout="control" %}
                                         {% bootstrap_field form.release_after_exit layout="control" %}
+                                        {% bootstrap_field form.ignore_for_event_availability layout="control" %}
                                     </div>
                                 </div>
                             {% endfor %}
@@ -237,6 +226,7 @@
                                         {% bootstrap_field formset.empty_form.size layout="control" %}
                                         {% bootstrap_field formset.empty_form.itemvars layout="control" %}
                                         {% bootstrap_field formset.empty_form.release_after_exit layout="control" %}
+                                        {% bootstrap_field formset.empty_form.ignore_for_event_availability layout="control" %}
                                     </div>
                                 </div>
                             {% endescapescript %}
@@ -253,7 +243,7 @@
         <fieldset>
             <legend>{% trans "Check-in lists" %}</legend>
             {% if sampled_lists|default_if_none:"NONE" == "NONE" %}
-                <div class="alert alert-warning">
+                <div class="alert alert-info">
                     {% blocktrans trimmed %}
                         You selected a set of dates that currently have different check-in list setups. You can
                         therefore not change their check-in lists in bulk.
@@ -343,10 +333,23 @@
                 </div>
             {% endif %}
         </fieldset>
-        <div class="form-group submit-group">
+        <div class="form-group submit-group submit-group-sticky">
             <button type="submit" class="btn btn-primary btn-save">
                 {% trans "Save" %}
             </button>
         </div>
     </form>
+    {% trans "Delete existing quotas" as dialog_title %}
+    {% trans "Using this option will <strong>delete all current quotas</strong> from <strong>all selected dates</strong>." as dialog_text %}
+    {% trans "This cannot be reverted. Are you sure to proceed?" as dialog_text2 %}
+    {% dialog "confirm-override-quotas" dialog_title dialog_text|add:" "|add:dialog_text2 icon="trash" %}
+        <p class="modal-card-confirm modal-card-confirm-spread">
+            <button class="btn btn-lg btn-default" value="no">
+                {% trans "Cancel" %}
+            </button>
+            <button class="btn btn-lg btn-danger" value="yes">
+                {% trans "Proceed" %}
+            </button>
+        </p>
+    {% enddialog %}
 {% endblock %}

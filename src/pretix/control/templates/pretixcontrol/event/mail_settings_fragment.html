@@ -5,7 +5,6 @@
     <summary class="panel-heading">
         <h4 class="panel-title">
             <strong>{% trans title %}</strong>
-            <i class="fa fa-angle-down collapse-indicator"></i>
         </h4>
     </summary>
     <div id="{{ pid }}">
@@ -35,9 +34,19 @@
                                     {% bootstrap_field field show_label=False form_group_class="" %}
                                 </div>
                                 <div id="{{ item }}_preview" class="tab-pane mail-preview-group">
-                                    {% for l in request.event.settings.locales %}
-                                        <div lang="{{ l }}" for="{{ item }}" class="mail-preview"></div>
-                                    {% endfor %}
+                                    {% if request.event %}
+                                        {% for l, n in settings.LANGUAGES %}
+                                            {% if l in request.event.settings.locales %}
+                                                <div lang="{{ l }}" for="{{ item }}" class="mail-preview"></div>
+                                            {% endif %}
+                                        {% endfor %}
+                                    {% else %}
+                                        {% for l, n in settings.LANGUAGES %}
+                                            {% if l in request.organizer.settings.locales %}
+                                                <div lang="{{ l }}" for="{{ item }}" class="mail-preview"></div>
+                                            {% endif %}
+                                        {% endfor %}
+                                    {% endif %}
                                 </div>
                             </div>
                         </div>

@@ -43,13 +43,16 @@ Possible permissions are:
 * Can view vouchers
 * Can change vouchers
 
+.. _`rest-compat`:
+
 Compatibility
 -------------
 
-We currently see pretix' API as a beta-stage feature. We therefore do not give any guarantees
-for compatibility between feature releases of pretix (such as 1.5 and 1.6). However, as always,
-we try not to break things when we don't need to. Any backwards-incompatible changes will be
-prominently noted in the release notes.
+We try to avoid any breaking changes to our API to avoid hassle on your end. If possible, we'll
+build new features in a way that keeps all pre-existing API usage unchanged. In some cases,
+this might not be possible or only possible with restrictions. In these case, any
+backwards-incompatible changes will be prominently noted in the "Changes to the REST API"
+section of our release notes. If possible, we will announce them multiple releases in advance.
 
 We treat the following types of changes as *backwards-compatible* so we ask you to make sure
 that your clients can deal with them properly:
@@ -58,6 +61,8 @@ that your clients can deal with them properly:
 * Support of new HTTP methods for a given API endpoint
 * Support of new query parameters for a given API endpoint
 * New fields contained in API responses
+* New possible values of enumeration-like fields
+* Response body structure or message texts on failed requests (``4xx``, ``5xx`` response codes)
 
 We treat the following types of changes as *backwards-incompatible*:
 
@@ -87,7 +92,8 @@ respectively, or ``null`` if there is no such page. You can use those URLs to re
 respective page.
 
 The field ``results`` contains a list of objects representing the first results. For most
-objects, every page contains 50 results.
+objects, every page contains 50 results. You can specify a lower pagination size using the
+``page_size`` query parameter, but no more than 50.
 
 Conditional fetching
 --------------------
@@ -111,7 +117,7 @@ List-level conditional fetching
 If modification checks are not possible with this granularity, you can instead check for the full list.
 In this case, the list of objects may contain a regular HTTP header ``Last-Modified`` with the date of the
 last modification to any item of that resource. You can then pass this date back in your next request in the
-``If-Modified-Since`` header. If the any object has changed in the meantime, you will receive back a full list
+``If-Modified-Since`` header. If any object has changed in the meantime, you will receive back a full list
 (if something it missing, this means the object has been deleted). If nothing happened, we'll send back a
 ``304 Not Modified`` return code.
 
@@ -167,7 +173,7 @@ Datetime              String in ISO 8601 format    ``"2017-12-27T10:00:00Z"``
                       with timezone (normally UTC) ``"2017-12-27T10:00:00.596934Z"``,
                                                    ``"2017-12-27T10:00:00+02:00"``
 Date                  String in ISO 8601 format    ``2017-12-27``
-Multi-lingual string  Object of strings            ``{"en": "red", "de": "rot", "de_Informal": "rot"}``
+Multi-lingual string  Object of strings            ``{"en": "red", "de": "rot", "de-informal": "rot"}``
 Money                 String with decimal number   ``"23.42"``
 Currency              String with ISO 4217 code    ``"EUR"``, ``"USD"``
 Relative datetime     *either* String in ISO 8601  ``"2017-12-27T10:00:00.596934Z"``,
@@ -186,6 +192,9 @@ Relative date         *either* String in ISO 8601  ``"2017-12-27"``,
 File                  URL in responses, ``file:``  ``"https://…"``, ``"file:…"``
                       specifiers in requests
                       (see below).
+Date range            *either* two dates separated ``2022-03-18/2022-03-23``, ``2022-03-18/``,
+                      by ``/`` *or* the name of a  ``/2022-03-23``, ``week_this``, ``week_next``,
+                      defined range.               ``month_this``
 ===================== ============================ ===================================
 
 Query parameters

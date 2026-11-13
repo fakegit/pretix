@@ -60,7 +60,13 @@ The exporter class
    .. py:attribute:: BaseExporter.event
 
       The default constructor sets this property to the event we are currently
-      working for.
+      working for. This will be ``None`` if the exporter is run for multiple
+      events.
+
+   .. py:attribute:: BaseExporter.events
+
+      The default constructor sets this property to the list of events to work
+      on, regardless of whether the exporter is called for one or multiple events.
 
    .. autoattribute:: identifier
 
@@ -70,8 +76,28 @@ The exporter class
 
       This is an abstract attribute, you **must** override this!
 
+   .. autoattribute:: description
+
+   .. autoattribute:: category
+
+   .. autoattribute:: feature
+
    .. autoattribute:: export_form_fields
+
+   .. autoattribute:: repeatable_read
 
    .. automethod:: render
 
       This is an abstract method, you **must** override this!
+
+   .. automethod:: available_for_user
+
+   .. automethod:: get_required_event_permission
+
+On organizer level, by default exporters are expected to handle on a *set of events* and the system will automatically
+add a form field that allows the selection of events, limited to events the user has correct permissions for. If this
+does not fit your organizer, because it is not related to events, you should **also** inherit from the following class:
+
+.. class:: pretix.base.exporter.OrganizerLevelExportMixin
+
+   .. automethod:: get_required_organizer_permission

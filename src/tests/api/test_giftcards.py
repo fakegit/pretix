@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -20,18 +20,20 @@
 # <https://www.gnu.org/licenses/>.
 #
 import copy
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
+from django.utils.timezone import now
 from django_scopes import scopes_disabled
 
-from pretix.base.models import GiftCard, Organizer
+from pretix.base.models import GiftCard, Order, Organizer
 
 
 @pytest.fixture
 def giftcard(organizer, event):
     gc = organizer.issued_gift_cards.create(secret="ABCDEF", currency="EUR")
-    gc.transactions.create(value=Decimal('23.00'))
+    gc.transactions.create(value=Decimal('23.00'), acceptor=organizer)
     return gc
 
 
@@ -50,7 +52,9 @@ TEST_GC_RES = {
     "testmode": False,
     "expires": None,
     "conditions": None,
-    "currency": "EUR"
+    "currency": "EUR",
+    "issuer": "dummy",
+    "owner_ticket": None
 }
 
 
@@ -82,6 +86,18 @@ def test_giftcard_list(token_client, organizer, event, giftcard, other_giftcard)
     assert resp.status_code == 200
     assert 2 == len(resp.data['results'])
 
+    resp = token_client.get('/api/v1/organizers/{}/giftcards/?expired=false'.format(organizer.slug))
+    assert 1 == len(resp.data['results'])
+    resp = token_client.get('/api/v1/organizers/{}/giftcards/?expired=true'.format(organizer.slug))
+    assert 0 == len(resp.data['results'])
+
+    resp = token_client.get('/api/v1/organizers/{}/giftcards/?value=23.00'.format(organizer.slug))
+    assert 1 == len(resp.data['results'])
+    resp = token_client.get('/api/v1/organizers/{}/giftcards/?value=23'.format(organizer.slug))
+    assert 1 == len(resp.data['results'])
+    resp = token_client.get('/api/v1/organizers/{}/giftcards/?value=24'.format(organizer.slug))
+    assert 0 == len(resp.data['results'])
+
 
 @pytest.mark.django_db
 def test_giftcard_detail(token_client, organizer, event, giftcard):
@@ -91,6 +107,97 @@ def test_giftcard_detail(token_client, organizer, event, giftcard):
     resp = token_client.get('/api/v1/organizers/{}/giftcards/{}/'.format(organizer.slug, giftcard.pk))
     assert resp.status_code == 200
     assert res == resp.data
+
+
+@pytest.mark.django_db
+def test_giftcard_detail_expand(token_client, organizer, event, giftcard):
+    with scopes_disabled():
+        o = Order.objects.create(
+            code='FOO', event=event, email='dummy@dummy.test',
+            status=Order.STATUS_PENDING, datetime=now(), expires=now() + timedelta(days=10),
+            sales_channel=event.organizer.sales_channels.get(identifier="web"),
+            total=14, locale='en'
+        )
+        ticket = event.items.create(name='Early-bird ticket', category=None, default_price=23, admission=True,
+                                    personalized=True)
+        op = o.positions.create(item=ticket, price=Decimal("14"))
+        giftcard.owner_ticket = op
+        giftcard.save()
+
+    res = dict(TEST_GC_RES)
+    res["id"] = giftcard.pk
+    res["issuance"] = giftcard.issuance.isoformat().replace('+00:00', 'Z')
+    resp = token_client.get('/api/v1/organizers/{}/giftcards/{}/?expand=owner_ticket'.format(organizer.slug, giftcard.pk))
+    assert resp.status_code == 200
+
+    assert resp.data["owner_ticket"] == {
+        "id": op.pk,
+        "order": {"code": "FOO", "event": "dummy"},
+        "positionid": op.positionid,
+        "item": ticket.pk,
+        "variation": None,
+        "price": "14.00",
+        "attendee_name": None,
+        "attendee_name_parts": {},
+        "company": None,
+        "street": None,
+        "zipcode": None,
+        "city": None,
+        "country": None,
+        "state": None,
+        "discount": None,
+        "attendee_email": None,
+        "voucher": None,
+        "voucher_budget_use": None,
+        "tax_rate": "0.00",
+        "tax_value": "0.00",
+        "tax_code": None,
+        "secret": op.secret,
+        "addon_to": None,
+        "subevent": None,
+        "checkins": [],
+        "print_logs": [],
+        "downloads": [],
+        "answers": [],
+        "tax_rule": None,
+        "pseudonymization_id": op.pseudonymization_id,
+        "pdf_data": {},
+        "plugin_data": {},
+        "seat": None,
+        "canceled": False,
+        "valid_from": None,
+        "valid_until": None,
+        "blocked": None
+    }
+
+
+@pytest.mark.django_db
+def test_giftcard_detail_expand_without_permissions(team, token_client, organizer, event, giftcard):
+    with scopes_disabled():
+        o = Order.objects.create(
+            code='FOO', event=event, email='dummy@dummy.test',
+            status=Order.STATUS_PENDING, datetime=now(), expires=now() + timedelta(days=10),
+            sales_channel=event.organizer.sales_channels.get(identifier="web"),
+            total=14, locale='en'
+        )
+        ticket = event.items.create(name='Early-bird ticket', category=None, default_price=23, admission=True,
+                                    personalized=True)
+        op = o.positions.create(item=ticket, price=Decimal("14"))
+        giftcard.owner_ticket = op
+        giftcard.save()
+
+    team.all_event_permissions = False
+    team.save()
+
+    res = dict(TEST_GC_RES)
+    res["id"] = giftcard.pk
+    res["issuance"] = giftcard.issuance.isoformat().replace('+00:00', 'Z')
+    resp = token_client.get('/api/v1/organizers/{}/giftcards/{}/?expand=owner_ticket'.format(organizer.slug, giftcard.pk))
+    assert resp.status_code == 200
+
+    assert resp.data["owner_ticket"] == {
+        "id": op.pk,
+    }
 
 
 TEST_GIFTCARD_CREATE_PAYLOAD = {
@@ -129,23 +236,53 @@ def test_giftcard_duplicate_secert(token_client, organizer, event, giftcard):
 
 
 @pytest.mark.django_db
-def test_giftcard_patch(token_client, organizer, event, giftcard):
+def test_giftcard_patch_owner_by_id(token_client, organizer, event, giftcard):
+    with scopes_disabled():
+        o = Order.objects.create(
+            code='FOO', event=event, email='dummy@dummy.test',
+            status=Order.STATUS_PENDING, datetime=now(), expires=now() + timedelta(days=10),
+            sales_channel=event.organizer.sales_channels.get(identifier="web"),
+            total=14, locale='en'
+        )
+        ticket = event.items.create(name='Early-bird ticket', category=None, default_price=23, admission=True,
+                                    personalized=True)
+        op = o.positions.create(item=ticket, price=Decimal("14"))
+
     resp = token_client.patch(
         '/api/v1/organizers/{}/giftcards/{}/'.format(organizer.slug, giftcard.pk),
         {
-            'secret': 'foo',
-            'value': '10.00',
-            'testmode': True,
-            'currency': 'USD'
+            'owner_ticket': op.pk,
         },
         format='json'
     )
     assert resp.status_code == 200
     giftcard.refresh_from_db()
-    assert giftcard.value == Decimal('10.00')
-    assert giftcard.secret == "ABCDEF"
-    assert giftcard.currency == "EUR"
-    assert not giftcard.testmode
+    assert giftcard.owner_ticket == op
+
+
+@pytest.mark.django_db
+def test_giftcard_patch_owner_by_secret(token_client, organizer, event, giftcard):
+    with scopes_disabled():
+        o = Order.objects.create(
+            code='FOO', event=event, email='dummy@dummy.test',
+            status=Order.STATUS_PENDING, datetime=now(), expires=now() + timedelta(days=10),
+            sales_channel=event.organizer.sales_channels.get(identifier="web"),
+            total=14, locale='en'
+        )
+        ticket = event.items.create(name='Early-bird ticket', category=None, default_price=23, admission=True,
+                                    personalized=True)
+        op = o.positions.create(item=ticket, price=Decimal("14"))
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/giftcards/{}/'.format(organizer.slug, giftcard.pk),
+        {
+            'owner_ticket': op.secret,
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    giftcard.refresh_from_db()
+    assert giftcard.owner_ticket == op
 
 
 @pytest.mark.django_db
@@ -176,7 +313,8 @@ def test_giftcard_transact(token_client, organizer, event, giftcard):
         '/api/v1/organizers/{}/giftcards/{}/transact/'.format(organizer.slug, giftcard.pk),
         {
             'value': '10.00',
-            'text': 'bla'
+            'text': 'bla',
+            'info': {"a": "b"}
         },
         format='json'
     )
@@ -184,6 +322,36 @@ def test_giftcard_transact(token_client, organizer, event, giftcard):
     giftcard.refresh_from_db()
     assert giftcard.value == Decimal('43.00')
     assert giftcard.transactions.last().text == 'bla'
+    assert giftcard.transactions.last().info == {"a": "b"}
+    assert giftcard.transactions.last().acceptor == organizer
+
+
+@pytest.mark.django_db
+def test_giftcard_transact_cross_organizer(token_client, organizer, event, other_giftcard):
+    resp = token_client.post(
+        '/api/v1/organizers/{}/giftcards/{}/transact/?include_accepted=true'.format(organizer.slug, other_giftcard.pk),
+        {
+            'value': '10.00',
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    other_giftcard.refresh_from_db()
+    assert other_giftcard.value == Decimal('10.00')
+    assert other_giftcard.transactions.last().acceptor == organizer
+
+
+@pytest.mark.django_db
+def test_giftcard_transact_cross_organizer_inactive(token_client, organizer, event, other_giftcard):
+    organizer.gift_card_issuer_acceptance.update(active=False)
+    resp = token_client.post(
+        '/api/v1/organizers/{}/giftcards/{}/transact/?include_accepted=true'.format(organizer.slug, other_giftcard.pk),
+        {
+            'value': '10.00',
+        },
+        format='json'
+    )
+    assert resp.status_code == 404
 
 
 @pytest.mark.django_db
@@ -226,7 +394,9 @@ def test_giftcard_transactions(token_client, organizer, giftcard):
                 "value": "23.00",
                 "event": None,
                 "order": None,
-                "text": None
+                "text": None,
+                "info": None,
+                "acceptor": organizer.slug
             }
         ]
     }

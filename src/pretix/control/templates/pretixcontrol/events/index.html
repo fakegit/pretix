@@ -2,6 +2,7 @@
 {% load i18n %}
 {% load urlreplace %}
 {% load bootstrap3 %}
+{% load static %}
 {% block title %}{% trans "Events" %}{% endblock %}
 {% block content %}
     <h1>{% trans "Events" %}</h1>
@@ -24,32 +25,36 @@
             <div class="panel-heading">
                 <h3 class="panel-title">{% trans "Filter" %}</h3>
             </div>
-            <div class="panel-body">
-                <form class="" action="" method="get">
-                    <div class="row filter-form">
-                        <div class="col-md-3 col-sm-6 col-xs-12">
-                            {% bootstrap_field filter_form.query layout='inline' %}
-                        </div>
-                        <div class="col-md-3 col-sm-6 col-xs-12">
-                            {% bootstrap_field filter_form.status layout='inline' %}
-                        </div>
-                        <div class="col-md-3 col-sm-6 col-xs-12">
-                            {% bootstrap_field filter_form.organizer layout='inline' %}
-                        </div>
-                        {% for mf in meta_fields %}
-                            <div class="col-md-3 col-sm-6 col-xs-12">
-                                {% bootstrap_field mf layout='inline' %}
-                            </div>
-                        {% endfor %}
+            <form class="panel-body filter-form" action="" method="get">
+                <div class="row">
+                    <div class="col-md-3 col-sm-6 col-xs-12">
+                        {% bootstrap_field filter_form.query %}
                     </div>
-                    <div class="text-right">
-                        <button class="btn btn-primary" type="submit">
-                            <span class="fa fa-filter"></span>
-                            <span class="hidden-md">{% trans "Filter" %}</span>
-                        </button>
+                    <div class="col-md-3 col-sm-6 col-xs-12">
+                        {% bootstrap_field filter_form.status %}
                     </div>
-                </form>
-            </div>
+                    <div class="col-md-3 col-sm-6 col-xs-12">
+                        {% bootstrap_field filter_form.date_from %}
+                    </div>
+                    <div class="col-md-3 col-sm-6 col-xs-12">
+                        {% bootstrap_field filter_form.date_until %}
+                    </div>
+                    <div class="col-md-3 col-sm-6 col-xs-12">
+                        {% bootstrap_field filter_form.organizer %}
+                    </div>
+                    {% for mf in meta_fields %}
+                        <div class="col-md-3 col-sm-6 col-xs-12">
+                            {% bootstrap_field mf %}
+                        </div>
+                    {% endfor %}
+                </div>
+                <div class="text-right">
+                    <button class="btn btn-primary btn-lg" type="submit">
+                        <span class="fa fa-filter"></span>
+                        {% trans "Filter" %}
+                    </button>
+                </div>
+            </form>
         </div>
         <p>
             <a href="{% url "control:events.add" %}" class="btn btn-default">
@@ -70,6 +75,7 @@
                         <a href="?{% url_replace request 'ordering' 'organizer' %}"><i class="fa fa-caret-up"></i></a>
                     </th>
                 {% endif %}
+                <th>{% trans "Sales channels" %}</th>
                 <th>
                     {% trans "Start date" %}
                     <a href="?{% url_replace request 'ordering' '-date_from' %}"><i class="fa fa-caret-down"></i></a>
@@ -104,25 +110,43 @@
                         {% endfor %}
                     </td>
                     {% if not hide_orga %}<td>{{ e.organizer }}</td>{% endif %}
+                    <td>
+                        {% for c in e.organizer.sales_channels.all %}
+                            {% if e.all_sales_channels or c in e.limit_sales_channels.all %}
+                                {% if "." in c.icon %}
+                                    <img src="{% static c.icon %}" class="fa-like-image"
+                                         data-toggle="tooltip" title="{{ c.label }}">
+                                {% else %}
+                                    <span class="fa fa-fw fa-{{ c.icon }} text-muted"
+                                          data-toggle="tooltip" title="{{ c.label }}"></span>
+                                {% endif %}
+                            {% else %}
+                                <span class="fa fa-fw"></span>
+                            {% endif %}
+                        {% endfor %}
+                    </td>
                     <td class="event-date-col">
                         {% if e.has_subevents %}
-                            {{ e.min_from|default_if_none:""|date:"SHORT_DATETIME_FORMAT" }}
+                            <span class="fa fa-fw- fa-calendar"></span>
+                            {% trans "Event series" %}
+                            <br>
+                            <span class="text-muted">
+                                {% if e.min_from %}
+                                    {{ e.min_from|date:"SHORT_DATETIME_FORMAT" }} –<br>
+                                    {{ e.max_fromto|default_if_none:e.max_to|default_if_none:e.max_from|date:"SHORT_DATETIME_FORMAT" }}
+                                {% else %}
+                                    {% trans "No dates" context "subevent" %}
+                                {% endif %}
+                            </span>
                         {% else %}
                             {{ e.get_short_date_from_display }}
-                        {% endif %}
-                        {% if e.has_subevents %}
-                            <span class="label label-default">{% trans "Series" %}</span>
-                        {% endif %}
-                        {% if e.settings.show_date_to and e.date_to %}
-                             –<br>
-                            {% if e.has_subevents %}
-                                {{ e.max_fromto|default_if_none:e.max_from|default_if_none:e.max_to|default_if_none:""|date:"SHORT_DATETIME_FORMAT" }}
-                            {% else %}
+                            {% if e.settings.show_date_to and e.date_to %}
+                                –<br>
                                 {{ e.get_short_date_to_display }}
                             {% endif %}
                         {% endif %}
                         {% if e.settings.timezone != request.timezone %}
-                            <span class="fa fa-globe text-muted" data-toggle="tooltip" title="{{ e.timezone }}"></span>
+                            <span class="fa fa-globe text-muted" data-toggle="tooltip" title="{{ e.tzname }}"></span>
                         {% endif %}
                     </td>
                     <td>

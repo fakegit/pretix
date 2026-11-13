@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -31,16 +31,15 @@ class LocaleDeterminationTest(TestCase):
     This test case tests various methods around the properties /
     variations concept.
     """
-    @classmethod
-    def setUpTestData(cls):
+    def setUp(self):
         o = Organizer.objects.create(name='Dummy', slug='dummy')
-        cls.event = Event.objects.create(
+        self.event = Event.objects.create(
             organizer=o, name='Dummy', slug='dummy',
             date_from=now(), live=True
         )
-        cls.TEST_LOCALE = 'de' if settings.LANGUAGE_CODE == 'en' else 'en'
-        cls.TEST_LOCALE_LONG = 'de-AT' if settings.LANGUAGE_CODE == 'en' else 'en-NZ'
-        cls.user = User.objects.create_user('dummy@dummy.dummy', 'dummy')
+        self.TEST_LOCALE = 'de' if settings.LANGUAGE_CODE == 'en' else 'en'
+        self.TEST_LOCALE_LONG = 'de-AT' if settings.LANGUAGE_CODE == 'en' else 'en-NZ'
+        self.user = User.objects.create_user('dummy@dummy.dummy', 'dummy')
 
     def test_global_default(self):
         c = Client()
@@ -127,3 +126,81 @@ class LocaleDeterminationTest(TestCase):
         response = c.get('/dummy/dummy/')
         language = response['Content-Language']
         self.assertEqual(language, 'en')
+
+
+def test_render_csp():
+    from pretix.base.middleware import _render_csp
+
+    assert _render_csp({}) == ""
+    assert _render_csp({'default-src': ["'self'"]}) == "default-src 'self'"
+
+    h = {
+        'default-src': ["'self'"],
+        'script-src': ["'self'"],
+        'object-src': ["'none'"],
+        'frame-src': ["'self'"],
+        'style-src': ["'self'", "'self'"],
+        'connect-src': ["'self'", "'self'"],
+        'img-src': ["'self'", "'self'", "data:"],
+        'font-src': ["'self'"],
+        'media-src': ["'self'", "data:"],
+        'form-action': ["'self'", "https:"],
+    }
+    assert _render_csp(h) == (
+        "default-src 'self'; script-src 'self'; object-src 'none'; frame-src 'self'; style-src 'self' 'self'; "
+        "connect-src 'self' 'self'; img-src 'self' 'self' data:; font-src 'self'; media-src 'self' data:; form-action 'self' https:"
+    )
+
+
+def test_merge_csp():
+    from pretix.base.middleware import _merge_csp, _parse_csp, _render_csp
+
+    h = {
+        'default-src': ["'self'"],
+        'script-src': ["'self'"],
+        'style-src': ["'self'", "'self'"],
+        'form-action': ["'self'", "https:"],
+        'connect-src': ["'self'", "'self'"],
+    }
+    assert _render_csp(h) == (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'self'; form-action 'self' https:; connect-src 'self' 'self'"
+    )
+
+    _merge_csp(h, _parse_csp("style-src 'unsafe-inline'; connect-src https://example.com"))
+    assert _render_csp(h) == (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'self' 'unsafe-inline'; form-action 'self' "
+        "https:; connect-src 'self' 'self' https://example.com"
+    )
+
+
+def test_roundtrip_csp():
+    from pretix.base.middleware import _merge_csp, _parse_csp, _render_csp
+
+    prod_csp = ("default-src 'self' https://pretix.eu https://static.pretix.cloud; script-src 'self' "
+                "'sha256-+tmFggeXIPOAC2UgcQ3LW/gPHTkwyWg3/D6FOJ5BHGo=' 'unsafe-eval' https://matomo.rami.io "
+                "https://pretix.eu https://static.pretix.cloud https://support.rami.io; object-src 'none'; "
+                "frame-src 'self' https://matomo.rami.io https://pretix.eu https://static.pretix.cloud "
+                "https://support.rami.io https://www.youtube-nocookie.com; style-src 'self' 'unsafe-inline' "
+                "data: https://cdn.pretix.cloud https://pretix.eu https://static.pretix…rt.rami.io; connect-src "
+                "'self' https://cdn.pretix.cloud https://matomo.rami.io https://pretix.eu https://static.pretix.cloud "
+                "https://support.rami.io ws://support.rami.io; img-src 'self' data: https://cdn.pretix.cloud "
+                "https://matomo.rami.io https://pretix.eu https://static.pretix.cloud https://support.rami.io; "
+                "font-src 'self' https://pretix.eu https://static.pretix.cloud; media-src 'self' data: "
+                "https://cdn.pretix.cloud https://pretix.eu https://static.pretix.cloud; form-action 'self' "
+                "https: https://pretix.eu")
+    h = _parse_csp(prod_csp)
+    _merge_csp(h, _parse_csp(prod_csp))
+    assert _render_csp(h) == prod_csp
+
+
+def test_sanitize_csp():
+    from pretix.base.middleware import _render_csp
+
+    h = {
+        'style-src': ["'self'", "https://example.com", "https://example.org https://attack.example.net", "https://\fexample.org",
+                      "https://\texample.org", "https://example.org;script-src https://example.org", ],
+        'script-src': ["'self'"],
+    }
+    assert _render_csp(h) == (
+        "style-src 'self' https://example.com; script-src 'self'"
+    )

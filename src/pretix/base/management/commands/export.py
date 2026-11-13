@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -22,7 +22,7 @@
 import json
 import sys
 
-import pytz
+import pytz_deprecation_shim
 from django.core.management.base import BaseCommand
 from django.utils.timezone import override
 from django_scopes import scope
@@ -60,7 +60,7 @@ class Command(BaseCommand):
             sys.exit(1)
 
         locale = options.get("locale", None)
-        timezone = pytz.timezone(options['timezone']) if options.get('timezone') else None
+        timezone = pytz_deprecation_shim.timezone(options['timezone']) if options.get('timezone') else None
 
         with scope(organizer=o):
             if options['event_slug']:
@@ -103,7 +103,9 @@ class Command(BaseCommand):
 
             with language(locale), override(timezone):
                 for receiver, response in signal_result:
-                    ex = response(e, report_status)
+                    if not response:
+                        continue
+                    ex = response(e, o, report_status)
                     if ex.identifier == options['export_provider']:
                         params = json.loads(options.get('parameters') or '{}')
                         with open(options['output_file'], 'wb') as f:

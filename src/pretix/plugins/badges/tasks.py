@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -20,6 +20,7 @@
 # <https://www.gnu.org/licenses/>.
 #
 import logging
+import tempfile
 from typing import List
 
 from django.core.files.base import ContentFile
@@ -31,16 +32,20 @@ from pretix.base.services.orders import OrderError
 from pretix.base.services.tasks import EventTask
 from pretix.celery_app import app
 
+from ...base.services.export import ExportError
 from .exporters import OPTIONS, render_pdf
 
 logger = logging.getLogger(__name__)
 
 
-@app.task(base=EventTask, throws=(OrderError,))
+@app.task(base=EventTask, throws=(OrderError, ExportError,))
 def badges_create_pdf(event: Event, fileid: int, positions: List[int]) -> int:
     file = CachedFile.objects.get(id=fileid)
 
-    pdfcontent = render_pdf(event, OrderPosition.objects.filter(id__in=positions), opt=OPTIONS['one'])
-    file.file.save(cachedfile_name(file, file.filename), ContentFile(pdfcontent.read()))
-    file.save()
+    with tempfile.TemporaryFile() as tmp_file:
+        render_pdf(event, OrderPosition.objects.filter(id__in=positions), opt=OPTIONS['one'],
+                   output_file=tmp_file)
+        tmp_file.seek(0)
+        file.file.save(cachedfile_name(file, file.filename), ContentFile(tmp_file.read()))
+        file.save()
     return file.pk

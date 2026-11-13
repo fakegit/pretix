@@ -17,6 +17,13 @@ Field                                 Type                       Description
 name                                  string                     The organizer's full name, i.e. the name of an
                                                                  organization or company.
 slug                                  string                     A short form of the name, used e.g. in URLs.
+public_url                            string                     The public, customer-facing URL of the organizer, where
+                                                                 the list of all events can be found (read-only).
+plugins                               list                       A list of package names of the enabled plugins for this
+                                                                 organizer. Note that most plugins are enabled on the
+                                                                 event level (or both levels). If you remove a plugin
+                                                                 that is also enabled on some events, it will
+                                                                 automatically be removed from all events as well.
 ===================================== ========================== =======================================================
 
 
@@ -51,6 +58,10 @@ Endpoints
           {
             "name": "Big Events LLC",
             "slug": "Big Events",
+            "public_url": "https://pretix.eu/bigevents/",
+            "plugins": [
+              "pretix_datev"
+            ]
           }
         ]
       }
@@ -84,12 +95,58 @@ Endpoints
       {
         "name": "Big Events LLC",
         "slug": "Big Events",
+        "public_url": "https://pretix.eu/bigevents/",
+        "plugins": [
+          "pretix_datev"
+        ]
       }
 
    :param organizer: The ``slug`` field of the organizer to fetch
    :statuscode 200: no error
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer does not exist **or** you have no permission to view it.
+
+.. http:patch:: /api/v1/organizers/(organizer)/
+
+   Updates an organizer. Currently only the ``plugins`` field may be updated.
+
+   **Example request**:
+
+   .. sourcecode:: http
+
+      PATCH /api/v1/organizers/bigevents/ HTTP/1.1
+      Host: pretix.eu
+      Accept: application/json, text/javascript
+      Content-Type: application/json
+
+      {
+        "plugins": [
+          "pretix_seating"
+        ]
+      }
+
+   **Example response**:
+
+   .. sourcecode:: http
+
+      HTTP/1.1 200 OK
+      Vary: Accept
+      Content-Type: application/json
+
+      {
+        "name": "Big Events LLC",
+        "slug": "Big Events",
+        "public_url": "https://pretix.eu/bigevents/",
+        "plugins": [
+          "pretix_seating"
+        ]
+      }
+
+   :param organizer: The ``slug`` field of the organizer to update
+   :statuscode 200: no error
+   :statuscode 400: The organizer could not be updated due to invalid submitted data.
+   :statuscode 401: Authentication failure
+   :statuscode 403: The requested organizer does not exist **or** you have no permission to update this resource.
 
 Organizer settings
 ------------------
@@ -109,15 +166,9 @@ information about the properties.
 .. warning:: This API is intended for advanced users. Even though we take care to validate your input, you will be
              able to break your shops using this API by creating situations of conflicting settings. Please take care.
 
-.. versionchanged:: 3.14
-
-   Initial support for settings has been added to the API.
-
 .. http:get:: /api/v1/organizers/(organizer)/settings/
 
    Get current values of organizer settings.
-
-   Permission required: "Can change organizer settings"
 
    **Example request**:
 
@@ -153,6 +204,7 @@ information about the properties.
           {
             "value": "calendar",
             "label": "Default overview style",
+            "readonly": false,
             "help_text": "If your event series has more than 50 dates in the future, only the month or week calendar can be used."
           }
         },

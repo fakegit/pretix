@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -31,28 +31,41 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the Apache License 2.0 is
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
+import logging
+from datetime import datetime
 
+from django.db.models import Exists, OuterRef, Q
 from i18nfield.strings import LazyI18nString
 
 from pretix.base.email import get_email_context
 from pretix.base.i18n import language
-from pretix.base.models import Event, InvoiceAddress, Order, User
-from pretix.base.services.mail import SendMailException, mail
+from pretix.base.models import Checkin, Event, InvoiceAddress, Order, User
+from pretix.base.services.mail import mail
 from pretix.base.services.tasks import ProfiledEventTask
 from pretix.celery_app import app
 
+logger = logging.getLogger(__name__)
+
+
+def _chunks(lst, n):
+    """
+    Yield successive n-sized chunks from lst.
+    """
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
 
 @app.task(base=ProfiledEventTask, acks_late=True)
-def send_mails(event: Event, user: int, subject: dict, message: dict, orders: list, items: list,
-               recipients: str, filter_checkins: bool, not_checked_in: bool, checkin_lists: list,
-               attachments: list = None) -> None:
-    failures = []
+def send_mails_to_orders(event: Event, user: int, subject: dict, message: dict, objects: list, items: list,
+                         subevent: int, subevents_from: datetime, subevents_to: datetime,
+                         recipients: str, filter_checkins: bool, not_checked_in: bool, checkin_lists: list,
+                         attachments: list = None, attach_tickets: bool = False,
+                         attach_ical: bool = False) -> None:
     user = User.objects.get(pk=user) if user else None
-    orders = Order.objects.filter(pk__in=orders, event=event)
     subject = LazyI18nString(subject)
     message = LazyI18nString(message)
 
-    for o in orders:
+    def _send_to_order(o):
         send_to_order = recipients in ('both', 'orders')
 
         try:
@@ -60,80 +73,141 @@ def send_mails(event: Event, user: int, subject: dict, message: dict, orders: li
         except InvoiceAddress.DoesNotExist:
             ia = InvoiceAddress(order=o)
 
+        parent_op = None
+        sent_to_positions = set()
         if recipients in ('both', 'attendees'):
-            for p in o.positions.prefetch_related('addons'):
-                if p.addon_to_id is not None:
+            for p in o.positions.annotate(
+                any_checkins=Exists(
+                    Checkin.objects.filter(
+                        Q(position_id=OuterRef('pk')) | Q(position__addon_to_id=OuterRef('pk')),
+                        list__consider_tickets_used=True,
+                    )
+                ),
+                matching_checkins=Exists(
+                    Checkin.objects.filter(
+                        Q(position_id=OuterRef('pk')) | Q(position__addon_to_id=OuterRef('pk')),
+                        list_id__in=checkin_lists or []
+                    )
+                ),
+            ).prefetch_related('addons', 'subevent'):
+
+                if p.addon_to_id is None:
+                    parent_op = p
+                elif not parent_op or p.addon_to_id != parent_op.id:
+                    # this op is an add-on, but not to the current parent_op
+                    # something got mixed up as add-ons should always come directly after their parent
+                    logger.warning(f"Add-ons are mixed up for position #{p.positionid} in order {o.full_code}")
                     continue
 
-                if p.item_id not in items and not any(a.item_id in items for a in p.addons.all()):
+                if p.item_id not in items:
                     continue
 
                 if filter_checkins:
-                    checkins = list(p.checkins.all())
                     allowed = (
-                        (not_checked_in and not checkins)
-                        or (any(c.list_id in checkin_lists for c in checkins))
+                        (not_checked_in and not p.any_checkins)
+                        or p.matching_checkins
                     )
                     if not allowed:
                         continue
 
+                if p.addon_to_id and (
+                    not p.attendee_email or p.attendee_email == parent_op.attendee_email
+                ):
+                    # if op is addon and either has no mail or the same as parent => send to parent
+                    p = parent_op
+
+                if subevent and p.subevent_id != subevent:
+                    continue
+
+                if subevents_from and p.subevent.date_from < subevents_from:
+                    continue
+
+                if subevents_to and p.subevent.date_from >= subevents_to:
+                    continue
+
                 if not p.attendee_email:
-                    if recipients == 'attendees':
-                        send_to_order = True
+                    send_to_order = True
                     continue
 
-                if p.attendee_email == o.email and send_to_order:
+                if p.pk in sent_to_positions:
+                    # this position already got an email
                     continue
 
-                try:
-                    with language(o.locale, event.settings.region):
-                        email_context = get_email_context(event=event, order=o, position_or_address=p, position=p)
-                        mail(
-                            p.attendee_email,
-                            subject,
-                            message,
-                            email_context,
-                            event,
-                            locale=o.locale,
-                            order=o,
-                            position=p,
-                            attach_cached_files=attachments
-                        )
-                        o.log_action(
-                            'pretix.plugins.sendmail.order.email.sent.attendee',
-                            user=user,
-                            data={
-                                'position': p.positionid,
-                                'subject': subject.localize(o.locale).format_map(email_context),
-                                'message': message.localize(o.locale).format_map(email_context),
-                                'recipient': p.attendee_email
-                            }
-                        )
-                except SendMailException:
-                    failures.append(p.attendee_email)
+                if p.attendee_email == o.email:
+                    send_to_order = True
+                    continue
 
-        if send_to_order and o.email:
-            try:
                 with language(o.locale, event.settings.region):
-                    email_context = get_email_context(event=event, order=o, position_or_address=ia)
-                    mail(
-                        o.email,
+                    email_context = get_email_context(event=event, order=o, invoice_address=ia, position=p)
+                    outgoing_mail = mail(
+                        p.attendee_email,
                         subject,
                         message,
                         email_context,
                         event,
                         locale=o.locale,
                         order=o,
+                        position=p,
+                        attach_tickets=attach_tickets,
+                        attach_ical=attach_ical,
                         attach_cached_files=attachments
                     )
+                    if outgoing_mail:
+                        o.log_action(
+                            'pretix.plugins.sendmail.order.email.sent.attendee',
+                            user=user,
+                            data=outgoing_mail.log_data(),
+                        )
+                    sent_to_positions.add(p.pk)
+
+        if send_to_order and o.email:
+            with language(o.locale, event.settings.region):
+                email_context = get_email_context(event=event, order=o, invoice_address=ia)
+                outgoing_mail = mail(
+                    o.email,
+                    subject,
+                    message,
+                    email_context,
+                    event,
+                    locale=o.locale,
+                    order=o,
+                    attach_tickets=attach_tickets,
+                    attach_ical=attach_ical,
+                    attach_cached_files=attachments,
+                )
+                if outgoing_mail:
                     o.log_action(
                         'pretix.plugins.sendmail.order.email.sent',
                         user=user,
-                        data={
-                            'subject': subject.localize(o.locale).format_map(email_context),
-                            'message': message.localize(o.locale).format_map(email_context),
-                            'recipient': o.email
-                        }
+                        data=outgoing_mail.log_data(),
                     )
-            except SendMailException:
-                failures.append(o.email)
+
+    for chunk in _chunks(objects, 1000):
+        orders = Order.objects.filter(pk__in=chunk, event=event)
+        for o in orders:
+            _send_to_order(o)
+
+
+@app.task(base=ProfiledEventTask, acks_late=True)
+def send_mails_to_waitinglist(event: Event, user: int, subject: dict, message: dict, objects: list,
+                              attachments: list = None) -> None:
+    user = User.objects.get(pk=user) if user else None
+    entries = event.waitinglistentries.filter(pk__in=objects).select_related(
+        'subevent'
+    )
+    subject = LazyI18nString(subject)
+    message = LazyI18nString(message)
+
+    for e in entries:
+        e.send_mail(
+            subject,
+            message,
+            get_email_context(
+                event=e.event,
+                waiting_list_entry=e,
+                event_or_subevent=e.subevent or e.event,
+            ),
+            user=user,
+            attach_cached_files=attachments,
+            log_entry_type='pretix.plugins.sendmail.waitinglist.email.sent',
+        )

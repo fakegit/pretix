@@ -1,107 +1,120 @@
 {% extends "pretixpresale/organizers/base.html" %}
 {% load i18n %}
+{% load icon %}
 {% load rich_text %}
 {% load eventurl %}
 {% load urlreplace %}
-{% block title %}{% trans "Event overview" %}{% endblock %}
+{% block title %}
+    {% blocktrans trimmed with week=date|date:week_format week_day_from=date|date:short_month_day_format week_day_to=date_to|date:short_month_day_format %}
+        Events in {{ week }} ({{ week_day_from }} – {{ week_day_to }})
+    {% endblocktrans %}
+{% endblock %}
 {% block content %}
     {% if organizer_homepage_text %}
-        <div>
+        <div class="blank-after">
             {{ organizer_homepage_text | rich_text }}
         </div>
     {% endif %}
-    <h3>{{ date|date:"F Y" }}</h3>
-    <form class="form-inline" method="get" id="monthselform"
-          action="{% eventurl request.organizer "presale:organizer.index" %}">
-        {% for f, v in request.GET.items %}
-            {% if f != "week" and f != "year" %}
-                <input type="hidden" name="{{ f }}" value="{{ v }}">
-            {% endif %}
-        {% endfor %}
-        <div class="row">
-            <div class="col-sm-4 hidden-xs text-left flip">
-                <div class="btn-group" role="group">
-                    <a href="?{% url_replace request "style" "list" "week" "" "year" "" "month" "" %}" type="button"
-                       class="btn btn-default">
-                        <span class="fa fa-list" aria-hidden="true"></span>
-                        {% trans "List" %}
-                    </a>
-                    <a href="?{% url_replace request "style" "week" "month" "" "old" "" %}" type="button"
-                       class="btn btn-default active">
-                        <span class="fa fa-calendar" aria-hidden="true"></span>
-                        {% trans "Week" %}
-                    </a>
-                    <a href="?{% url_replace request "style" "calendar" "week" "" "old" "" "year" "" %}"
-                       type="button"
-                       class="btn btn-default">
-                        <span class="fa fa-calendar" aria-hidden="true"></span>
-                        {% trans "Month" %}
-                    </a>
-                </div>
-                <a href="{% eventurl request.organizer "presale:organizer.ical" %}?{% url_replace request "locale" request.LANGUAGE_CODE "page" "" "old" "" "week" "" "style" "" "month" "" "year" "" %}"
-                   class="btn btn-default">
-                    <span class="fa fa-calendar-plus-o" aria-hidden="true"></span>
-                    {% trans "iCal" %}
-                </a>
+    <div class="blank-after text-left flip">
+        {% include "pretixpresale/fragment_calendar_nav.html" with date=date request=request style="week" %}
+    </div>
+    <div class="panel panel-default">
+        <div class="panel-heading">
+            <h2 class="panel-title">
+                <strong>
+                {% blocktrans trimmed with week=date|date:week_format week_day_from=date|date:short_month_day_format week_day_to=date_to|date:short_month_day_format %}
+                    Events in {{ week }} ({{ week_day_from }} – {{ week_day_to }})
+                {% endblocktrans %}
+                </strong>
+            </h2>
+        </div>
+        {% if filter_form.fields %}
+            <div class="panel-subhead">
+                {% include "pretixpresale/fragment_event_list_filter.html" with request=request %}
             </div>
-            <div class="col-sm-4 col-xs-12 text-center">
-                <select name="week" class="form-control select-calendar-week-short">
-                    {% for w in weeks %}
-                        <option value="{{ w.0.isocalendar.1 }}"
-                                {% if w.0.isocalendar.1 == date.isocalendar.1 %}selected{% endif %}>{% trans "W" %} {{ w.0.isocalendar.1 }}
-                            ({{ w.0|date:"SHORT_DATE_FORMAT" }} – {{ w.1|date:"SHORT_DATE_FORMAT" }})
-                        </option>
-                    {% endfor %}
-                </select>
-                <select name="year" class="form-control">
-                    {% for y in years %}
-                        <option value="{{ y }}" {% if y == date.isocalendar.0 %}selected{% endif %}>{{ y }}</option>
-                    {% endfor %}
-                </select>
-                <button type="submit" class="js-hidden btn btn-default">
-                    {% trans "Go" %}
-                </button>
-            </div>
-            <div class="col-sm-4 hidden-xs text-right flip">
+        {% endif %}
+        <div class="panel-body">
+            <nav aria-label="{% trans "calendar navigation" %}">
+                <ul class="row calendar-nav">
+                    <li class="text-left flip">
+                        {% if has_before %}
+                            <a href="?{% url_replace request "date" before|date:"o-\WW" %}"
+                               class="btn btn-default" data-save-scrollpos aria-label="{{ before|date:week_format }}">
+                                {% icon "arrow-left" %}
+                                <span class="hidden-xs">{{ before|date:week_format }}</span>
+                            </a>
+                        {% endif %}
+                    </li>
+                    <li class="text-center">
+                        <form class="form-inline" method="get" id="monthselform" action="{% eventurl request.organizer "presale:organizer.index" %}">
+                            {% for f, v in request_get_items %}
+                                {% if f != "date" %}
+                                    <input type="hidden" name="{{ f }}" value="{{ v }}">
+                                {% endif %}
+                            {% endfor %}
+                            <fieldset>
+                                <legend class="sr-only">{% trans "Select a week to display" %}</legend>
+                                <div>
+                                    <label for="calendar-input-date">{% trans "Week" %}</label>
+                                </div>
+                                <div class="input-group">
+                                    <select name="date" class="form-control" id="calendar-input-date">
+                                    {% for weeks_per_year in weeks %}
+                                        <optgroup label="{{ weeks_per_year.0.0.year }}">
+                                        {% for w in weeks_per_year %}
+                                            <option value="{{ w.0.isocalendar.0 }}-W{{ w.0.isocalendar.1 }}"
+                                                    {% if w.0.isocalendar.0 == date.isocalendar.0 and w.0.isocalendar.1 == date.isocalendar.1 %}selected{% endif %}>
+                                                    {{ w.0|date:week_format }}
+                                                ({{ w.0|date:short_month_day_format }} – {{ w.1|date:short_month_day_format }})
+                                            </option>
+                                        {% endfor %}
+                                        </optgroup>
+                                    {% endfor %}
+                                    </select>
+                                    <span class="input-group-btn">
+                                        <button type="submit" class="btn btn-default" aria-label="{% trans "Show week" %}">
+                                            {% icon "chevron-right" %}
+                                        </button>
+                                    </span>
+                                </div>
+                            </fieldset>
+                        </form>
+                    </li>
+                    <li class="text-right flip">
+                        {% if has_after %}
+                            <a href="?{% url_replace request "date" after|date:"o-\WW" %}"
+                               class="btn btn-default" data-save-scrollpos aria-label="{{ after|date:week_format }}">
+                                <span class="hidden-xs">{{ after|date:week_format }}</span>
+                                {% icon "arrow-right" %}
+                            </a>
+                        {% endif %}
+                    </li>
+                </ul>
+            </nav>
+            {% include "pretixpresale/fragment_week_calendar.html" with show_avail=request.organizer.settings.event_list_availability %}
+            <div class="row visible-sm visible-xs">
                 {% if has_before %}
-                    <a href="?{% url_replace request "year" before.isocalendar.0 "week" before.isocalendar.1 %}"
+                <div class="col-xs-6 text-left flip">
+                    <a href="?{% url_replace request "date" before|date:"o-\WW" %}"
                        class="btn btn-default">
                         <span class="fa fa-arrow-left" aria-hidden="true"></span>
                         {{ before|date:week_format }}
                     </a>
+                </div>
                 {% endif %}
                 {% if has_after %}
-                    <a href="?{% url_replace request "year" after.isocalendar.0 "week" after.isocalendar.1 %}"
+                <div class="col-xs-6 text-right flip">
+                    <a href="?{% url_replace request "date" after|date:"o-\WW" %}"
                        class="btn btn-default">
                         {{ after|date:week_format }}
                         <span class="fa fa-arrow-right" aria-hidden="true"></span>
                     </a>
+                </div>
                 {% endif %}
             </div>
         </div>
-        {% for f, v in request.GET.items %}
-            {% if f != "month" and f != "year" %}
-                <input type="hidden" name="{{ f }}" value="{{ v }}">
-            {% endif %}
-        {% endfor %}
-    </form>
-    {% include "pretixpresale/fragment_week_calendar.html" with show_avail=request.organizer.settings.event_list_availability %}
-    <div class="col-sm-4 visible-xs text-center">
-        {% if has_before %}
-            <a href="?{% url_replace request "year" before.isocalendar.0 "week" before.isocalendar.1 %}"
-               class="btn btn-default">
-                <span class="fa fa-arrow-left" aria-hidden="true"></span>
-                {{ before|date:week_format }}
-            </a>
-        {% endif %}
-        {% if has_after %}
-            <a href="?{% url_replace request "year" after.isocalendar.0 "week" after.isocalendar.1 %}"
-               class="btn btn-default">
-                {{ after|date:week_format }}
-                <span class="fa fa-arrow-right" aria-hidden="true"></span>
-            </a>
-        {% endif %}
     </div>
+
 
     {% if multiple_timezones %}
         <div class="alert alert-info">

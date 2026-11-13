@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -42,6 +42,7 @@ class BankImportJob(models.Model):
 
     event = models.ForeignKey('pretixbase.Event', null=True, on_delete=models.CASCADE)
     organizer = models.ForeignKey('pretixbase.Organizer', null=True, on_delete=models.CASCADE)
+    currency = models.CharField(max_length=10, null=True)
     created = models.DateTimeField(auto_now_add=True)
     state = models.CharField(max_length=32, choices=STATES, default=STATE_PENDING)
 
@@ -78,12 +79,14 @@ class BankTransaction(models.Model):
     event = models.ForeignKey('pretixbase.Event', null=True, on_delete=models.CASCADE)
     organizer = models.ForeignKey('pretixbase.Organizer', null=True, on_delete=models.CASCADE)
     import_job = models.ForeignKey('BankImportJob', related_name='transactions', on_delete=models.CASCADE)
+    currency = models.CharField(max_length=10, null=True)
     state = models.CharField(max_length=32, choices=STATES, default=STATE_UNCHECKED)
     message = models.TextField()
+    external_id = models.CharField(max_length=190, db_index=True, null=True, blank=True)
     checksum = models.CharField(max_length=190, db_index=True)
     payer = models.TextField(blank=True)
     reference = models.TextField(blank=True)
-    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    amount = models.DecimalField(max_digits=13, decimal_places=2)
     date = models.CharField(max_length=50)
     date_parsed = models.DateField(null=True)
     iban = models.CharField(max_length=250, blank=True)
@@ -112,6 +115,7 @@ class BankTransaction(models.Model):
 class RefundExport(models.Model):
     event = models.ForeignKey('pretixbase.Event', related_name='banktransfer_refund_exports', on_delete=models.CASCADE, null=True, blank=True)
     organizer = models.ForeignKey('pretixbase.Organizer', related_name='banktransfer_refund_exports', on_delete=models.PROTECT, null=True, blank=True)
+    currency = models.CharField(max_length=10, null=True)
     datetime = models.DateTimeField(auto_now_add=True)
     testmode = models.BooleanField(default=False)
     rows = models.TextField(default="[]")
@@ -123,12 +127,6 @@ class RefundExport(models.Model):
             return self.organizer.slug
         else:
             return self.event.slug
-
-    @cached_property
-    def currency(self):
-        if self.event:
-            return self.event.currency
-        return self.organizer.events.first().currency
 
     @property
     def rows_data(self):

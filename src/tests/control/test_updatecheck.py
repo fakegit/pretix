@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -90,6 +90,7 @@ def test_trigger(client, user):
         responses.POST, 'https://pretix.eu/.update_check/',
         callback=request_callback_updatable,
         content_type='application/json',
+        match_querystring=None,  # https://github.com/getsentry/responses/issues/464
     )
 
     user.is_staff = True

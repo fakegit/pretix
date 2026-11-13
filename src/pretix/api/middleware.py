@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -20,6 +20,7 @@
 # <https://www.gnu.org/licenses/>.
 #
 import json
+import logging
 from hashlib import sha1
 
 from django.conf import settings
@@ -32,6 +33,9 @@ from rest_framework import status
 
 from pretix.api.models import ApiCall
 from pretix.base.models import Organizer
+from pretix.helpers import OF_SELF
+
+logger = logging.getLogger(__name__)
 
 
 class IdempotencyMiddleware:
@@ -50,13 +54,13 @@ class IdempotencyMiddleware:
 
         auth_hash_parts = '{}:{}'.format(
             request.headers.get('Authorization', ''),
-            request.COOKIES.get(settings.SESSION_COOKIE_NAME, '')
+            request.COOKIES.get('__Host-' + settings.SESSION_COOKIE_NAME, request.COOKIES.get(settings.SESSION_COOKIE_NAME, ''))
         )
         auth_hash = sha1(auth_hash_parts.encode()).hexdigest()
         idempotency_key = request.headers.get('X-Idempotency-Key', '')
 
-        with transaction.atomic():
-            call, created = ApiCall.objects.select_for_update().get_or_create(
+        with transaction.atomic(durable=True):
+            call, created = ApiCall.objects.select_for_update(of=OF_SELF).get_or_create(
                 auth_hash=auth_hash,
                 idempotency_key=idempotency_key,
                 defaults={
@@ -71,7 +75,7 @@ class IdempotencyMiddleware:
 
         if created:
             resp = self.get_response(request)
-            with transaction.atomic():
+            with transaction.atomic(durable=True):
                 if resp.status_code in (409, 429, 500, 503):
                     # This is the exception: These calls are *meant* to be retried!
                     call.delete()
@@ -89,13 +93,16 @@ class IdempotencyMiddleware:
                         call.response_body = json.dumps(resp.data)
                     else:
                         call.response_body = repr(resp).encode()
-                    call.response_headers = json.dumps(resp._headers)
+                    call.response_headers = json.dumps(resp.headers._store)
                     call.locked = None
                     call.save(update_fields=['locked', 'response_code', 'response_headers',
                                              'response_body'])
             return resp
         else:
             if call.locked:
+                logger.info(
+                    f'Concurrent request with idempotency key {idempotency_key} blocked.'
+                )
                 r = JsonResponse(
                     {'detail': 'Concurrent request with idempotency key.'},
                     status=status.HTTP_409_CONFLICT,
@@ -110,6 +117,7 @@ class IdempotencyMiddleware:
                 content=content,
                 status=call.response_code,
             )
+            logger.info(f'API response replayed from idempotency store for key {idempotency_key} [{call.response_code}]')
             for k, v in json.loads(call.response_headers).values():
                 r[k] = v
             return r

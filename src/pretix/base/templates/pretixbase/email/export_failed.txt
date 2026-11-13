@@ -1,0 +1,13 @@
+{% load i18n %}
+{% trans "Your scheduled export failed." %}
+
+- {% trans "Reason" %}: {{ reason }}
+
+{% if not soft %}{% trans "If an export fails five times in a row, we'll stop sending it." %}{% endif %}
+
+{% trans "You can adjust or remove this export here:" %}
+
+{{ configuration_url }}
+
+{% blocktrans with instance=instance %}Thanks,  
+The {{ instance }} Team{% endblocktrans %}

@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -32,12 +32,34 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
 
-from django.conf.urls import url
+from django.urls import re_path
+
+from pretix.api.urls import event_router
 
 from . import views
+from .api import RuleViewSet
 
 urlpatterns = [
-    url(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/$', views.SenderView.as_view(),
-        name='send'),
-    url(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/history/', views.EmailHistoryView.as_view(), name='history')
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/$', views.IndexView.as_view(),
+            name='send'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/orders/$', views.OrderSendView.as_view(),
+            name='send.orders'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/waitinglist/$', views.WaitinglistSendView.as_view(),
+            name='send.waitinglist'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/history/', views.EmailHistoryView.as_view(),
+            name='history'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/rules/create', views.CreateRule.as_view(),
+            name='rule.create'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/rules/(?P<rule>[^/]+)/schedule',
+            views.ScheduleView.as_view(),
+            name='rule.schedule'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/rules/(?P<rule>[^/]+)/delete',
+            views.DeleteRule.as_view(),
+            name='rule.delete'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/rules/(?P<rule>[^/]+)',
+            views.UpdateRule.as_view(),
+            name='rule.update'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/sendmail/rules', views.ListRules.as_view(),
+            name='rule.list'),
 ]
+event_router.register(r'sendmail_rules', RuleViewSet)

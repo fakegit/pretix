@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -36,10 +36,14 @@ import logging
 
 import i18nfield.forms
 from django import forms
+from django.core.validators import URLValidator
 from django.forms.models import ModelFormMetaclass
 from django.utils.crypto import get_random_string
+from django.utils.safestring import mark_safe
+from django.utils.translation import gettext_lazy as _
 from formtools.wizard.views import SessionWizardView
 from hierarkey.forms import HierarkeyForm
+from i18nfield.strings import LazyI18nString
 
 from pretix.base.reldate import RelativeDateField, RelativeDateTimeField
 
@@ -82,6 +86,43 @@ class I18nInlineFormSet(i18nfield.forms.I18nInlineFormSet):
         super().__init__(*args, **kwargs)
 
 
+class MarkdownTextarea(forms.Textarea):
+
+    def _render(self, template_name, context, renderer=None):
+        return mark_safe(
+            '<div class="i18n-form-group">%s<div class="i18n-field-markdown-note">%s</div></div>' % (
+                super()._render(template_name, context, renderer=None),
+                _("You can use {markup_name} in this field.").format(
+                    markup_name='<a href="https://docs.pretix.eu/guides/markdown/" target="_blank">Markdown</a>'
+                )
+            )
+        )
+
+
+class I18nMarkdownTextarea(i18nfield.forms.I18nTextarea):
+    def format_output(self, rendered_widgets, id_) -> str:
+        rendered_widgets = rendered_widgets + [
+            '<div class="i18n-field-markdown-note">%s</div>' % (
+                _("You can use {markup_name} in this field.").format(
+                    markup_name='<a href="https://docs.pretix.eu/guides/markdown/" target="_blank">Markdown</a>'
+                )
+            )
+        ]
+        return super().format_output(rendered_widgets, id_)
+
+
+class I18nMarkdownTextInput(i18nfield.forms.I18nTextInput):
+    def format_output(self, rendered_widgets, id_) -> str:
+        rendered_widgets = rendered_widgets + [
+            '<div class="i18n-field-markdown-note">%s</div>' % (
+                _("You can use {markup_name} in this field.").format(
+                    markup_name='<a href="https://docs.pretix.eu/guides/markdown/" target="_blank">Markdown</a>'
+                )
+            )
+        ]
+        return super().format_output(rendered_widgets, id_)
+
+
 SECRET_REDACTED = '*****'
 
 
@@ -112,11 +153,41 @@ class SettingsForm(i18nfield.forms.I18nFormMixin, HierarkeyForm):
             if isinstance(f, (RelativeDateTimeField, RelativeDateField)):
                 f.set_event(self.obj)
 
-    def save(self):
+    def _unmask_secret_fields(self):
         for k, v in self.cleaned_data.items():
             if isinstance(self.fields.get(k), SecretKeySettingsField) and self.cleaned_data.get(k) == SECRET_REDACTED:
                 self.cleaned_data[k] = self.initial[k]
+
+    def save(self):
+        self._unmask_secret_fields()
         return super().save()
+
+    def clean(self):
+        d = super().clean()
+
+        # There is logic in HierarkeyForm.save() to only persist fields that changed. HierarkeyForm determines if
+        # something changed by comparing `self._s.get(name)` to `value`. This leaves an edge case open for multi-lingual
+        # text fields. On the very first load, the initial value in `self._s.get(name)` will be a LazyGettextProxy-based
+        # string. However, only some of the languages are usually visible, so even if the user does not change anything
+        # at all, it will be considered a changed value and stored. We do not want that, as it makes it very hard to add
+        # languages to an organizer/event later on. So we trick it and make sure nothing gets changed in that situation.
+        for name, field in self.fields.items():
+            if isinstance(field, SecretKeySettingsField) and d.get(name) == SECRET_REDACTED and not self.initial.get(name):
+                self.add_error(
+                    name,
+                    _('Due to technical reasons you cannot set inputs, that need to be masked (e.g. passwords), to %(value)s.') % {'value': SECRET_REDACTED}
+                )
+
+            if isinstance(field, i18nfield.forms.I18nFormField):
+                value = d.get(name)
+                if not value:
+                    continue
+
+                current = self._s.get(name, as_type=type(value))
+                if name not in self.changed_data:
+                    d[name] = current
+
+        return d
 
     def get_new_filename(self, name: str) -> str:
         from pretix.base.models import Event
@@ -134,6 +205,7 @@ class SettingsForm(i18nfield.forms.I18nFormMixin, HierarkeyForm):
 
 class PrefixForm(forms.Form):
     prefix = forms.CharField(widget=forms.HiddenInput)
+    template_name = "django/forms/table.html"
 
 
 class SafeSessionWizardView(SessionWizardView):
@@ -165,10 +237,16 @@ class SecretKeySettingsWidget(forms.TextInput):
         attrs.update({
             'autocomplete': 'new-password'  # see https://bugs.chromium.org/p/chromium/issues/detail?id=370363#c7
         })
+        self.__reflect_value = False
         super().__init__(attrs)
 
+    def value_from_datadict(self, data, files, name):
+        value = super().value_from_datadict(data, files, name)
+        self.__reflect_value = value and value != SECRET_REDACTED
+        return value
+
     def get_context(self, name, value, attrs):
-        if value:
+        if value and not self.__reflect_value:
             value = SECRET_REDACTED
         return super().get_context(name, value, attrs)
 
@@ -185,3 +263,17 @@ class SecretKeySettingsField(forms.CharField):
         if value == SECRET_REDACTED:
             return
         return super().run_validators(value)
+
+
+class I18nURLFormField(i18nfield.forms.I18nFormField):
+    def clean(self, value) -> LazyI18nString:
+        value = super().clean(value)
+        if not value:
+            return value
+        if isinstance(value.data, dict):
+            for v in value.data.values():
+                if v:
+                    URLValidator()(v)
+        else:
+            URLValidator()(value.data)
+        return value

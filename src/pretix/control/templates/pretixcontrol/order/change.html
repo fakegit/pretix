@@ -70,6 +70,10 @@
                             {% endblocktrans %}
                         </em>
                         {% endif %}
+                        {% if position.attendee_name %}
+                            – <span class="fa fa-user" aria-hidden="true"></span>
+                            {{ position.attendee_name }}
+                        {% endif %}
                     </h3>
                 </div>
                 <div class="panel-body">
@@ -102,6 +106,11 @@
                             <div class="row">
                                 <div class="col-sm-3">
                                     <strong>{% trans "Date" context "subevent" %}</strong>
+                                    {% if use_revocation_list %}
+                                        <span class="fa fa-info-circle text-warning"
+                                              title="{% trans "If you change this, it might cause a new ticket QR code to be generated and the old one to be invalidated." %}"
+                                              data-toggle="tooltip"></span>
+                                    {% endif %}
                                 </div>
                                 <div class="col-sm-5">
                                     {{ position.subevent }}
@@ -128,6 +137,11 @@
                         <div class="row">
                             <div class="col-sm-3">
                                 <strong>{% trans "Product" %}</strong>
+                                {% if use_revocation_list %}
+                                    <span class="fa fa-info-circle text-warning"
+                                          title="{% trans "If you change this, it might cause a new ticket QR code to be generated and the old one to be invalidated." %}"
+                                          data-toggle="tooltip"></span>
+                                {% endif %}
                             </div>
                             <div class="col-sm-5">
                                 {{ position.item }}
@@ -137,6 +151,12 @@
                             </div>
                             <div class="col-sm-4">
                                 {% bootstrap_field position.form.itemvar layout='inline' %}
+                                {% if position.granted_memberships.all %}
+                                    <span class="text-muted">
+                                        <span class="fa fa-warning text-warning" aria-hidden="true"></span>
+                                        {% trans "The sale of this position created a membership. Changing the product here will not affect the membership. Memberships can be managed in the customer account." %}
+                                    </span>
+                                {% endif %}
                             </div>
                         </div>
 
@@ -145,10 +165,27 @@
                                 <strong>{% trans "Tax rule" %}</strong>
                             </div>
                             <div class="col-sm-5">
-                                {{ position.tax_rule.name }} ({{ position.tax_rule.rate }} %)
+                                {% if position.tax_rule.internal_name %}
+                                    {{ position.tax_rule.internal_name }}
+                                {% else %}
+                                    {{ position.tax_rule.name }}
+                                {% endif %}
+                                ({{ position.tax_rule.rate }} %)
                             </div>
                             <div class="col-sm-4 field-container">
                                 {% bootstrap_field position.form.tax_rule layout='inline' %}
+                            </div>
+                        </div>
+
+                        <div class="row">
+                            <div class="col-sm-3">
+                                <strong>{% trans "Membership" %}</strong>
+                            </div>
+                            <div class="col-sm-5">
+                                {{ position.used_membership|default:"–" }}
+                            </div>
+                            <div class="col-sm-4 field-container">
+                                {% bootstrap_field position.form.used_membership layout='inline' %}
                             </div>
                         </div>
 
@@ -165,10 +202,76 @@
                                         + {{ position.tax_rate }}%)
                                     </small>
                                 {% endif %}
+                                {% if position.tax_code %}
+                                    <br>
+                                    <small>
+                                        {{ position.get_tax_code_display }}
+                                    </small>
+                                {% endif %}
                             </div>
                             <div class="col-sm-4 field-container">
                                 {% bootstrap_field position.form.price addon_after=request.event.currency layout='inline' %}
                                 <small><strong>{% trans "including all taxes" %}</strong></small>
+                            </div>
+                        </div>
+
+                        <div class="row">
+                            <div class="col-sm-3">
+                                <strong>{% trans "Ticket block" %}</strong>
+                            </div>
+                            <div class="col-sm-5">
+                                {% if "admin" in position.blocked %}
+                                    {% trans "Blocked" %}
+                                {% elif position.blocked %}
+                                    {% trans "Blocked due to external constraints" %}
+                                {% else %}
+                                    {% trans "Not blocked" %}
+                                {% endif %}
+                            </div>
+                            <div class="col-sm-4">
+                                {% bootstrap_field position.form.blocked layout='inline' %}
+                            </div>
+                        </div>
+
+                        <div class="row">
+                            <div class="col-sm-3">
+                                <strong>{% trans "Validity time" %}</strong>
+                                {% if use_revocation_list %}
+                                    <span class="fa fa-info-circle text-warning"
+                                          title="{% trans "If you change this, it might cause a new ticket QR code to be generated and the old one to be invalidated." %}"
+                                          data-toggle="tooltip"></span>
+                                {% endif %}
+                            </div>
+                            <div class="col-sm-5">
+                                {% if position.valid_from %}
+                                    {% blocktrans trimmed with datetime=position.valid_from|date:"SHORT_DATETIME_FORMAT" %}
+                                        Valid from {{ datetime }}
+                                    {% endblocktrans %}
+                                {% endif %}
+                                {% if position.valid_until %}
+                                    {% if position.valid_from %}
+                                        <br />
+                                    {% endif %}
+                                    {% blocktrans trimmed with datetime=position.valid_until|date:"SHORT_DATETIME_FORMAT" %}
+                                        Valid until {{ datetime }}
+                                    {% endblocktrans %}
+                                {% endif %}
+                                {% if not position.valid_from and not position.valid_until %}
+                                    {% trans "Unconstrained" %}
+                                {% endif %}
+                            </div>
+                            <div class="col-sm-4">
+                                {% bootstrap_field position.form.valid_from layout='inline' %}
+                                <div class="text-center">
+                                    {% trans "–" %}
+                                </div>
+                                {% bootstrap_field position.form.valid_until layout='inline' %}
+                                {% if position.granted_memberships.all %}
+                                    <span class="text-muted">
+                                        <span class="fa fa-warning text-warning" aria-hidden="true"></span>
+                                        {% trans "The sale of this position created a membership. Changing the validity of the ticket here will not affect the membership. Memberships can be managed in the customer account." %}
+                                    </span>
+                                {% endif %}
                             </div>
                         </div>
 
@@ -181,14 +284,24 @@
                             </div>
                             <div class="col-sm-4">
                                 {% bootstrap_field position.form.operation_secret layout='inline' %}
+                                {% if position.issued_gift_cards.exists %}
+                                    <div class="alert alert-info">
+                                        {% blocktrans trimmed %}
+                                        Ticket secrets of order positions that have been used to issue a gift card can not
+                                        be changed. Only the link will be changed in this case.
+                                        {% endblocktrans %}
+                                    </div>
+                                {% endif %}
                             </div>
                         </div>
 
                         {% bootstrap_field position.form.operation_cancel layout='inline' %}
-                        {% bootstrap_field position.form.operation_split layout='inline' %}
+                        {% if position.form.operation_split %}
+                            {% bootstrap_field position.form.operation_split layout='inline' %}
+                        {% endif %}
                         {% if position.addons.exists %}
                             <em class="text-danger">
-                                {% trans "Removing this position will also remove all add-ons to this position." %}
+                                {% trans "Removing or splitting this position will also remove or split all add-ons to this position." %}
                             </em>
                         {% endif %}
                     </div>
@@ -197,11 +310,11 @@
         {% endfor %}
 
 
-        <div class="formset" data-formset data-formset-prefix="{{ add_formset.prefix }}">
-            {{ add_formset.management_form }}
-            {% bootstrap_formset_errors add_formset %}
+        <div class="formset" data-formset data-formset-prefix="{{ add_position_formset.prefix }}">
+            {{ add_position_formset.management_form }}
+            {% bootstrap_formset_errors add_position_formset %}
             <div data-formset-body>
-                {% for add_form in add_formset %}
+                {% for add_form in add_position_formset %}
                     <div class="panel panel-default items" data-formset-form data-subevent="0">
                         <div class="panel-heading">
                             <h3 class="panel-title">
@@ -224,6 +337,7 @@
                                         {{ add_form.custom_error }}
                                     </div>
                                 {% endif %}
+                                {% bootstrap_field add_form.count layout="control" %}
                                 {% bootstrap_field add_form.itemvar layout="control" %}
                                 {% bootstrap_field add_form.price addon_after=request.event.currency layout="control" %}
                                 {% if add_form.addon_to %}
@@ -231,6 +345,9 @@
                                 {% endif %}
                                 {% if add_form.subevent %}
                                     {% bootstrap_field add_form.subevent layout="control" %}
+                                {% endif %}
+                                {% if add_form.used_membership %}
+                                    {% bootstrap_field add_form.used_membership layout="control" %}
                                 {% endif %}
                                 {% bootstrap_field add_form.seat layout="control" %}
                             </div>
@@ -249,22 +366,26 @@
                                 </button>
                                 {% trans "Add product" %}
                                 <div class="sr-only">
-                                    {{ add_formset.empty_form.id }}
-                                    {% bootstrap_field add_formset.empty_form.DELETE form_group_class="" layout="inline" %}
+                                    {{ add_position_formset.empty_form.id }}
+                                    {% bootstrap_field add_position_formset.empty_form.DELETE form_group_class="" layout="inline" %}
                                 </div>
                             </h3>
                         </div>
                         <div class="panel-body">
                             <div class="form-horizontal">
-                                {% bootstrap_field add_formset.empty_form.itemvar layout="control" %}
-                                {% bootstrap_field add_formset.empty_form.price addon_after=request.event.currency layout="control" %}
-                                {% if add_formset.empty_form.addon_to %}
-                                    {% bootstrap_field add_formset.empty_form.addon_to layout="control" %}
+                                {% bootstrap_field add_position_formset.empty_form.count layout="control" %}
+                                {% bootstrap_field add_position_formset.empty_form.itemvar layout="control" %}
+                                {% bootstrap_field add_position_formset.empty_form.price addon_after=request.event.currency layout="control" %}
+                                {% if add_position_formset.empty_form.addon_to %}
+                                    {% bootstrap_field add_position_formset.empty_form.addon_to layout="control" %}
                                 {% endif %}
-                                {% if add_formset.empty_form.subevent %}
-                                    {% bootstrap_field add_formset.empty_form.subevent layout="control" %}
+                                {% if add_position_formset.empty_form.subevent %}
+                                    {% bootstrap_field add_position_formset.empty_form.subevent layout="control" %}
                                 {% endif %}
-                                {% bootstrap_field add_formset.empty_form.seat layout="control" %}
+                                {% if add_position_formset.empty_form.used_membership %}
+                                    {% bootstrap_field add_position_formset.empty_form.used_membership layout="control" %}
+                                {% endif %}
+                                {% bootstrap_field add_position_formset.empty_form.seat layout="control" %}
                             </div>
                         </div>
                     </div>
@@ -315,6 +436,12 @@
                                         + {{ fee.tax_rate }}%)
                                     </small>
                                 {% endif %}
+                                {% if fee.tax_code %}
+                                    <br>
+                                    <small>
+                                        {{ fee.get_tax_code_display }}
+                                    </small>
+                                {% endif %}
                             </div>
                             <div class="col-sm-4 field-container">
                                 {% bootstrap_field fee.form.value addon_after=request.event.currency layout='inline' %}
@@ -326,13 +453,77 @@
                         {% bootstrap_field fee.form.operation_cancel layout='inline' %}
                         {% if fee.fee_type == "payment" %}
                             <em class="text-danger">
-                                {% trans "Manually modifying payment fees is discouraged since they might automatically be on subsequent order changes or when choosing a different payment method." %}
+                                {% trans "Manually modifying payment fees is discouraged since they might automatically be updated on subsequent order changes or when choosing a different payment method." %}
                             </em>
                         {% endif %}
                     </div>
                 </div>
             </div>
         {% endfor %}
+
+        <div class="formset" data-formset data-formset-prefix="{{ add_fee_formset.prefix }}">
+            {{ add_fee_formset.management_form }}
+            {% bootstrap_formset_errors add_fee_formset %}
+            <div data-formset-body>
+                {% for add_form in add_fee_formset %}
+                    <div class="panel panel-default items" data-formset-form data-subevent="0">
+                        <div class="panel-heading">
+                            <h3 class="panel-title">
+                                <button type="button" class="btn btn-danger btn-xs pull-right flip"
+                                        data-formset-delete-button>
+                                    <i class="fa fa-trash"></i>
+                                </button>
+                                {% trans "Add fee" %}
+                                <div class="sr-only">
+                                    {{ add_form.id }}
+                                    {% bootstrap_field add_form.DELETE form_group_class="" layout="inline" %}
+                                </div>
+                            </h3>
+                        </div>
+                        <div class="panel-body">
+                            <div class="form-horizontal">
+                                {% bootstrap_field add_form.fee_type layout='control' %}
+                                {% bootstrap_field add_form.value addon_after=request.event.currency layout='control' %}
+                                {% bootstrap_field add_form.tax_rule layout='control' %}
+                                {% bootstrap_field add_form.description layout='control' %}
+                            </div>
+                        </div>
+                    </div>
+                {% endfor %}
+            </div>
+            <script type="form-template" data-formset-empty-form>
+                {% escapescript %}
+                    <div class="panel panel-default items" data-formset-form data-subevent="0">
+                        <div class="panel-heading">
+                            <h3 class="panel-title">
+                                <button type="button" class="btn btn-danger btn-xs pull-right flip"
+                                        data-formset-delete-button>
+                                    <i class="fa fa-trash"></i>
+                                </button>
+                                {% trans "Add fee" %}
+                                <div class="sr-only">
+                                    {{ add_fee_formset.empty_form.id }}
+                                    {% bootstrap_field add_fee_formset.empty_form.DELETE form_group_class="" layout="inline" %}
+                                </div>
+                            </h3>
+                        </div>
+                        <div class="panel-body">
+                            <div class="form-horizontal">
+                                {% bootstrap_field add_fee_formset.empty_form.fee_type layout='control' %}
+                                {% bootstrap_field add_fee_formset.empty_form.value addon_after=request.event.currency layout='control' %}
+                                {% bootstrap_field add_fee_formset.empty_form.tax_rule layout='control' %}
+                                {% bootstrap_field add_fee_formset.empty_form.description layout='control' %}
+                            </div>
+                        </div>
+                    </div>
+                {% endescapescript %}
+            </script>
+            <p>
+                <button type="button" class="btn btn-primary" data-formset-add>
+                    <i class="fa fa-plus"></i> {% trans "Add fee" %}</button>
+            </p>
+        </div>
+
         <div class="panel panel-default items">
             <div class="panel-heading">
                 <h3 class="panel-title">

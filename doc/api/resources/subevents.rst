@@ -1,4 +1,4 @@
-.. spelling::
+.. spelling:word-list::
 
    geo
    lat
@@ -38,14 +38,18 @@ location                              multi-lingual string       The sub-event l
 geo_lat                               float                      Latitude of the location (or ``null``)
 geo_lon                               float                      Longitude of the location (or ``null``)
 item_price_overrides                  list of objects            List of items for which this sub-event overrides the
-                                                                 default price
+                                                                 default price or settings
 ├ item                                integer                    The internal item ID
 ├ disabled                            boolean                    If ``true``, item should not be available for this sub-event
+├ available_from                      datetime                   Start of availability (or ``null``)
+├ available_until                     datetime                   End of availability (or ``null``)
 └ price                               money (string)             The price or ``null`` for the default price
 variation_price_overrides             list of objects            List of variations for which this sub-event overrides
-                                                                 the default price
+                                                                 the default price or settings
 ├ variation                           integer                    The internal variation ID
 ├ disabled                            boolean                    If ``true``, variation should not be available for this sub-event
+├ available_from                      datetime                   Start of availability (or ``null``)
+├ available_until                     datetime                   End of availability (or ``null``)
 └ price                               money (string)             The price or ``null`` for the default price
 meta_data                             object                     Values set for organizer-specific meta data parameters.
 seating_plan                          integer                    If reserved seating is in use, the ID of a seating
@@ -55,24 +59,12 @@ seat_category_mapping                 object                     An object mappi
 last_modified                         datetime                   Last modification of this object
 ===================================== ========================== =======================================================
 
-.. versionchanged:: 3.3
+.. versionchanged:: 2023.8.0
 
-   The attributes ``geo_lat`` and ``geo_lon`` have been added.
-
-.. versionchanged:: 3.10
-
-   The ``disabled`` attribute has been added to ``item_price_overrides`` and ``variation_price_overrides``.
-
-.. versionchanged:: 3.12
-
-   The ``last_modified`` attribute has been added.
+    For the organizer-wide endpoint, the ``search`` query parameter has been modified to filter sub-events by their parent events slug too.
 
 Endpoints
 ---------
-
-.. versionchanged:: 3.3
-
-    The sub-events resource can now be filtered by meta data attributes.
 
 .. http:get:: /api/v1/organizers/(organizer)/events/(event)/subevents/
 
@@ -119,6 +111,8 @@ Endpoints
               {
                 "item": 2,
                 "disabled": false,
+                "available_from": null,
+                "available_until": null,
                 "price": "12.00"
               }
             ],
@@ -129,10 +123,16 @@ Endpoints
       }
 
    :query page: The page number in case of a multi-page result set, default is 1
+   :query is_public: If set to ``true``/``false``, only subevents with a matching value of ``is_public`` are returned.
    :query active: If set to ``true``/``false``, only events with a matching value of ``active`` are returned.
    :query is_future: If set to ``true`` (``false``), only events that happen currently or in the future are (not) returned.
    :query is_past: If set to ``true`` (``false``), only events that are over are (not) returned.
+   :query date_from_after: If set to a date and time, only events that start at or after the given time are returned.
+   :query date_from_before: If set to a date and time, only events that start at or before the given time are returned.
+   :query date_to_after: If set to a date and time, only events that have an end date and end at or after the given time are returned.
+   :query date_to_before: If set to a date and time, only events that have an end date and end at or before the given time are returned.
    :query ends_after: If set to a date and time, only events that happen during of after the given time are returned.
+   :query search: Only return events matching a given search query.
    :param organizer: The ``slug`` field of a valid organizer
    :param event: The ``slug`` field of the main event
    :query datetime modified_since: Only return objects that have changed since the given date. Be careful: This does not
@@ -142,6 +142,10 @@ Endpoints
         only those sub-events having set their ``Format`` meta data to ``Seminar``, ``?attr[Format]=`` only those, that
         have no value set. Please note that this filter will respect default values set on 
         organizer or event level.
+   :query with_availability_for: If set to a sales channel identifier, the response will contain a special ``best_availability_state``
+                                 attribute with values of 100 for "tickets available", values less than 100 for "tickets sold out or reserved",
+                                 and ``null`` for "status unknown". These values might be served from a cache. This parameter can make the response
+                                 slow.
    :statuscode 200: no error
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer does not exist **or** you have no permission to view it.
@@ -149,8 +153,6 @@ Endpoints
 .. http:post:: /api/v1/organizers/(organizer)/events/(event)/subevents/
 
    Creates a new subevent.
-
-   Permission required: "Can create events"
 
    **Example request**:
 
@@ -179,6 +181,8 @@ Endpoints
           {
             "item": 2,
             "disabled": false,
+            "available_from": null,
+            "available_until": null,
             "price": "12.00"
           }
         ],
@@ -214,6 +218,8 @@ Endpoints
           {
             "item": 2,
             "disabled": false,
+            "available_from": null,
+            "available_until": null,
             "price": "12.00"
           }
         ],
@@ -270,6 +276,8 @@ Endpoints
           {
             "item": 2,
             "disabled": false,
+            "available_from": null,
+            "available_until": null,
             "price": "12.00"
           }
         ],
@@ -290,8 +298,6 @@ Endpoints
    provide all fields of the resource, other fields will be reset to default. With ``PATCH``, you only need to provide
    the fields that you want to change.
 
-   Permission required: "Can change event settings"
-
    **Example request**:
 
    .. sourcecode:: http
@@ -307,6 +313,8 @@ Endpoints
           {
             "item": 2,
             "disabled": false,
+            "available_from": null,
+            "available_until": null,
             "price": "23.42"
           }
         ],
@@ -340,6 +348,8 @@ Endpoints
           {
             "item": 2,
             "disabled": false,
+            "available_from": null,
+            "available_until": null,
             "price": "23.42"
           }
         ],
@@ -358,8 +368,6 @@ Endpoints
 .. http:delete:: /api/v1/organizers/(organizer)/events/(event)/subevents/(id)/
 
    Delete a sub-event. Note that events with orders cannot be deleted to ensure data integrity.
-
-   Permission required: "Can change event settings"
 
    **Example request**:
 
@@ -429,6 +437,8 @@ Endpoints
               {
                 "item": 2,
                 "disabled": false,
+                "available_from": null,
+                "available_until": null,
                 "price": "12.00"
               }
             ],
@@ -439,11 +449,18 @@ Endpoints
       }
 
    :query page: The page number in case of a multi-page result set, default is 1
+   :query is_public: If set to ``true``/``false``, only subevents with a matching value of ``is_public`` are returned.
    :query active: If set to ``true``/``false``, only events with a matching value of ``active`` are returned.
    :query event__live: If set to ``true``/``false``, only events with a matching value of ``live`` on the parent event are returned.
    :query is_future: If set to ``true`` (``false``), only events that happen currently or in the future are (not) returned.
    :query is_past: If set to ``true`` (``false``), only events that are over are (not) returned.
+   :query date_from_after: If set to a date and time, only events that start at or after the given time are returned.
+   :query date_from_before: If set to a date and time, only events that start at or before the given time are returned.
+   :query date_to_after: If set to a date and time, only events that have an end date and end at or after the given time are returned.
+   :query date_to_before: If set to a date and time, only events that have an end date and end at or before the given time are returned.
    :query ends_after: If set to a date and time, only events that happen during of after the given time are returned.
+   :query search: Only return events matching a given search query.
+   :query sales_channel: If set to a sales channel identifier, the response will only contain subevents from events available on this sales channel.
    :param organizer: The ``slug`` field of a valid organizer
    :param event: The ``slug`` field of the event to fetch
    :statuscode 200: no error

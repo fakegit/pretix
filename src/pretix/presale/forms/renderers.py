@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -29,11 +29,12 @@ from django.utils.safestring import mark_safe
 from django.utils.translation import pgettext
 
 
-def render_label(content, label_for=None, label_class=None, label_title='', label_id='', optional=False, is_valid=None):
+def render_label(content, label_for=None, label_class=None, label_title='', label_id='', optional=False, is_valid=None, attrs=None):
     """
     Render a label with content
     """
-    attrs = {}
+    tag = 'label'
+    attrs = attrs or {}
     if label_for:
         attrs['for'] = label_for
     if label_class:
@@ -58,15 +59,16 @@ def render_label(content, label_for=None, label_class=None, label_title='', labe
         attrs['class'] += ' label-empty'
         # usually checkboxes have overall empty labels and special labels per checkbox
         # => remove for-attribute as well as "required"-text appended to label
+        tag = 'div'
         if 'for' in attrs:
-            del(attrs['for'])
-    else:
-        opt += '<i class="sr-only label-required">, {}</i>'.format(pgettext('form', 'required')) if not optional else ''
+            del attrs['for']
+    elif not optional:
+        opt += '<i class="label-required">{}</i>'.format(pgettext('form', 'required'))
 
     builder = '<{tag}{attrs}>{content}{opt}</{tag}>'
     return format_html(
         builder,
-        tag='label',
+        tag=tag,
         attrs=mark_safe(flatatt(attrs)) if attrs else '',
         opt=mark_safe(opt),
         content=text_value(content),
@@ -77,7 +79,7 @@ class CheckoutFieldRenderer(FieldRenderer):
     def __init__(self, *args, **kwargs):
         kwargs['layout'] = 'horizontal'
         super().__init__(*args, **kwargs)
-        self.is_group_widget = isinstance(self.widget, (CheckboxSelectMultiple, RadioSelect, )) or (self.is_multi_widget and len(self.widget.widgets) > 1)
+        self.is_group_widget = isinstance(self.widget, (CheckboxSelectMultiple, RadioSelect, )) or self.is_multi_widget
 
     def get_form_group_class(self):
         form_group_class = self.form_group_class
@@ -103,7 +105,11 @@ class CheckoutFieldRenderer(FieldRenderer):
         if self.field_help:
             help_text_and_errors.append(self.field_help)
         for idx, text in enumerate(help_text_and_errors):
-            html += '<div class="help-block" id="help-for-{id}-{idx}">{text}</div>'.format(id=self.field.id_for_label, text=text, idx=idx)
+            if text.lower().startswith("<p>") or text.lower().startswith("<p "):
+                html_tag = "div"
+            else:
+                html_tag = "p"
+            html += '<{tag} class="help-block" id="help-for-{id}-{idx}">{text}</{tag}>'.format(id=self.field.id_for_label, text=text, idx=idx, tag=html_tag)
         return html
 
     def add_help_attrs(self, widget=None):
@@ -118,9 +124,13 @@ class CheckoutFieldRenderer(FieldRenderer):
             widget.attrs["aria-describedby"] = " ".join(help_ids)
 
     def add_label(self, html):
+        attrs = {}
         label = self.get_label()
 
-        if hasattr(self.field.field, '_required'):
+        if hasattr(self.field.field, '_show_required'):
+            # e.g. payment settings forms where a field is only required if the payment provider is active
+            required = self.field.field._show_required
+        elif hasattr(self.field.field, '_required'):
             # e.g. payment settings forms where a field is only required if the payment provider is active
             required = self.field.field._required
         else:
@@ -138,22 +148,37 @@ class CheckoutFieldRenderer(FieldRenderer):
             label_for = self.field.id_for_label
             label_id = ""
 
+        if hasattr(self.field.field, 'question') and self.field.field.question.identifier:
+            attrs["data-identifier"] = self.field.field.question.identifier
+
         html = render_label(
             label,
             label_for=label_for,
             label_class=self.get_label_class(),
             label_id=label_id,
-            optional=not required and not isinstance(self.widget, CheckboxInput),
+            attrs=attrs,
+            optional=not required,
             is_valid=is_valid
         ) + html
         return html
 
     def put_inside_label(self, html):
         content = "{field} {label}".format(field=html, label=self.label)
+
+        if hasattr(self.field.field, '_show_required'):
+            # e.g. payment settings forms where a field is only required if the payment provider is active
+            required = self.field.field._show_required
+        elif hasattr(self.field.field, '_required'):
+            # e.g. payment settings forms where a field is only required if the payment provider is active
+            required = self.field.field._required
+        else:
+            required = self.field.field.required
+
         return render_label(
             content=mark_safe(content),
             label_for=self.field.id_for_label,
             label_title=escape(strip_tags(self.field_help)),
+            optional=not required,
         )
 
     def wrap_label_and_field(self, html):
@@ -162,3 +187,11 @@ class CheckoutFieldRenderer(FieldRenderer):
         else:
             attrs = ''
         return '<div class="{klass}"{attrs}>{html}</div>'.format(klass=self.get_form_group_class(), html=html, attrs=attrs)
+
+    def wrap_widget(self, html):
+        if isinstance(self.widget, CheckboxInput):
+            css_class = "checkbox"
+            if self.field.field.disabled:
+                css_class += " disabled"
+            html = f'<div class="{css_class}">{html}</div>'
+        return html

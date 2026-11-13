@@ -26,6 +26,7 @@ limit_events                          list of strings            If ``all_events
 action_types                          list of strings            A list of action type filters that limit the
                                                                  notifications sent to this webhook. See below for
                                                                  valid values
+comment                               string                     Internal comment on this webhook, default ``null``
 ===================================== ========================== =======================================================
 
 The following values for ``action_types`` are valid with pretix core:
@@ -36,20 +37,47 @@ The following values for ``action_types`` are valid with pretix core:
     * ``pretix.event.order.canceled``
     * ``pretix.event.order.reactivated``
     * ``pretix.event.order.expired``
+    * ``pretix.event.order.expirychanged``
     * ``pretix.event.order.modified``
     * ``pretix.event.order.contact.changed``
     * ``pretix.event.order.changed.*``
+    * ``pretix.event.order.deleted`` (can only occur for test mode orders)
+    * ``pretix.event.order.refund.created``
     * ``pretix.event.order.refund.created.externally``
+    * ``pretix.event.order.refund.requested``
+    * ``pretix.event.order.refund.done``
+    * ``pretix.event.order.refund.canceled``
+    * ``pretix.event.order.refund.failed``
+    * ``pretix.event.order.payment.confirmed``
     * ``pretix.event.order.approved``
     * ``pretix.event.order.denied``
+    * ``pretix.event.orders.waitinglist.added``
+    * ``pretix.event.orders.waitinglist.changed``
+    * ``pretix.event.orders.waitinglist.deleted``
+    * ``pretix.event.orders.waitinglist.voucher_assigned``
     * ``pretix.event.checkin``
     * ``pretix.event.checkin.reverted``
     * ``pretix.event.added``
     * ``pretix.event.changed``
     * ``pretix.event.deleted``
+    * ``pretix.giftcards.created``
+    * ``pretix.giftcards.modified``
+    * ``pretix.giftcards.transaction.*``
+    * ``pretix.voucher.added``
+    * ``pretix.voucher.changed``
+    * ``pretix.voucher.deleted``
     * ``pretix.subevent.added``
     * ``pretix.subevent.changed``
     * ``pretix.subevent.deleted``
+    * ``pretix.event.item.*``
+    * ``pretix.event.quota.*``
+    * ``pretix.event.live.activated``
+    * ``pretix.event.live.deactivated``
+    * ``pretix.event.testmode.activated``
+    * ``pretix.event.testmode.deactivated``
+    * ``pretix.customer.created``
+    * ``pretix.customer.changed``
+    * ``pretix.customer.anonymized``
 
 Installed plugins might register more valid values.
 
@@ -88,12 +116,14 @@ Endpoints
             "target_url": "https://httpstat.us/200",
             "all_events": false,
             "limit_events": ["democon"],
-            "action_types": ["pretix.event.order.modified", "pretix.event.order.changed.*"]
+            "action_types": ["pretix.event.order.modified", "pretix.event.order.changed.*"],
+            "comment": null
           }
         ]
       }
 
    :query integer page: The page number in case of a multi-page result set, default is 1
+   :query boolean enabled: Only show webhooks that are or are not enabled
    :param organizer: The ``slug`` field of the organizer to fetch
    :statuscode 200: no error
    :statuscode 401: Authentication failure
@@ -125,7 +155,8 @@ Endpoints
         "target_url": "https://httpstat.us/200",
         "all_events": false,
         "limit_events": ["democon"],
-        "action_types": ["pretix.event.order.modified", "pretix.event.order.changed.*"]
+        "action_types": ["pretix.event.order.modified", "pretix.event.order.changed.*"],
+        "comment": null
       }
 
    :param organizer: The ``slug`` field of the organizer to fetch
@@ -152,7 +183,8 @@ Endpoints
         "target_url": "https://httpstat.us/200",
         "all_events": false,
         "limit_events": ["democon"],
-        "action_types": ["pretix.event.order.modified", "pretix.event.order.changed.*"]
+        "action_types": ["pretix.event.order.modified", "pretix.event.order.changed.*"],
+        "comment": "Called for changes"
       }
 
    **Example response**:
@@ -169,7 +201,8 @@ Endpoints
         "target_url": "https://httpstat.us/200",
         "all_events": false,
         "limit_events": ["democon"],
-        "action_types": ["pretix.event.order.modified", "pretix.event.order.changed.*"]
+        "action_types": ["pretix.event.order.modified", "pretix.event.order.changed.*"],
+        "comment": "Called for changes"
       }
 
    :param organizer: The ``slug`` field of the organizer to create a webhook for
@@ -214,7 +247,8 @@ Endpoints
         "target_url": "https://httpstat.us/200",
         "all_events": false,
         "limit_events": ["democon"],
-        "action_types": ["pretix.event.order.modified", "pretix.event.order.changed.*"]
+        "action_types": ["pretix.event.order.modified", "pretix.event.order.changed.*"],
+        "comment": null
       }
 
    :param organizer: The ``slug`` field of the organizer to modify

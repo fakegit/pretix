@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -105,6 +105,31 @@ class EventTask(app.Task):
             args[0] = event
 
         with scope(organizer=event.organizer):
+            ret = super().__call__(*args, **kwargs)
+        return ret
+
+
+class OrganizerTask(app.Task):
+    def __call__(self, *args, **kwargs):
+        if 'organizer_id' in kwargs:
+            organizer_id = kwargs.get('organizer_id')
+            with scopes_disabled():
+                organizer = Organizer.objects.get(pk=organizer_id)
+            del kwargs['organizer_id']
+            kwargs['organizer'] = organizer
+        elif 'organizer' in kwargs:
+            organizer_id = kwargs.get('organizer')
+            with scopes_disabled():
+                organizer = Organizer.objects.get(pk=organizer_id)
+            kwargs['organizer'] = organizer
+        else:
+            args = list(args)
+            organizer_id = args[0]
+            with scopes_disabled():
+                organizer = Organizer.objects.get(pk=organizer_id)
+            args[0] = organizer
+
+        with scope(organizer=organizer):
             ret = super().__call__(*args, **kwargs)
         return ret
 

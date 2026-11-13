@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -48,10 +48,9 @@ class PluginSignalTest(TestCase):
     """
     This test case tests the EventPluginSignal handler
     """
-    @classmethod
-    def setUpTestData(cls):
+    def setUp(self):
         o = Organizer.objects.create(name='Dummy', slug='dummy')
-        cls.event = Event.objects.create(
+        self.event = Event.objects.create(
             organizer=o, name='Dummy', slug='dummy',
             date_from=now(),
         )

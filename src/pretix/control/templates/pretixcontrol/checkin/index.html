@@ -9,43 +9,64 @@
 {% block content %}
     <h1>
         {% blocktrans with name=checkinlist.name %}Check-in list: {{ name }}{% endblocktrans %}
-        {% if 'can_change_event_settings' in request.eventpermset %}
+        {% if 'event.settings.general:write' in request.eventpermset %}
             <a href="{% url "control:event.orders.checkinlists.edit" event=request.event.slug organizer=request.event.organizer.slug list=checkinlist.pk %}"
                     class="btn btn-default">
                 <span class="fa fa-wrench"></span>
                 {% trans "Edit list configuration" %}
             </a>
         {% endif %}
-        <a href="{% url "control:event.orders.export" event=request.event.slug organizer=request.event.organizer.slug %}?identifier=checkinlistpdf&checkinlistpdf-list={{ checkinlist.pk }}"
+        <a href="{% url "control:event.orders.checkinlists.simulator" event=request.event.slug organizer=request.event.organizer.slug list=checkinlist.pk %}"
+           class="btn btn-default">
+            <span class="fa fa-flask"></span>
+            {% trans "Check-in simulator" %}
+        </a>
+        <a href="{% url "control:event.orders.export" event=request.event.slug organizer=request.event.organizer.slug %}?identifier=checkinlistpdf&checkinlistpdf-list={{ checkinlist.pk }}{% if "status" in request.GET %}&checkinlistpdf-status={{ request.GET.status|urlencode }}{% endif %}"
                 class="btn btn-default" target="_blank">
             <span class="fa fa-download"></span>
             {% trans "PDF" %}
         </a>
-        <a href="{% url "control:event.orders.export" event=request.event.slug organizer=request.event.organizer.slug %}?identifier=checkinlist&checkinlist-list={{ checkinlist.pk }}"
+        <a href="{% url "control:event.orders.export" event=request.event.slug organizer=request.event.organizer.slug %}?identifier=checkinlist&checkinlist-list={{ checkinlist.pk }}{% if "status" in request.GET %}&checkinlist-status={{ request.GET.status|urlencode }}{% endif %}"
                 class="btn btn-default" target="_blank">
             <span class="fa fa-download"></span>
             {% trans "CSV" %}
         </a>
     </h1>
-    <form class="row filter-form" action="" method="get">
-        <div class="col-md-4 col-sm-6 col-xs-12">
-            {% bootstrap_field filter_form.user layout='inline' %}
+    <div class="panel panel-default">
+        <div class="panel-heading">
+            <h3 class="panel-title">{% trans "Filter" %}</h3>
         </div>
-        <div class="col-md-3 col-sm-6 col-xs-12">
-            {% bootstrap_field filter_form.status layout='inline' %}
-        </div>
-        <div class="col-md-3 col-sm-6 col-xs-12">
-            {% bootstrap_field filter_form.item layout='inline' %}
-        </div>
-        <div class="col-md-2 col-sm-6 col-xs-12">
-            <button class="btn btn-primary btn-block" type="submit">
-                <span class="fa fa-filter"></span>
-                <span class="hidden-md">
+        <form class="panel-body filter-form" action="" method="get">
+            <div class="row">
+                <div class="col-md-6 col-sm-6 col-xs-12">
+                    {% bootstrap_field filter_form.user %}
+                </div>
+                <div class="col-md-3 col-sm-6 col-xs-12">
+                    {% bootstrap_field filter_form.status %}
+                </div>
+                <div class="col-md-3 col-sm-6 col-xs-12">
+                    {% bootstrap_field filter_form.item %}
+                </div>
+                {% if filter_form.subevent %}
+                    <div class="col-md-6 col-sm-6 col-xs-12">
+                        {% bootstrap_field filter_form.subevent %}
+                    </div>
+                    <div class="col-md-3 col-sm-6 col-xs-12">
+                        {% bootstrap_field filter_form.subevent_from %}
+                    </div>
+                    <div class="col-md-3 col-sm-6 col-xs-12">
+                        {% bootstrap_field filter_form.subevent_until %}
+                    </div>
+                {% endif %}
+            </div>
+            <div class="text-right">
+                <button class="btn btn-primary btn-lg" type="submit">
+                    <span class="fa fa-filter"></span>
                     {% trans "Filter" %}
-                </span>
-            </button>
-        </div>
-    </form>
+                </button>
+            </div>
+        </form>
+    </div>
     {% if entries|length == 0 %}
         <div class="empty-collection">
             <p>
@@ -55,13 +76,22 @@
             </p>
         </div>
     {% else %}
-        <form method="post" action="">
+        <form method="post" action="{% url "control:event.orders.checkinlists.bulk_action" event=request.event.slug organizer=request.event.organizer.slug list=checkinlist.pk %}" data-asynctask>
+            {% for field in filter_form %}
+                {{ field.as_hidden }}
+            {% endfor %}
+            <input name="returnquery" type="hidden" value="{{ request.META.QUERY_STRING }}">
            {% csrf_token %}
             <div class="table-responsive">
                 <table class="table table-condensed table-hover">
                     <thead>
                     <tr>
-                        <th></th>
+                        <th>
+                            {% if "event.orders:write" in request.eventpermset or "event.orders:checkin" in request.eventpermset %}
+                                <label aria-label="{% trans "select all rows for batch-operation" %}"
+                                       class="batch-select-label"><input type="checkbox" data-toggle-table/></label>
+                            {% endif %}
+                        </th>
                         <th>{% trans "Order code" %} <a href="?{% url_replace request 'ordering' '-code'%}"><i class="fa fa-caret-down"></i></a>
                       <a href="?{% url_replace request 'ordering' 'code'%}"><i class="fa fa-caret-up"></i></a></th>
                         <th>{% trans "Item" %} <a href="?{% url_replace request 'ordering' '-item'%}"><i class="fa fa-caret-down"></i></a>
@@ -84,12 +114,25 @@
                         <th>{% trans "Timestamp" %} <a href="?{% url_replace request 'ordering' '-timestamp'%}"><i class="fa fa-caret-down"></i></a>
                       <a href="?{% url_replace request 'ordering' 'timestamp'%}"><i class="fa fa-caret-up"></i></a></th>
                     </tr>
+                    {% if page_obj.paginator.num_pages > 1 %}
+                        <tr class="table-select-all warning hidden">
+                            <td>
+                                <input type="checkbox" name="__ALL" id="__all"
+                                       data-results-total="{{ page_obj.paginator.count }}">
+                            </td>
+                            <td colspan="8">
+                                <label for="__all">
+                                    {% trans "Select all results on other pages as well" %}
+                                </label>
+                            </td>
+                        </tr>
+                    {% endif %}
                     </thead>
                     <tbody>
                     {% for e in entries %}
                         <tr>
                             <td>
-                                {% if "can_change_orders" in request.eventpermset %}
+                                {% if "event.orders:write" in request.eventpermset or "event.orders:checkin" in request.eventpermset %}
                                     <input type="checkbox" name="checkin" id="id_checkin" class="" value="{{ e.pk }}"/>
                                 {% endif %}
                             </td>
@@ -105,7 +148,7 @@
                             <td>{{ e.item }}{% if e.variation %} – {{ e.variation }}{% endif %}</td>
                             {% if request.event.has_subevents and not checkinlist.subevent %}
                                 <td>
-                                    {{ e.subevent.name }} – {{ e.subevent.get_date_range_display }} {{ e.subevent.date_from|date:"TIME_FORMAT" }}
+                                    {{ e.subevent.name }} – {{ e.subevent.get_date_range_display_with_times }}
                                 </td>
                             {% endif %}
                             {% if seats %}
@@ -142,6 +185,7 @@
                                             <span class="fa fa-magic text-muted"
                                                   data-toggle="tooltip" title="{% trans "Checked in automatically" %}"></span>
                                         {% endif %}
+                                        {% include "pretixcontrol/checkin/fragment_checkin_source_type.html" with source_type=e.last_entry_source_type %}
                                     {% endif %}
                                 {% endif %}
                             </td>
@@ -162,17 +206,27 @@
                     </tbody>
                 </table>
             </div>
-            {% if "can_change_orders" in request.eventpermset %}
-                <button type="submit" class="btn btn-primary btn-save">
-                    {% trans "Check-In selected attendees" %}
-                </button>
-                <button type="submit" class="btn btn-default btn-save" name="checkout" value="true">
-                    {% trans "Check-Out selected attendees" %}
-                </button>
-                <button type="submit" class="btn btn-default btn-save" name="revert" value="true">
-                    {% trans "Revert selected check-ins" %}
-                </button>
-            {% endif %}
+            <div class="batch-select-actions">
+                {% if "event.orders:write" in request.eventpermset or "event.orders:checkin" in request.eventpermset %}
+                    <button type="submit" class="btn btn-primary btn-save">
+                        <span class="fa fa-sign-in" aria-hidden="true"></span>
+                        {% trans "Check-In selected attendees" %}
+                    </button>
+                    <button type="submit" class="btn btn-default btn-save" name="checkout" value="true">
+                        <span class="fa fa-sign-out" aria-hidden="true"></span>
+                        {% trans "Check-Out selected attendees" %}
+                    </button>
+                {% endif %}
+                {% if "event.orders:write" in request.eventpermset %}
+                    <button type="submit" class="btn btn-danger btn-save" name="revert"
+                            formaction="{% url "control:event.orders.checkinlists.bulk_revert" event=request.event.slug organizer=request.event.organizer.slug list=checkinlist.pk %}"
+                            data-no-asynctask
+                            value="true">
+                        <span class="fa fa-trash" aria-hidden="true"></span>
+                        {% trans "Delete all check-ins of selected attendees" %}
+                    </button>
+                {% endif %}
+            </div>
         </form>
         {% include "pretixcontrol/pagination.html" %}
     {% endif %}

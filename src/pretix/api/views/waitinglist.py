@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -20,14 +20,15 @@
 # <https://www.gnu.org/licenses/>.
 #
 import django_filters
+from django.db import transaction
 from django_filters.rest_framework import DjangoFilterBackend, FilterSet
 from django_scopes import scopes_disabled
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.filters import OrderingFilter
 from rest_framework.response import Response
 
+from pretix.api.pagination import TotalOrderingFilter
 from pretix.api.serializers.waitinglist import WaitingListSerializer
 from pretix.base.models import WaitingListEntry
 from pretix.base.models.waitinglist import WaitingListException
@@ -47,12 +48,12 @@ with scopes_disabled():
 class WaitingListViewSet(viewsets.ModelViewSet):
     serializer_class = WaitingListSerializer
     queryset = WaitingListEntry.objects.none()
-    filter_backends = (DjangoFilterBackend, OrderingFilter)
-    ordering = ('created',)
+    filter_backends = (DjangoFilterBackend, TotalOrderingFilter)
+    ordering = ('created', 'pk',)
     ordering_fields = ('id', 'created', 'email', 'item')
     filterset_class = WaitingListFilter
-    permission = 'can_view_orders'
-    write_permission = 'can_change_orders'
+    permission = 'event.orders:read'
+    write_permission = 'event.orders:write'
 
     def get_queryset(self):
         return self.request.event.waitinglistentries.all()
@@ -62,6 +63,7 @@ class WaitingListViewSet(viewsets.ModelViewSet):
         ctx['event'] = self.request.event
         return ctx
 
+    @transaction.atomic()
     def perform_create(self, serializer):
         serializer.save(event=self.request.event)
         serializer.instance.log_action(
@@ -70,6 +72,7 @@ class WaitingListViewSet(viewsets.ModelViewSet):
             auth=self.request.auth,
         )
 
+    @transaction.atomic()
     def perform_update(self, serializer):
         if serializer.instance.voucher:
             raise PermissionDenied('This entry can not be changed as it has already been assigned a voucher.')
@@ -80,6 +83,7 @@ class WaitingListViewSet(viewsets.ModelViewSet):
             auth=self.request.auth,
         )
 
+    @transaction.atomic()
     def perform_destroy(self, instance):
         if instance.voucher:
             raise PermissionDenied('This entry can not be deleted as it has already been assigned a voucher.')

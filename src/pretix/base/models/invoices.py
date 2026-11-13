@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -33,6 +33,7 @@
 # License for the specific language governing permissions and limitations under the License.
 
 import string
+import warnings
 from decimal import Decimal
 
 import pycountry
@@ -42,11 +43,13 @@ from django.db.models.functions import Cast
 from django.utils import timezone
 from django.utils.crypto import get_random_string
 from django.utils.functional import cached_property
-from django.utils.translation import pgettext
+from django.utils.timezone import now
+from django.utils.translation import gettext_lazy as _, pgettext
 from django_scopes import ScopedManager
 
 from pretix.base.settings import COUNTRIES_WITH_STATE_IN_ADDRESS
 from pretix.helpers.countries import FastCountryField
+from pretix.helpers.models import NormalizedDecimalField
 
 
 def invoice_filename(instance, filename: str) -> str:
@@ -95,6 +98,8 @@ class Invoice(models.Model):
     :type additional_text: str
     :param payment_provider_text: A payment provider specific text
     :type payment_provider_text: str
+    :param payment_provider_stamp: A payment provider specific stamp
+    :type payment_provider_stamp: str
     :param footer_text: A footer text, displayed smaller and centered on every page
     :type footer_text: str
     :param foreign_currency_display: A different currency that taxes should also be displayed in.
@@ -103,26 +108,49 @@ class Invoice(models.Model):
     :type foreign_currency_rate: Decimal
     :param foreign_currency_rate_date: The date of the foreign currency exchange rates.
     :type foreign_currency_rate_date: date
+    :param foreign_currency_rate_source: The source of the foreign currency rate.
+    :type foreign_currency_rate_source: str
     :param file: The filename of the rendered invoice
     :type file: File
     """
+    TRANSMISSION_STATUS_PENDING = "pending"
+    TRANSMISSION_STATUS_INFLIGHT = "inflight"
+    TRANSMISSION_STATUS_COMPLETED = "completed"
+    TRANSMISSION_STATUS_FAILED = "failed"
+    TRANSMISSION_STATUS_UNKNOWN = "unknown"
+    TRANSMISSION_STATUS_TESTMODE_IGNORED = "testmode_ignored"
+    TRANSMISSION_STATUS_CHOICES = (
+        (TRANSMISSION_STATUS_PENDING, _("pending transmission")),
+        (TRANSMISSION_STATUS_INFLIGHT, _("currently being transmitted")),
+        (TRANSMISSION_STATUS_COMPLETED, _("transmitted")),
+        (TRANSMISSION_STATUS_FAILED, _("failed")),
+        (TRANSMISSION_STATUS_UNKNOWN, _("unknown")),
+        (TRANSMISSION_STATUS_TESTMODE_IGNORED, _("not transmitted due to test mode")),
+    )
+
     order = models.ForeignKey('Order', related_name='invoices', db_index=True, on_delete=models.CASCADE)
     organizer = models.ForeignKey('Organizer', related_name='invoices', db_index=True, on_delete=models.PROTECT)
     event = models.ForeignKey('Event', related_name='invoices', db_index=True, on_delete=models.CASCADE)
+
     prefix = models.CharField(max_length=160, db_index=True)
     invoice_no = models.CharField(max_length=19, db_index=True)
     full_invoice_no = models.CharField(max_length=190, db_index=True)
+
     is_cancellation = models.BooleanField(default=False)
     refers = models.ForeignKey('Invoice', related_name='refered', null=True, blank=True, on_delete=models.CASCADE)
+
     invoice_from = models.TextField()
     invoice_from_name = models.CharField(max_length=190, null=True)
     invoice_from_zipcode = models.CharField(max_length=190, null=True)
     invoice_from_city = models.CharField(max_length=190, null=True)
+    invoice_from_state = models.CharField(max_length=190, null=True)
     invoice_from_country = FastCountryField(null=True)
     invoice_from_tax_id = models.CharField(max_length=190, null=True)
     invoice_from_vat_id = models.CharField(max_length=190, null=True)
+
     invoice_to = models.TextField()
     invoice_to_company = models.TextField(null=True)
+    invoice_to_is_business = models.BooleanField(null=True)
     invoice_to_name = models.TextField(null=True)
     invoice_to_street = models.TextField(null=True)
     invoice_to_zipcode = models.CharField(max_length=190, null=True)
@@ -131,21 +159,52 @@ class Invoice(models.Model):
     invoice_to_country = FastCountryField(null=True)
     invoice_to_vat_id = models.TextField(null=True)
     invoice_to_beneficiary = models.TextField(null=True)
+    invoice_to_transmission_info = models.JSONField(null=True, blank=True)
+    internal_reference = models.TextField(blank=True)
+    custom_field = models.CharField(max_length=255, null=True)
+
+    created = models.DateTimeField(auto_now_add=True, null=True)  # null for backwards compatibility
     date = models.DateField(default=today)
     locale = models.CharField(max_length=50, default='en')
     introductory_text = models.TextField(blank=True)
     additional_text = models.TextField(blank=True)
     reverse_charge = models.BooleanField(default=False)
     payment_provider_text = models.TextField(blank=True)
+    payment_provider_stamp = models.CharField(max_length=100, null=True, blank=True)
     footer_text = models.TextField(blank=True)
+
     foreign_currency_display = models.CharField(max_length=50, null=True, blank=True)
-    foreign_currency_rate = models.DecimalField(decimal_places=4, max_digits=10, null=True, blank=True)
+    foreign_currency_rate = models.DecimalField(decimal_places=4, max_digits=13, null=True, blank=True)
     foreign_currency_rate_date = models.DateField(null=True, blank=True)
+    foreign_currency_source = models.CharField(max_length=100, null=True, blank=True)
+
     shredded = models.BooleanField(default=False)
 
+    # The field sent_to_organizer records whether this invoice was already sent to the organizer by a configured
+    # mechanism such as email.
+    # NULL: The cronjob that handles sending did not yet run.
+    # True: The invoice was sent.
+    # False: The invoice wasn't sent and never will, because sending was not configured at the time of the check.
+    sent_to_organizer = models.BooleanField(null=True, blank=True)
+
+    transmission_type = models.CharField(
+        max_length=255,
+        default="email",
+    )
+    transmission_provider = models.CharField(
+        max_length=255,
+        null=True, blank=True,
+    )
+    transmission_status = models.CharField(
+        max_length=255,
+        choices=TRANSMISSION_STATUS_CHOICES,
+        default=TRANSMISSION_STATUS_UNKNOWN,
+    )
+    transmission_date = models.DateTimeField(null=True, blank=True)
+    transmission_info = models.JSONField(null=True, blank=True)
+
     file = models.FileField(null=True, blank=True, upload_to=invoice_filename, max_length=255)
-    internal_reference = models.TextField(blank=True)
-    custom_field = models.CharField(max_length=255, null=True)
+    plugin_data = models.JSONField(default=dict)
 
     objects = ScopedManager(organizer='event__organizer')
 
@@ -161,10 +220,23 @@ class Invoice(models.Model):
                 taxidrow = "ABN: %s" % self.invoice_from_tax_id
             else:
                 taxidrow = pgettext("invoice", "Tax ID: %s") % self.invoice_from_tax_id
+
+        state_name = ""
+        if self.invoice_from_state:
+            state_name = self.invoice_from_state
+            if str(self.invoice_from_country) in COUNTRIES_WITH_STATE_IN_ADDRESS:
+                if COUNTRIES_WITH_STATE_IN_ADDRESS[str(self.invoice_from_country)][1] == 'long':
+                    try:
+                        state_name = pycountry.subdivisions.get(
+                            code='{}-{}'.format(self.invoice_from_country, self.invoice_from_state)
+                        ).name
+                    except:
+                        pass
+
         parts = [
             self.invoice_from_name,
             self.invoice_from,
-            (self.invoice_from_zipcode or "") + " " + (self.invoice_from_city or ""),
+            ((self.invoice_from_zipcode or "") + " " + (self.invoice_from_city or "") + " " + (state_name or "")).strip(),
             self.invoice_from_country.name if self.invoice_from_country else "",
             pgettext("invoice", "VAT-ID: %s") % self.invoice_from_vat_id if self.invoice_from_vat_id else "",
             taxidrow,
@@ -173,10 +245,22 @@ class Invoice(models.Model):
 
     @property
     def address_invoice_from(self):
+        state_name = ""
+        if self.invoice_from_state:
+            state_name = self.invoice_from_state
+            if str(self.invoice_from_country) in COUNTRIES_WITH_STATE_IN_ADDRESS:
+                if COUNTRIES_WITH_STATE_IN_ADDRESS[str(self.invoice_from_country)][1] == 'long':
+                    try:
+                        state_name = pycountry.subdivisions.get(
+                            code='{}-{}'.format(self.invoice_from_country, self.invoice_from_state)
+                        ).name
+                    except:
+                        pass
+
         parts = [
             self.invoice_from_name,
             self.invoice_from,
-            (self.invoice_from_zipcode or "") + " " + (self.invoice_from_city or ""),
+            " ".join(s for s in [self.invoice_from_zipcode, self.invoice_from_city, state_name] if s),
             self.invoice_from_country.name if self.invoice_from_country else "",
         ]
         return '\n'.join([p.strip() for p in parts if p and p.strip()])
@@ -221,7 +305,7 @@ class Invoice(models.Model):
     def _get_invoice_number_from_order(self):
         return '{order}-{count}'.format(
             order=self.order.code,
-            count=Invoice.objects.filter(event=self.event, order=self.order).count() + 1,
+            count=Invoice.objects.filter(event=self.event, prefix=self.prefix, invoice_no__startswith=f"{self.order.code}-", order=self.order).count() + 1,
         )
 
     def save(self, *args, **kwargs):
@@ -229,14 +313,20 @@ class Invoice(models.Model):
             raise ValueError('Every invoice needs to be connected to an order')
         if not self.event:
             self.event = self.order.event
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'event'}.union(kwargs['update_fields'])
         if not self.organizer:
             self.organizer = self.order.event.organizer
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'organizer'}.union(kwargs['update_fields'])
         if not self.prefix:
             self.prefix = self.event.settings.invoice_numbers_prefix or (self.event.slug.upper() + '-')
             if self.is_cancellation:
                 self.prefix = self.event.settings.invoice_numbers_prefix_cancellations or self.prefix
             if '%' in self.prefix:
                 self.prefix = self.date.strftime(self.prefix)
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'prefix'}.union(kwargs['update_fields'])
 
         if not self.invoice_no:
             if self.order.testmode:
@@ -248,13 +338,19 @@ class Invoice(models.Model):
                     self.invoice_no = self._get_invoice_number_from_order()
                 try:
                     with transaction.atomic():
+                        self.full_invoice_no = self.prefix + self.invoice_no
                         return super().save(*args, **kwargs)
                 except DatabaseError:
                     # Suppress duplicate key errors and try again
                     if i == 9:
                         raise
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'invoice_no'}.union(kwargs['update_fields'])
 
-        self.full_invoice_no = self.prefix + self.invoice_no
+        if self.full_invoice_no != self.prefix + self.invoice_no:
+            self.full_invoice_no = self.prefix + self.invoice_no
+            if 'update_fields' in kwargs:
+                kwargs['update_fields'] = {'full_invoice_no'}.union(kwargs['update_fields'])
         return super().save(*args, **kwargs)
 
     def delete(self, *args, **kwargs):
@@ -286,6 +382,38 @@ class Invoice(models.Model):
     def __repr__(self):
         return '<Invoice {} / {}>'.format(self.full_invoice_no, self.pk)
 
+    def __str__(self):
+        return self.full_invoice_no
+
+    @property
+    def regenerate_allowed(self):
+        return self.transmission_status in (
+            Invoice.TRANSMISSION_STATUS_UNKNOWN,
+            Invoice.TRANSMISSION_STATUS_PENDING,
+            Invoice.TRANSMISSION_STATUS_FAILED,
+        ) and self.event.settings.invoice_regenerate_allowed
+
+    @property
+    def transmission_type_instance(self):
+        from pretix.base.invoicing.transmission import transmission_types
+        return transmission_types.get(identifier=self.transmission_type)[0]
+
+    def set_transmission_failed(self, provider, data):
+        self.transmission_status = Invoice.TRANSMISSION_STATUS_FAILED
+        self.transmission_date = now()
+        if not self.transmission_provider and provider:
+            self.transmission_provider = provider
+        self.save(update_fields=["transmission_status", "transmission_date", "transmission_provider"])
+        self.order.log_action(
+            "pretix.event.order.invoice.sending_failed",
+            data={
+                "full_invoice_no": self.full_invoice_no,
+                "transmission_provider": provider,
+                "transmission_type": self.transmission_type,
+                "data": data,
+            }
+        )
+
 
 class InvoiceLine(models.Model):
     """
@@ -305,10 +433,12 @@ class InvoiceLine(models.Model):
     :type tax_name: str
     :param subevent: The subevent this line refers to
     :type subevent: SubEvent
-    :param event_date_from: Event date of the (sub)event at the time the invoice was created
-    :type event_date_from: datetime
-    :param event_date_to: Event end date of the (sub)event at the time the invoice was created
-    :type event_date_to: datetime
+    :param period_start: Start if service period invoiced
+    :type period_start: datetime
+    :param period_end: End of service period invoiced
+    :type period_end: datetime
+    :param event_location: Event location of the (sub)event at the time the invoice was created
+    :type event_location: str
     :param item: The item this line refers to
     :type item: Item
     :param variation: The variation this line refers to
@@ -319,16 +449,20 @@ class InvoiceLine(models.Model):
     invoice = models.ForeignKey('Invoice', related_name='lines', on_delete=models.CASCADE)
     position = models.PositiveIntegerField(default=0)
     description = models.TextField()
-    gross_value = models.DecimalField(max_digits=10, decimal_places=2)
-    tax_value = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal('0.00'))
-    tax_rate = models.DecimalField(max_digits=7, decimal_places=2, default=Decimal('0.00'))
+    gross_value = models.DecimalField(max_digits=13, decimal_places=2)
+    tax_value = models.DecimalField(max_digits=13, decimal_places=2, default=Decimal('0.00'))
+    tax_rate = NormalizedDecimalField(max_digits=7, decimal_places=4, default=Decimal('0'))
     tax_name = models.CharField(max_length=190)
+    tax_code = models.CharField(max_length=190, null=True, blank=True)
     subevent = models.ForeignKey('SubEvent', null=True, blank=True, on_delete=models.PROTECT)
-    event_date_from = models.DateTimeField(null=True)
-    event_date_to = models.DateTimeField(null=True)
+    period_start = models.DateTimeField(null=True)
+    period_end = models.DateTimeField(null=True)
+    event_location = models.TextField(null=True, blank=True)
     item = models.ForeignKey('Item', null=True, blank=True, on_delete=models.PROTECT)
     variation = models.ForeignKey('ItemVariation', null=True, blank=True, on_delete=models.PROTECT)
     attendee_name = models.TextField(null=True, blank=True)
+    fee_type = models.CharField(max_length=190, null=True, blank=True)
+    fee_internal_type = models.CharField(max_length=190, null=True, blank=True)
 
     @property
     def net_value(self):
@@ -339,3 +473,35 @@ class InvoiceLine(models.Model):
 
     def __str__(self):
         return 'Line {} of invoice {}'.format(self.position, self.invoice)
+
+    @property
+    def event_date_from(self):
+        warnings.warn(
+            'InvoiceLine.event_date_from is deprecated, use period_start instead,',
+            category=DeprecationWarning,
+        )
+        return self.period_start
+
+    @event_date_from.setter
+    def event_date_from(self, value):
+        warnings.warn(
+            'InvoiceLine.event_date_from is deprecated, use period_start instead,',
+            category=DeprecationWarning,
+        )
+        self.period_start = value
+
+    @property
+    def event_date_to(self):
+        warnings.warn(
+            'InvoiceLine.event_date_to is deprecated, use period_end instead,',
+            category=DeprecationWarning,
+        )
+        return self.period_end
+
+    @event_date_to.setter
+    def event_date_to(self, value):
+        warnings.warn(
+            'InvoiceLine.event_date_to is deprecated, use period_end instead,',
+            category=DeprecationWarning,
+        )
+        self.period_to = value

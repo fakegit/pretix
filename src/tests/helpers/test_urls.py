@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -20,19 +20,19 @@
 # <https://www.gnu.org/licenses/>.
 #
 from django import urls
-from django.conf import settings
+from django.test import override_settings
 
-from pretix.helpers.urls import build_absolute_uri
+from pretix.helpers.urls import mainreverse_absolute
 
 
 def test_site_url_domain():
-    settings.SITE_URL = 'https://example.com'
-    assert build_absolute_uri('control:auth.login') == 'https://example.com/control/login'
+    with override_settings(SITE_URL='https://example.com'):
+        assert mainreverse_absolute('control:auth.login') == 'https://example.com/control/login'
 
 
 def test_site_url_subpath():
-    settings.SITE_URL = 'https://example.com/presale'
-    old_prefix = urls.get_script_prefix()
-    urls.set_script_prefix('/presale/')
-    assert build_absolute_uri('control:auth.login') == 'https://example.com/presale/control/login'
-    urls.set_script_prefix(old_prefix)
+    with override_settings(SITE_URL='https://example.com/presale'):
+        old_prefix = urls.get_script_prefix()
+        urls.set_script_prefix('/presale/')
+        assert mainreverse_absolute('control:auth.login') == 'https://example.com/presale/control/login'
+        urls.set_script_prefix(old_prefix)

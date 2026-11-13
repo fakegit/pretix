@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,13 +19,19 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import gettext as gettext_module
 import json
+import os
 import re
+from datetime import datetime
+from functools import lru_cache
+from typing import Optional
 
+from django.apps import apps
+from django.conf import settings
 from django.utils import translation
 from django.utils.formats import get_format
-
-from pretix import settings
+from django.utils.translation import to_locale
 
 date_conversion_to_moment = {
     '%a': 'ddd',
@@ -157,3 +163,84 @@ def get_moment_locale(locale=None):
 
 def i18ncomp(query):
     return json.dumps(str(query))[1:-1]
+
+
+@lru_cache
+def get_language_score(locale):
+    """
+    For a given language code, return a numeric score on how well-translated the language is. The score
+    is an integer greater than 1 and can be arbitrarily high, so it's only useful for comparing with
+    other languages.
+
+    Note that there is no valid score for "en", since it's technically not "translated".
+    """
+    catalog = {}
+    app_configs = reversed(apps.get_app_configs())
+
+    for app in app_configs:
+        # Filter out all third-party apps by looking for the pretix name and for valid pretix plugins
+        if not app.name.startswith("pretix") and not hasattr(app, 'PretixPluginMeta'):
+            continue
+        if hasattr(app, 'PretixPluginMeta'):
+            # Filter out invisible plugins and plugins only available to some users
+            p = app.PretixPluginMeta
+            if not getattr(p, 'visible', True) or hasattr(app, 'is_available'):
+                continue
+        localedir = os.path.join(app.path, "locale")
+        if os.path.exists(localedir):
+            try:
+                translation = gettext_module.translation(
+                    domain="django",
+                    localedir=localedir,
+                    languages=[to_locale(locale)],
+                    fallback=False,
+                )
+            except:
+                continue
+
+            catalog.update(translation._catalog.copy())
+
+            # Also add fallback catalog (e.g. es for es-419, de for de-informal, …)
+            while translation._fallback:
+                if not locale.startswith(translation._fallback.info().get("language", "XX")):
+                    break
+                translation = translation._fallback
+                catalog.update(translation._catalog.copy())
+
+    # Add pretix' main translation folder as well as installation-specific translation folders
+    for localedir in reversed(settings.LOCALE_PATHS):
+        try:
+            translation = gettext_module.translation(
+                domain="django",
+                localedir=localedir,
+                languages=[to_locale(locale)],
+                fallback=False,
+            )
+        except:
+            continue
+        catalog.update(translation._catalog.copy())
+
+        while translation._fallback:
+            if not locale.startswith(translation._fallback.info().get("language", "XX")):
+                break
+            translation = translation._fallback
+            catalog.update(translation._catalog.copy())
+
+    if not catalog:
+        score = 1
+    else:
+        source_strings = [k[1] if isinstance(k, tuple) else k for k in catalog.keys()]
+        score = len(set(source_strings)) or 1
+    return score
+
+
+def parse_date_localized(date_str) -> Optional[datetime]:
+    """Parses a date according to the localized date input formats. Returns None if invalid."""
+    dt = None
+    for f in get_format('DATE_INPUT_FORMATS'):
+        try:
+            dt = datetime.strptime(date_str, f)
+            break
+        except (ValueError, TypeError):
+            continue
+    return dt

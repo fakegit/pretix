@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,48 +19,3 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
-
-# This file is based on an earlier version of pretix which was released under the Apache License 2.0. The full text of
-# the Apache License 2.0 can be obtained at <http://www.apache.org/licenses/LICENSE-2.0>.
-#
-# This file may have since been changed and any changes are released under the terms of AGPLv3 as described above. A
-# full history of changes and contributors is available at <https://github.com/pretix/pretix>.
-#
-# This file contains Apache-licensed contributions copyrighted by: Tobias Kunze
-#
-# Unless required by applicable law or agreed to in writing, software distributed under the Apache License 2.0 is
-# distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-# License for the specific language governing permissions and limitations under the License.
-
-from django.apps import AppConfig
-from django.utils.functional import cached_property
-from django.utils.translation import gettext_lazy as _
-
-from pretix import __version__ as version
-
-
-class PaypalApp(AppConfig):
-    name = 'pretix.plugins.paypal'
-    verbose_name = _("PayPal")
-
-    class PretixPluginMeta:
-        name = _("PayPal")
-        author = _("the pretix team")
-        version = version
-        category = 'PAYMENT'
-        description = _("This plugin allows you to receive payments via PayPal")
-
-    def ready(self):
-        from . import signals  # NOQA
-
-    @cached_property
-    def compatibility_errors(self):
-        errs = []
-        try:
-            import paypalrestsdk  # NOQA
-        except ImportError:
-            errs.append("Python package 'paypalrestsdk' is not installed.")
-        return errs
-
-
-default_app_config = 'pretix.plugins.paypal.PaypalApp'

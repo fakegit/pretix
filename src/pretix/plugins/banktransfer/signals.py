@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -27,6 +27,9 @@ from django.utils.translation import gettext_lazy as _
 from pretix.base.signals import register_payment_providers
 from pretix.control.signals import html_head, nav_event, nav_organizer
 
+from ...base.logentrytypes import (
+    ClearDataShredderMixin, OrderLogEntryType, log_entry_types,
+)
 from .payment import BankTransfer
 
 
@@ -38,7 +41,7 @@ def register_payment_provider(sender, **kwargs):
 @receiver(nav_event, dispatch_uid="payment_banktransfer_nav")
 def control_nav_import(sender, request=None, **kwargs):
     url = resolve(request.path_info)
-    if not request.user.has_event_permission(request.organizer, request.event, 'can_change_orders', request=request):
+    if not request.user.has_event_permission(request.organizer, request.event, 'event.orders:write', request=request):
         return []
     return [
         {
@@ -73,9 +76,10 @@ def control_nav_import(sender, request=None, **kwargs):
 @receiver(nav_organizer, dispatch_uid="payment_banktransfer_organav")
 def control_nav_orga_import(sender, request=None, **kwargs):
     url = resolve(request.path_info)
-    if not request.user.has_organizer_permission(request.organizer, 'can_change_orders', request=request):
-        return []
-    if not request.organizer.events.filter(plugins__icontains='pretix.plugins.banktransfer'):
+    has_any_event_perm = request.user.get_events_with_permission(
+        "event.orders:write", request=request
+    ).filter(organizer=request.organizer).exists()
+    if not has_any_event_perm:
         return []
     return [
         {
@@ -113,3 +117,10 @@ def html_head_presale(sender, request=None, **kwargs):
         return template.render({})
     else:
         return ""
+
+
+@log_entry_types.new()
+class BanktransferOrderEmailInvoiceLogEntryType(OrderLogEntryType, ClearDataShredderMixin):
+    # For backwards-compatibility only
+    action_type = 'pretix.plugins.banktransfer.order.email.invoice'
+    plain = _('The invoice was sent to the designated email address.')

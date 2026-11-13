@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -37,10 +37,8 @@ import datetime
 from decimal import Decimal
 
 import pytest
-from django.utils import timezone
 from django.utils.timezone import now
 from django_scopes import scopes_disabled
-from pytz import UTC
 
 from pretix.base.models import Event, SeatingPlan, Voucher
 
@@ -66,6 +64,7 @@ TEST_VOUCHER_RES = {
     'id': 1,
     'code': '43K6LKM37FBVR2YG',
     'max_usages': 1,
+    'min_usages': 1,
     'redeemed': 0,
     'valid_until': None,
     'block_quota': False,
@@ -78,8 +77,12 @@ TEST_VOUCHER_RES = {
     'tag': 'Foo',
     'comment': '',
     'show_hidden_items': True,
+    'all_addons_included': False,
+    'all_bundles_included': False,
     'subevent': None,
     'seat': None,
+    'budget': None,
+    'budget_used': "0.00",
 }
 
 
@@ -88,6 +91,7 @@ def test_voucher_list(token_client, organizer, event, voucher, item, quota, sube
     res = dict(TEST_VOUCHER_RES)
     res['item'] = item.pk
     res['id'] = voucher.pk
+    res['created'] = voucher.created.isoformat().replace('+00:00', 'Z')
     res['code'] = voucher.code
     q2 = copy.copy(quota)
     q2.pk = None
@@ -108,6 +112,15 @@ def test_voucher_list(token_client, organizer, event, voucher, item, quota, sube
     assert [res] == resp.data['results']
     resp = token_client.get(
         '/api/v1/organizers/{}/events/{}/vouchers/?code=ABC'.format(organizer.slug, event.slug)
+    )
+    assert [] == resp.data['results']
+
+    resp = token_client.get(
+        '/api/v1/organizers/{}/events/{}/vouchers/?search={}'.format(organizer.slug, event.slug, voucher.code[:3])
+    )
+    assert [res] == resp.data['results']
+    resp = token_client.get(
+        '/api/v1/organizers/{}/events/{}/vouchers/?code=RAvRcnbDehWD59oywV5x'.format(organizer.slug, event.slug)
     )
     assert [] == resp.data['results']
 
@@ -231,7 +244,7 @@ def test_voucher_list(token_client, organizer, event, voucher, item, quota, sube
     assert [res] == resp.data['results']
 
     voucher.redeemed = 0
-    voucher.valid_until = (timezone.now() - datetime.timedelta(days=1)).replace(microsecond=0)
+    voucher.valid_until = (now() - datetime.timedelta(days=1)).replace(microsecond=0)
     voucher.save()
     res['valid_until'] = voucher.valid_until.isoformat().replace('+00:00', 'Z')
     res['redeemed'] = 0
@@ -248,7 +261,7 @@ def test_voucher_list(token_client, organizer, event, voucher, item, quota, sube
         '/api/v1/organizers/{}/events/{}/vouchers/?subevent={}'.format(organizer.slug, event.slug, subevent.pk))
     assert [res] == resp.data['results']
     with scopes_disabled():
-        se2 = event.subevents.create(name="Foobar", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC))
+        se2 = event.subevents.create(name="Foobar", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=datetime.timezone.utc))
     resp = token_client.get(
         '/api/v1/organizers/{}/events/{}/vouchers/?subevent={}'.format(organizer.slug, event.slug,
                                                                        se2.pk))
@@ -261,6 +274,7 @@ def test_voucher_detail(token_client, organizer, event, voucher, item):
     res['item'] = item.pk
     res['id'] = voucher.pk
     res['code'] = voucher.code
+    res['created'] = voucher.created.isoformat().replace('+00:00', 'Z')
 
     resp = token_client.get('/api/v1/organizers/{}/events/{}/vouchers/{}/'.format(organizer.slug, event.slug,
                                                                                   voucher.pk))
@@ -311,7 +325,8 @@ def test_voucher_create_full(token_client, organizer, event, item):
         token_client, organizer, event,
         data={
             'code': 'ABCDEFGHI',
-            'max_usages': 1,
+            'max_usages': 10,
+            'min_usages': 10,
             'valid_until': None,
             'block_quota': False,
             'allow_ignore_quota': False,
@@ -327,10 +342,10 @@ def test_voucher_create_full(token_client, organizer, event, item):
     )
 
     assert v.code == 'ABCDEFGHI'
-    assert v.max_usages == 1
+    assert v.max_usages == 10
+    assert v.min_usages == 10
     assert v.redeemed == 0
     assert v.valid_until is None
-    assert v.max_usages == 1
     assert v.block_quota is False
     assert v.price_mode == 'set'
     assert v.value == Decimal('12.00')
@@ -609,7 +624,7 @@ def test_change_to_item_of_other_event(token_client, organizer, event, item):
             organizer=organizer,
             name='Dummy2',
             slug='dummy2',
-            date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC),
+            date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=datetime.timezone.utc),
             plugins='pretix.plugins.banktransfer,pretix.plugins.ticketoutputpdf'
         )
         ticket2 = e2.items.create(name='Late-bird ticket', default_price=23)
@@ -958,6 +973,8 @@ def test_redeemed_is_not_writable(token_client, organizer, event, item):
 
 @pytest.mark.django_db
 def test_create_multiple_vouchers(token_client, organizer, event, item):
+    with scopes_disabled():
+        event.quotas.create(name="Q", size=100).items.add(item)
     resp = token_client.post(
         '/api/v1/organizers/{}/events/{}/vouchers/batch_create/'.format(organizer.slug, event.slug),
         data=[
@@ -1006,6 +1023,8 @@ def test_create_multiple_vouchers(token_client, organizer, event, item):
 
 @pytest.mark.django_db
 def test_create_multiple_vouchers_one_invalid(token_client, organizer, event, item):
+    with scopes_disabled():
+        event.quotas.create(name="Q", size=100).items.add(item)
     resp = token_client.post(
         '/api/v1/organizers/{}/events/{}/vouchers/batch_create/'.format(organizer.slug, event.slug),
         data=[
@@ -1049,6 +1068,8 @@ def test_create_multiple_vouchers_one_invalid(token_client, organizer, event, it
 
 @pytest.mark.django_db
 def test_create_multiple_vouchers_duplicate_code(token_client, organizer, event, item):
+    with scopes_disabled():
+        event.quotas.create(name="Q", size=100).items.add(item)
     resp = token_client.post(
         '/api/v1/organizers/{}/events/{}/vouchers/batch_create/'.format(organizer.slug, event.slug),
         data=[
@@ -1090,6 +1111,52 @@ def test_create_multiple_vouchers_duplicate_code(token_client, organizer, event,
         assert Voucher.objects.count() == 0
 
 
+@pytest.mark.django_db
+def test_create_multiple_vouchers_autogenerate_codes(token_client, organizer, event, item):
+    with scopes_disabled():
+        event.quotas.create(name="Q", size=100).items.add(item)
+    resp = token_client.post(
+        '/api/v1/organizers/{}/events/{}/vouchers/batch_create/'.format(organizer.slug, event.slug),
+        data=[
+            {
+                'max_usages': 1,
+                'valid_until': None,
+                'block_quota': False,
+                'allow_ignore_quota': False,
+                'price_mode': 'set',
+                'value': '12.00',
+                'item': item.pk,
+                'variation': None,
+                'quota': None,
+                'tag': 'Foo',
+                'comment': '',
+                'subevent': None
+            },
+            {
+                'max_usages': 1,
+                'valid_until': None,
+                'block_quota': True,
+                'allow_ignore_quota': False,
+                'price_mode': 'set',
+                'value': '12.00',
+                'item': item.pk,
+                'variation': None,
+                'quota': None,
+                'tag': 'Foo',
+                'comment': '',
+                'subevent': None
+            }
+        ], format='json'
+    )
+    assert resp.status_code == 201
+    with scopes_disabled():
+        assert Voucher.objects.count() == 2
+        v1 = Voucher.objects.get(code=resp.data[0]['code'])
+        assert not v1.block_quota
+        v2 = Voucher.objects.get(code=resp.data[1]['code'])
+        assert v2.block_quota
+
+
 @pytest.fixture
 def seatingplan(organizer, event):
     plan = SeatingPlan.objects.create(
@@ -1107,6 +1174,8 @@ def seat1(item, event):
 
 @pytest.mark.django_db
 def test_create_multiple_vouchers_duplicate_seat(token_client, organizer, event, item, seat1, seatingplan):
+    with scopes_disabled():
+        event.quotas.create(name="Q", size=100).items.add(item)
     resp = token_client.post(
         '/api/v1/organizers/{}/events/{}/vouchers/batch_create/'.format(organizer.slug, event.slug),
         data=[
@@ -1163,6 +1232,14 @@ def test_set_seat_ok(token_client, organizer, event, seatingplan, seat1, item):
     with scopes_disabled():
         v.refresh_from_db()
         assert v.seat == seat1
+
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/seats/{}/'.format(organizer.slug, event.slug, seat1.pk))
+    assert resp.status_code == 200
+    assert resp.data['voucher'] == v.pk
+
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/seats/{}/?expand=voucher'.format(organizer.slug, event.slug, seat1.pk))
+    assert resp.status_code == 200
+    assert resp.data['voucher']['id'] == v.pk
 
 
 @pytest.mark.django_db
@@ -1252,8 +1329,8 @@ def test_set_seat_subevent(token_client, organizer, event, seatingplan, seat1, i
     with scopes_disabled():
         event.has_subevents = True
         event.save()
-        se1 = event.subevents.create(name="Foobar", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC))
-        se2 = event.subevents.create(name="Baz", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC))
+        se1 = event.subevents.create(name="Foobar", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=datetime.timezone.utc))
+        se2 = event.subevents.create(name="Baz", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=datetime.timezone.utc))
         seat1 = event.seats.create(seat_number="A1", product=item, seat_guid="A1", subevent=se1)
         event.seats.create(seat_number="A1", product=item, seat_guid="A1", subevent=se2)
         v = event.vouchers.create(item=item)
@@ -1275,8 +1352,8 @@ def test_set_seat_subevent_required(token_client, organizer, event, seatingplan,
     with scopes_disabled():
         event.has_subevents = True
         event.save()
-        se1 = event.subevents.create(name="Foobar", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC))
-        se2 = event.subevents.create(name="Baz", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC))
+        se1 = event.subevents.create(name="Foobar", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=datetime.timezone.utc))
+        se2 = event.subevents.create(name="Baz", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=datetime.timezone.utc))
         seat1 = event.seats.create(seat_number="A1", product=item, seat_guid="A1", subevent=se1)
         event.seats.create(seat_number="A1", product=item, seat_guid="A1", subevent=se2)
         event.vouchers.create(item=item, seat=seat1)
@@ -1295,8 +1372,8 @@ def test_set_seat_subevent_invalid(token_client, organizer, event, seatingplan, 
     with scopes_disabled():
         event.has_subevents = True
         event.save()
-        se1 = event.subevents.create(name="Foobar", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC))
-        se2 = event.subevents.create(name="Baz", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC))
+        se1 = event.subevents.create(name="Foobar", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=datetime.timezone.utc))
+        se2 = event.subevents.create(name="Baz", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=datetime.timezone.utc))
         seat1 = event.seats.create(seat_number="A1", product=item, seat_guid="A1", subevent=se1)
         event.seats.create(seat_number="B1", product=item, seat_guid="B1", subevent=se2)
         event.vouchers.create(item=item, seat=seat1, subevent=se2)

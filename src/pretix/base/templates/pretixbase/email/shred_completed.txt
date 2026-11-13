@@ -1,0 +1,14 @@
+{% load i18n %}{% blocktrans %}Hello,
+
+The following data shredding job has been completed:
+
+- Organizer: {{ organizer }}
+- Event: {{ event }}
+- Data selection: {{ shredders }}
+- Start time: {{ start_time }}
+
+Any data added to the event after the start time may not have been deleted.
+
+Thanks,  
+The {{ instance }} Team
+{% endblocktrans %}

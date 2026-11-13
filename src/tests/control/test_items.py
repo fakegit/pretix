@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -40,8 +40,8 @@ from django_scopes import scopes_disabled
 from tests.base import SoupTest, extract_form_fields
 
 from pretix.base.models import (
-    Event, Item, ItemCategory, ItemVariation, Order, OrderPosition, Organizer,
-    Question, Quota, Team, User,
+    Discount, Event, Item, ItemCategory, ItemVariation, Order, OrderPosition,
+    Organizer, Question, Quota, Team, User,
 )
 
 
@@ -57,9 +57,9 @@ class ItemFormTest(SoupTest):
             date_from=datetime.datetime(2013, 12, 26, tzinfo=datetime.timezone.utc),
         )
         self.item1 = Item.objects.create(event=self.event1, name="Standard", default_price=0, position=1)
-        t = Team.objects.create(organizer=self.orga1, can_change_event_settings=True, can_change_items=True)
-        t.members.add(self.user)
-        t.limit_events.add(self.event1)
+        self.team = Team.objects.create(organizer=self.orga1, all_event_permissions=True)
+        self.team.members.add(self.user)
+        self.team.limit_events.add(self.event1)
         self.client.login(email='dummy@dummy.dummy', password='dummy')
 
 
@@ -86,6 +86,23 @@ class CategoriesTest(ItemFormTest):
         with scopes_disabled():
             assert str(ItemCategory.objects.get(id=c.id).name) == 'T-Shirts'
 
+    def test_copy(self):
+        i2 = Item.objects.create(event=self.event1, name="Non-Standard", default_price=10, position=2)
+        c = ItemCategory.objects.create(event=self.event1, name="Cross-Selling", cross_selling_mode='only', cross_selling_condition='products')
+        c.cross_selling_match_products.add(self.item1)
+        c.cross_selling_match_products.add(i2)
+
+        doc = self.get_doc('/control/event/%s/%s/categories/add?copy_from=%d' % (self.orga1.slug, self.event1.slug, c.pk))
+        form_data = extract_form_fields(doc.select('.container-fluid form')[0])
+        assert form_data['name_0'] == 'Cross-Selling'
+        assert form_data['category_type'] == 'only'
+        assert form_data['cross_selling_condition'] == 'products'
+        assert form_data['cross_selling_match_products'] == [str(self.item1.pk), str(i2.pk)]
+        form_data['name_0'] = 'Recommendations'
+        doc = self.post_doc('/control/event/%s/%s/categories/add' % (self.orga1.slug, self.event1.slug), form_data)
+        assert doc.select(".alert-success")
+        self.assertIn("Recommendations", doc.select("#page-wrapper table")[0].text)
+
     def test_sort(self):
         with scopes_disabled():
             c1 = ItemCategory.objects.create(event=self.event1, name="Entry tickets", position=0)
@@ -94,12 +111,12 @@ class CategoriesTest(ItemFormTest):
         self.assertIn("Entry tickets", doc.select("table > tbody > tr")[0].text)
         self.assertIn("T-Shirts", doc.select("table > tbody > tr")[1].text)
 
-        self.client.get('/control/event/%s/%s/categories/%s/down' % (self.orga1.slug, self.event1.slug, c1.id))
+        self.client.post('/control/event/%s/%s/categories/%s/down' % (self.orga1.slug, self.event1.slug, c1.id))
         doc = self.get_doc('/control/event/%s/%s/categories/' % (self.orga1.slug, self.event1.slug))
         self.assertIn("Entry tickets", doc.select("table > tbody > tr")[1].text)
         self.assertIn("T-Shirts", doc.select("table > tbody > tr")[0].text)
 
-        self.client.get('/control/event/%s/%s/categories/%s/up' % (self.orga1.slug, self.event1.slug, c1.id))
+        self.client.post('/control/event/%s/%s/categories/%s/up' % (self.orga1.slug, self.event1.slug, c1.id))
         doc = self.get_doc('/control/event/%s/%s/categories/' % (self.orga1.slug, self.event1.slug))
         self.assertIn("Entry tickets", doc.select("table > tbody > tr")[0].text)
         self.assertIn("T-Shirts", doc.select("table > tbody > tr")[1].text)
@@ -225,6 +242,7 @@ class QuestionsTest(ItemFormTest):
             o = Order.objects.create(code='FOO', event=self.event1, email='dummy@dummy.test',
                                      status=Order.STATUS_PENDING, datetime=now(),
                                      expires=now() + datetime.timedelta(days=10),
+                                     sales_channel=self.event1.organizer.sales_channels.get(identifier="web"),
                                      total=14, locale='en')
             op = OrderPosition.objects.create(order=o, item=item1, variation=None, price=Decimal("14"),
                                               attendee_name_parts={'full_name': "Peter"})
@@ -251,6 +269,14 @@ class QuestionsTest(ItemFormTest):
         doc = self.get_doc('/control/event/%s/%s/questions/%s/?status=p' % (self.orga1.slug, self.event1.slug, c.id))
         tbl = doc.select('.container-fluid table.table-bordered tbody')[0]
         assert tbl.select('tr')[0].select('td')[0].text.strip() == '42'
+
+        # Test permission requirement
+        self.team.all_event_permissions = False
+        self.team.limit_event_permissions = {}
+        self.team.save()
+        doc = self.get_doc('/control/event/%s/%s/questions/%s/' % (self.orga1.slug, self.event1.slug, c.id))
+        assert not doc.select('.container-fluid table.table-bordered tbody')
+        assert doc.select('.empty-collection')
 
     def test_set_dependency(self):
         with scopes_disabled():
@@ -303,6 +329,7 @@ class QuotaTest(ItemFormTest):
         form_data = extract_form_fields(doc.select('.container-fluid form')[0])
         form_data['name'] = 'Full house'
         form_data['size'] = '500'
+        form_data['itemvars'] = str(self.item1.pk)
         doc = self.post_doc('/control/event/%s/%s/quotas/add' % (self.orga1.slug, self.event1.slug), form_data)
         assert doc.select(".alert-success")
         self.assertIn("Full house", doc.select("#page-wrapper table")[0].text)
@@ -334,6 +361,7 @@ class QuotaTest(ItemFormTest):
             se1 = self.event1.subevents.create(name="Foo", date_from=now())
             se2 = self.event1.subevents.create(name="Bar", date_from=now())
             c = Quota.objects.create(event=self.event1, name="Full house", size=500, subevent=se1)
+            c.items.add(self.item1)
         doc = self.get_doc('/control/event/%s/%s/quotas/%s/change' % (self.orga1.slug, self.event1.slug, c.id))
         form_data = extract_form_fields(doc.select('.container-fluid form')[0])
         form_data['subevent'] = se2.pk
@@ -399,6 +427,24 @@ class ItemsTest(ItemFormTest):
         self.item1.refresh_from_db()
         self.item2.refresh_from_db()
         assert self.item1.position < self.item2.position
+
+    def test_reorder(self):
+        self.client.post('/control/event/%s/%s/items/reorder/0/' % (self.orga1.slug, self.event1.slug), {
+            'ids': [str(self.item2.id), str(self.item1.id)],
+        }, content_type='application/json')
+        self.item1.refresh_from_db()
+        self.item2.refresh_from_db()
+        assert self.item1.position > self.item2.position
+        assert self.item1.category is None
+        assert self.item2.category is None
+        self.client.post('/control/event/%s/%s/items/reorder/%s/' % (self.orga1.slug, self.event1.slug, self.addoncat.id), {
+            'ids': [str(self.item1.id), str(self.item2.id)],
+        }, content_type='application/json')
+        self.item1.refresh_from_db()
+        self.item2.refresh_from_db()
+        assert self.item1.position < self.item2.position
+        assert self.item1.category.id == self.addoncat.id
+        assert self.item2.category.id == self.addoncat.id
 
     def test_create(self):
         self.client.post('/control/event/%s/%s/items/add' % (self.orga1.slug, self.event1.slug), {
@@ -614,6 +660,7 @@ class ItemsTest(ItemFormTest):
                 code='FOO', event=self.event1, email='dummy@dummy.test',
                 status=Order.STATUS_PENDING,
                 datetime=now(), expires=now() + datetime.timedelta(days=10),
+                sales_channel=self.event1.organizer.sales_channels.get(identifier="web"),
                 total=14, locale='en'
             )
             OrderPosition.objects.create(
@@ -634,9 +681,24 @@ class ItemsTest(ItemFormTest):
         with scopes_disabled():
             q = Question.objects.create(event=self.event1, question="Size", type="N")
             q.items.add(self.item2)
-        self.item2.sales_channels = ["web", "bar"]
+            self.item2.limit_sales_channels.set(self.orga1.sales_channels.filter(identifier__in=["web", "bar"]))
+            self.item2.all_sales_channels = False
+            self.item2.save()
+            self.var2.limit_sales_channels.set(self.orga1.sales_channels.filter(identifier__in=["web"]))
+            self.var2.all_sales_channels = False
+            self.var2.save()
+        prop = self.event1.item_meta_properties.create(name="Foo")
+        self.item2.meta_values.create(property=prop, value="Bar")
+        self.item2.program_times.create(start=datetime.datetime(2017, 12, 27, 0, 0, 0,
+                                                                tzinfo=datetime.timezone.utc),
+                                        end=datetime.datetime(2017, 12, 28, 0, 0, 0,
+                                                              tzinfo=datetime.timezone.utc),
+                                        location={"en": "Testlocation", "de": "Testort"})
 
+        doc = self.get_doc('/control/event/%s/%s/items/add?copy_from=%d' % (self.orga1.slug, self.event1.slug, self.item2.pk))
+        data = extract_form_fields(doc.select("form")[0])
         self.client.post('/control/event/%s/%s/items/add' % (self.orga1.slug, self.event1.slug), {
+            **data,
             'name_0': 'Intermediate',
             'default_price': '23.00',
             'tax_rate': '19.00',
@@ -646,6 +708,7 @@ class ItemsTest(ItemFormTest):
         with scopes_disabled():
             i_old = Item.objects.get(name__icontains='Business')
             i_new = Item.objects.get(name__icontains='Intermediate')
+            v2_new = i_new.variations.get(value__icontains='Gold')
             assert i_new.category == i_old.category
             assert i_new.description == i_old.description
             assert i_new.active == i_old.active
@@ -654,9 +717,14 @@ class ItemsTest(ItemFormTest):
             assert i_new.require_voucher == i_old.require_voucher
             assert i_new.hide_without_voucher == i_old.hide_without_voucher
             assert i_new.allow_cancel == i_old.allow_cancel
-            assert i_new.sales_channels == i_old.sales_channels
+            assert set(i_new.limit_sales_channels.values_list("identifier", flat=True)) == {"web", "bar"}
+            assert set(v2_new.limit_sales_channels.values_list("identifier", flat=True)) == {"web"}
+            assert i_new.meta_data == i_old.meta_data == {"Foo": "Bar"}
             assert set(i_new.questions.all()) == set(i_old.questions.all())
             assert set([str(v.value) for v in i_new.variations.all()]) == set([str(v.value) for v in i_old.variations.all()])
+            assert i_old.program_times.first().start == i_new.program_times.first().start
+            assert i_old.program_times.first().end == i_new.program_times.first().end
+            assert i_old.program_times.first().location == i_new.program_times.first().location
 
     def test_add_to_existing_quota(self):
         with scopes_disabled():
@@ -693,3 +761,64 @@ class ItemsTest(ItemFormTest):
             i = Item.objects.get(name__icontains='New Item')
             q = Quota.objects.get(name__icontains='New Quota')
             assert q.items.filter(pk=i.pk).exists()
+
+
+class DiscountTest(ItemFormTest):
+
+    def test_create(self):
+        doc = self.get_doc('/control/event/%s/%s/discounts/add' % (self.orga1.slug, self.event1.slug))
+        form_data = extract_form_fields(doc.select('.container-fluid form')[0])
+        form_data['internal_name'] = 'Group discount'
+        form_data['condition_min_count'] = '2'
+        form_data['benefit_discount_matching_percent'] = '20'
+        doc = self.post_doc('/control/event/%s/%s/discounts/add' % (self.orga1.slug, self.event1.slug), form_data)
+        assert doc.select(".alert-success")
+        self.assertIn("Group discount", doc.select("#page-wrapper table")[0].text)
+
+    def test_update(self):
+        c = Discount.objects.create(event=self.event1, internal_name="2 for 1")
+        doc = self.get_doc('/control/event/%s/%s/discounts/%s/' % (self.orga1.slug, self.event1.slug, c.id))
+        form_data = extract_form_fields(doc.select('.container-fluid form')[0])
+        form_data['internal_name'] = 'Group discount'
+        form_data['condition_min_count'] = '2'
+        form_data['benefit_discount_matching_percent'] = '20'
+        doc = self.post_doc('/control/event/%s/%s/discounts/%s/' % (self.orga1.slug, self.event1.slug, c.id),
+                            form_data)
+        assert doc.select(".alert-success")
+        self.assertIn("Group discount", doc.select("#page-wrapper table")[0].text)
+        self.assertNotIn("2 for 1", doc.select("#page-wrapper table")[0].text)
+        with scopes_disabled():
+            assert str(Discount.objects.get(id=c.id).benefit_discount_matching_percent) == '20.00'
+
+    def test_sort(self):
+        with scopes_disabled():
+            c1 = Discount.objects.create(event=self.event1, internal_name="Group discount", condition_min_value=2,
+                                         benefit_discount_matching_percent=20)
+            Discount.objects.create(event=self.event1, internal_name="Big group", condition_min_value=5,
+                                    benefit_discount_matching_percent=40)
+        doc = self.get_doc('/control/event/%s/%s/discounts/' % (self.orga1.slug, self.event1.slug))
+        self.assertIn("Group discount", doc.select("table > tbody > tr")[0].text)
+        self.assertIn("Big group", doc.select("table > tbody > tr")[1].text)
+
+        self.client.post('/control/event/%s/%s/discounts/%s/down' % (self.orga1.slug, self.event1.slug, c1.id))
+        doc = self.get_doc('/control/event/%s/%s/discounts/' % (self.orga1.slug, self.event1.slug))
+        self.assertIn("Group discount", doc.select("table > tbody > tr")[1].text)
+        self.assertIn("Big group", doc.select("table > tbody > tr")[0].text)
+
+        self.client.post('/control/event/%s/%s/discounts/%s/up' % (self.orga1.slug, self.event1.slug, c1.id))
+        doc = self.get_doc('/control/event/%s/%s/discounts/' % (self.orga1.slug, self.event1.slug))
+        self.assertIn("Group discount", doc.select("table > tbody > tr")[0].text)
+        self.assertIn("Big group", doc.select("table > tbody > tr")[1].text)
+
+    def test_delete(self):
+        with scopes_disabled():
+            c = Discount.objects.create(event=self.event1, internal_name="Group discount", condition_min_value=2,
+                                        benefit_discount_matching_percent=20)
+        doc = self.get_doc('/control/event/%s/%s/discounts/%s/delete' % (self.orga1.slug, self.event1.slug, c.id))
+        form_data = extract_form_fields(doc.select('.container-fluid form')[0])
+        doc = self.post_doc('/control/event/%s/%s/discounts/%s/delete' % (self.orga1.slug, self.event1.slug, c.id),
+                            form_data)
+        assert doc.select(".alert-success")
+        self.assertNotIn("Group discount", doc.select("#page-wrapper")[0].text)
+        with scopes_disabled():
+            assert not Discount.objects.filter(id=c.id).exists()

@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -21,6 +21,7 @@
 #
 import json
 import logging
+from datetime import timedelta
 from io import BytesIO
 
 from django.contrib import messages
@@ -29,13 +30,14 @@ from django.core.files import File
 from django.core.files.storage import default_storage
 from django.db import transaction
 from django.http import Http404
-from django.shortcuts import redirect
+from django.shortcuts import get_object_or_404, redirect
 from django.templatetags.static import static
 from django.urls import reverse
 from django.utils.functional import cached_property
+from django.utils.timezone import now
 from django.utils.translation import gettext, gettext_lazy as _
 from django.views import View
-from django.views.generic import CreateView, DeleteView, DetailView, ListView
+from django.views.generic import CreateView, DetailView, ListView
 from reportlab.lib import pagesizes
 from reportlab.pdfgen import canvas
 
@@ -48,7 +50,10 @@ from pretix.helpers.models import modelcopy
 from pretix.plugins.ticketoutputpdf.forms import TicketLayoutForm
 from pretix.plugins.ticketoutputpdf.ticketoutput import PdfTicketOutput
 
+from ...base.views.tasks import AsyncAction
+from ...helpers.compat import CompatDeleteView
 from .models import TicketLayout
+from .tasks import tickets_create_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +95,7 @@ class EditorView(BaseEditorView):
 
 class LayoutListView(EventPermissionRequiredMixin, ListView):
     model = TicketLayout
-    permission = ('can_change_event_settings')
+    permission = 'event.settings.general:write'
     template_name = 'pretixplugins/ticketoutputpdf/index.html'
     context_object_name = 'layouts'
 
@@ -102,7 +107,7 @@ class LayoutCreate(EventPermissionRequiredMixin, CreateView):
     model = TicketLayout
     form_class = TicketLayoutForm
     template_name = 'pretixplugins/ticketoutputpdf/edit.html'
-    permission = 'can_change_event_settings'
+    permission = 'event.settings.general:write'
     context_object_name = 'layout'
     success_url = '/ignored'
 
@@ -152,7 +157,7 @@ class LayoutCreate(EventPermissionRequiredMixin, CreateView):
 
 class LayoutSetDefault(EventPermissionRequiredMixin, DetailView):
     model = TicketLayout
-    permission = 'can_change_event_settings'
+    permission = 'event.settings.general:write'
 
     def get_object(self, queryset=None) -> TicketLayout:
         try:
@@ -178,10 +183,10 @@ class LayoutSetDefault(EventPermissionRequiredMixin, DetailView):
         })
 
 
-class LayoutDelete(EventPermissionRequiredMixin, DeleteView):
+class LayoutDelete(EventPermissionRequiredMixin, CompatDeleteView):
     model = TicketLayout
     template_name = 'pretixplugins/ticketoutputpdf/delete.html'
-    permission = 'can_change_event_settings'
+    permission = 'event.settings.general:write'
     context_object_name = 'layout'
 
     def get_object(self, queryset=None) -> TicketLayout:
@@ -213,7 +218,7 @@ class LayoutDelete(EventPermissionRequiredMixin, DeleteView):
 
 
 class LayoutGetDefault(EventPermissionRequiredMixin, View):
-    permission = 'can_change_event_settings'
+    permission = 'event.settings.general:write'
 
     def get(self, request, *args, **kwargs):
         layout = self.request.event.ticket_layouts.get_or_create(
@@ -230,6 +235,7 @@ class LayoutGetDefault(EventPermissionRequiredMixin, View):
 
 
 class LayoutEditorView(BaseEditorView):
+    checkin_qr_warning = True
 
     @cached_property
     def layout(self):
@@ -245,17 +251,21 @@ class LayoutEditorView(BaseEditorView):
         return _('Ticket PDF layout: {}').format(self.layout)
 
     def save_layout(self):
+        update_fields = ['layout']
         self.layout.layout = self.request.POST.get("data")
-        self.layout.save(update_fields=['layout'])
+        if "name" in self.request.POST:
+            self.layout.name = self.request.POST.get("name")
+            update_fields.append('name')
+        self.layout.save(update_fields=update_fields)
         self.layout.log_action(action='pretix.plugins.ticketoutputpdf.layout.changed', user=self.request.user,
-                               data={'layout': self.request.POST.get("data")})
+                               data={'layout': self.request.POST.get("data"), 'name': self.request.POST.get("name")})
         invalidate_cache.apply_async(kwargs={'event': self.request.event.pk, 'provider': 'pdf'})
 
     def get_default_background(self):
         return static('pretixpresale/pdf/ticket_default_a4.pdf')
 
     def generate(self, op: OrderPosition, override_layout=None, override_background=None):
-        Renderer._register_fonts()
+        Renderer._register_fonts(self.request.event)
 
         buffer = BytesIO()
         if override_background:
@@ -282,7 +292,51 @@ class LayoutEditorView(BaseEditorView):
         return self.layout.background.url if self.layout.background else self.get_default_background()
 
     def save_background(self, f: CachedFile):
-        if self.layout.background:
+        if self.layout.background and TicketLayout.objects.filter(background=self.layout.background).count() == 1:
             self.layout.background.delete()
         self.layout.background.save('background.pdf', f.file)
         invalidate_cache.apply_async(kwargs={'event': self.request.event.pk, 'provider': 'pdf'})
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['name'] = self.layout.name
+        return ctx
+
+
+class OrderPrintDo(EventPermissionRequiredMixin, AsyncAction, View):
+    task = tickets_create_pdf
+    permission = 'event.orders:read'
+    known_errortypes = ['OrderError', 'ExportError']
+
+    def get_success_message(self, value):
+        return None
+
+    def get_success_url(self, value):
+        return reverse('cachedfile.download', kwargs={'id': str(value)})
+
+    def get_error_url(self):
+        return reverse('control:event.index', kwargs={
+            'organizer': self.request.organizer.slug,
+            'event': self.request.event.slug,
+        })
+
+    def get_error_message(self, exception):
+        if isinstance(exception, str):
+            return exception
+        return super().get_error_message(exception)
+
+    def post(self, request, *args, **kwargs):
+        order = get_object_or_404(self.request.event.orders, code=request.GET.get("code"))
+        cf = CachedFile(web_download=True, session_key=self.request.session.session_key)
+        cf.date = now()
+        cf.type = 'application/pdf'
+        cf.expires = now() + timedelta(days=3)
+        position = get_object_or_404(order.positions, pk=request.GET.get('position'))
+        cf.filename = f'tickets_{self.request.event.slug}_{order.code}-{position.positionid}.pdf'
+        cf.save()
+        return self.do(
+            self.request.event.pk,
+            str(cf.id),
+            position.pk,
+            request.GET.get('channel'),
+        )

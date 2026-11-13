@@ -1,14 +1,12 @@
-.. spelling:: checkin
+.. spelling:word-list:: checkin
+
+.. _rest-exporters:
 
 Data exporters
 ==============
 
 pretix and it's plugins include a number of data exporters that allow you to bulk download various data from pretix in
 different formats. This page shows you how to use these exporters through the API.
-
-.. versionchanged:: 3.13
-
-   This feature has been added to the API.
 
 .. warning::
 
@@ -115,7 +113,7 @@ Listing available exporters
             "input_parameters": [
               {
                 "name": "events",
-                "required": true
+                "required": false
               },
               {
                 "name": "_format",
@@ -182,7 +180,7 @@ endpoints:
       Content-Type: application/json
 
       {
-        "download": "https://pretix.eu/api/v1/organizers/bigevents/events/sampleconf/orderlist/download/29891ede-196f-4942-9e26-d055a36e98b8/3f279f13-c198-4137-b49b-9b360ce9fcce/"
+        "download": "https://pretix.eu/api/v1/organizers/bigevents/events/sampleconf/exporters/orderlist/download/29891ede-196f-4942-9e26-d055a36e98b8/3f279f13-c198-4137-b49b-9b360ce9fcce/"
       }
 
    :param organizer: The ``slug`` field of the organizer to fetch

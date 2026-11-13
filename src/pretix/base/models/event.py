@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -32,48 +32,65 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the Apache License 2.0 is
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
-
+import logging
+import os
 import string
 import uuid
-from collections import OrderedDict
+import warnings
+from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, time, timedelta
 from operator import attrgetter
+from typing import TYPE_CHECKING
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
-import pytz
+import pytz_deprecation_shim
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.core.files import File
 from django.core.files.storage import default_storage
 from django.core.mail import get_connection
 from django.core.validators import (
-    MaxValueValidator, MinLengthValidator, MinValueValidator, RegexValidator,
+    MaxValueValidator, MinValueValidator, RegexValidator,
 )
 from django.db import models
 from django.db.models import Exists, OuterRef, Prefetch, Q, Subquery, Value
+from django.db.models.functions import Coalesce
 from django.template.defaultfilters import date as _date
 from django.urls import reverse
 from django.utils.crypto import get_random_string
 from django.utils.formats import date_format
 from django.utils.functional import cached_property
+from django.utils.html import format_html
 from django.utils.timezone import make_aware, now
 from django.utils.translation import gettext, gettext_lazy as _
 from django_scopes import ScopedManager, scopes_disabled
 from i18nfield.fields import I18nCharField, I18nTextField
 
 from pretix.base.models.base import LoggedModel
-from pretix.base.models.fields import MultiStringField
 from pretix.base.reldate import RelativeDateWrapper
+from pretix.base.timemachine import time_machine_now
 from pretix.base.validators import EventSlugBanlistValidator
 from pretix.helpers.database import GroupConcat
 from pretix.helpers.daterange import daterange
-from pretix.helpers.json import safe_string
+from pretix.helpers.hierarkey import clean_filename
+from pretix.helpers.json import CustomJSONEncoder, safe_string
 from pretix.helpers.thumb import get_thumbnail
 
 from ..settings import settings_hierarkey
 from .organizer import Organizer, Team
 
+if TYPE_CHECKING:
+    from hierarkey.proxy import HierarkeyProxy
+
+    from .organizer import SalesChannel
+
+logger = logging.getLogger(__name__)
+
 
 class EventMixin:
+    if TYPE_CHECKING:
+        settings: HierarkeyProxy
 
     def clean(self):
         if self.presale_start and self.presale_end and self.presale_start > self.presale_end:
@@ -118,6 +135,16 @@ class EventMixin:
             ("SHORT_" if short else "") + ("DATETIME_FORMAT" if self.settings.show_times and show_times else "DATE_FORMAT")
         )
 
+    def get_weekday_from_display(self, tz=None, short=False) -> str:
+        """
+        Returns a formatted string containing the weekday of the start date of the event with respect
+        to the current locale.
+        """
+        tz = tz or self.timezone
+        return _date(
+            self.date_from.astimezone(tz), ("D" if short else "l")
+        )
+
     def get_time_from_display(self, tz=None) -> str:
         """
         Returns a formatted string containing the start time of the event, ignoring
@@ -142,7 +169,25 @@ class EventMixin:
             ("SHORT_" if short else "") + ("DATETIME_FORMAT" if self.settings.show_times and show_times else "DATE_FORMAT")
         )
 
-    def get_date_range_display(self, tz=None, force_show_end=False) -> str:
+    def get_weekday_to_display(self, tz=None, short=False) -> str:
+        """
+        Returns a formatted string containing the weekday of the end date of the event with respect
+        to the current locale.
+        """
+        tz = tz or self.timezone
+        if not self.settings.show_date_to or not self.date_to:
+            return ""
+        return _date(
+            self.date_to.astimezone(tz), ("D" if short else "l")
+        )
+
+    def is_same_day(self):
+        if not self.date_to:
+            return True
+        else:
+            return self.date_from.astimezone(self.timezone).date() == self.date_to.astimezone(self.timezone).date()
+
+    def get_date_range_display(self, tz=None, force_show_end=False, as_html=False, try_to_show_times=False) -> str:
         """
         Returns a formatted string containing the start date and the end date
         of the event with respect to the current locale and to the ``show_date_to``
@@ -150,12 +195,55 @@ class EventMixin:
         """
         tz = tz or self.timezone
         if (not self.settings.show_date_to and not force_show_end) or not self.date_to:
-            return _date(self.date_from.astimezone(tz), "DATE_FORMAT")
-        return daterange(self.date_from.astimezone(tz), self.date_to.astimezone(tz))
+            df, dt = self.date_from, self.date_from
+            show_times = try_to_show_times
+        else:
+            df, dt = self.date_from, self.date_to
+            show_times = try_to_show_times and self.settings.show_times and (
+                # Show times if start and end are on the same day ("08:00-10:00")
+                dt.astimezone(tz).date() == df.astimezone(tz).date() or
+                # Show times if start and end are on consecutive days and less than 24h ("23:00-03:00")
+                (dt.astimezone(tz).date() == df.astimezone(tz).date() + timedelta(days=1) and
+                 dt.astimezone(tz).time() < df.astimezone(tz).time())
+            )
+        d = daterange(df.astimezone(tz), dt.astimezone(tz), as_html)
+
+        if show_times:
+            if (not self.settings.show_date_to and not force_show_end) or not self.date_to:
+                time_str = _date(self.date_from.astimezone(tz), "TIME_FORMAT")
+            else:
+                time_str = '{}–{}'.format(
+                    _date(self.date_from.astimezone(tz), "TIME_FORMAT"),
+                    _date(self.date_to.astimezone(tz), "TIME_FORMAT"),
+                )
+
+            if as_html:
+                d = format_html(
+                    d + ' <time datetime="{}" data-timezone="{}" data-time-short>{}</time>',
+                    self.date_from.isoformat(),
+                    str(self.timezone),
+                    time_str,
+                )
+            else:
+                d = d + ' ' + time_str
+
+        return d
+
+    def get_date_range_display_with_times(self) -> str:  # Helper for usage from templates
+        return self.get_date_range_display(try_to_show_times=True)
+
+    def get_date_range_display_with_times_as_html(self) -> str:  # Helper for usage from templates
+        return self.get_date_range_display(try_to_show_times=True, as_html=True)
+
+    def get_date_range_display_as_html(self, tz=None, force_show_end=False) -> str:
+        return self.get_date_range_display(tz, force_show_end, as_html=True)
 
     @property
     def timezone(self):
-        return pytz.timezone(self.settings.timezone)
+        # If we get rid of the shim, verify that
+        # https://github.com/py-vobject/vobject/issues/117#issuecomment-5045645314
+        # has been released and included
+        return pytz_deprecation_shim.timezone(self.settings.timezone)
 
     @property
     def effective_presale_end(self):
@@ -170,16 +258,32 @@ class EventMixin:
             return self.presale_end
 
     @property
+    def waiting_list_active(self):
+        if not self.settings.waiting_list_enabled:
+            return False
+
+        if self.settings.waiting_list_auto_disable:
+            if self.settings.waiting_list_auto_disable.datetime(self) <= time_machine_now():
+                return False
+
+        if hasattr(self, 'active_quotas'):
+            # Only run when called with computed quotas, i.e. event calendar
+            if not self.best_availability[3]:
+                return False
+
+        return True
+
+    @property
     def presale_has_ended(self):
         """
         Is true, when ``presale_end`` is set and in the past.
         """
         if self.effective_presale_end:
-            return now() > self.effective_presale_end
+            return time_machine_now() > self.effective_presale_end
         elif self.date_to:
-            return now() > self.date_to
+            return time_machine_now() > self.date_to
         else:
-            return now().astimezone(self.timezone).date() > self.date_from.astimezone(self.timezone).date()
+            return time_machine_now().astimezone(self.timezone).date() > self.date_from.astimezone(self.timezone).date()
 
     @property
     def effective_presale_start(self):
@@ -199,12 +303,15 @@ class EventMixin:
         Is true, when ``presale_end`` is not set or in the future and ``presale_start`` is not
         set or in the past.
         """
-        if self.effective_presale_start and now() < self.effective_presale_start:
+        if self.effective_presale_start and time_machine_now() < self.effective_presale_start:
             return False
         return not self.presale_has_ended
 
     @property
     def event_microdata(self):
+        if self.settings.event_microdata:
+            return self.settings.event_microdata
+
         import json
 
         eventdict = {
@@ -231,84 +338,201 @@ class EventMixin:
         return safe_string(json.dumps(eventdict))
 
     @classmethod
-    def annotated(cls, qs, channel='web'):
-        from pretix.base.models import Item, ItemVariation, Quota
+    def annotated(cls, qs, channel: "str | SalesChannel | list[SalesChannel]", voucher=None):
+        # Channel can currently be a SalesChannel or a str, since we need that compatibility, but a SalesChannel
+        # makes the query SIGNIFICANTLY faster
+        from pretix.base.models import Item, ItemVariation, Quota, SalesChannel
 
-        sq_active_item = Item.objects.using(settings.DATABASE_REPLICA).filter_available(channel=channel).filter(
+        assert isinstance(channel, (SalesChannel, str, list))
+
+        if isinstance(channel, SalesChannel):
+            channel = [channel]
+
+        if isinstance(channel, list):
+            assert all(isinstance(c, SalesChannel) for c in channel)
+
+        sq_active_item = Item.objects.using(settings.DATABASE_REPLICA).filter_available(channel=channel, voucher=voucher).filter(
             Q(variations__isnull=True)
             & Q(quotas__pk=OuterRef('pk'))
-        ).order_by().values_list('quotas__pk').annotate(
-            items=GroupConcat('pk', delimiter=',')
-        ).values('items')
-        sq_active_variation = ItemVariation.objects.filter(
+        )
+
+        q_variation = (
             Q(active=True)
+            & Q(Q(available_from__isnull=True) | Q(available_from__lte=time_machine_now()))
+            & Q(Q(available_until__isnull=True) | Q(available_until__gte=time_machine_now()))
             & Q(item__active=True)
-            & Q(Q(item__available_from__isnull=True) | Q(item__available_from__lte=now()))
-            & Q(Q(item__available_until__isnull=True) | Q(item__available_until__gte=now()))
+            & Q(Q(item__available_from__isnull=True) | Q(item__available_from__lte=time_machine_now()))
+            & Q(Q(item__available_until__isnull=True) | Q(item__available_until__gte=time_machine_now()))
             & Q(Q(item__category__isnull=True) | Q(item__category__is_addon=False))
-            & Q(item__sales_channels__contains=channel)
-            & Q(item__hide_without_voucher=False)
             & Q(item__require_bundling=False)
             & Q(quotas__pk=OuterRef('pk'))
-        ).order_by().values_list('quotas__pk').annotate(
-            items=GroupConcat('pk', delimiter=',')
-        ).values('items')
+        )
+
+        if isinstance(channel, str):
+            q_variation &= Q(Q(all_sales_channels=True) | Q(limit_sales_channels__identifier=channel))
+            q_variation &= Q(Q(item__all_sales_channels=True) | Q(item__limit_sales_channels__identifier=channel))
+        else:
+            q_variation &= Q(Q(all_sales_channels=True) | Q(limit_sales_channels__in=channel))
+            q_variation &= Q(Q(item__all_sales_channels=True) | Q(item__limit_sales_channels__in=channel))
+
+        if voucher:
+            if voucher.variation_id:
+                q_variation &= Q(pk=voucher.variation_id)
+            elif voucher.item_id:
+                q_variation &= Q(item_id=voucher.item_id)
+            elif voucher.quota_id:
+                q_variation &= Q(quotas__in=[voucher.quota_id])
+
+        if not voucher or not voucher.show_hidden_items:
+            q_variation &= Q(hide_without_voucher=False)
+            q_variation &= Q(item__hide_without_voucher=False)
+
+        sq_active_variation = ItemVariation.objects.filter(q_variation)
+        quota_base_qs = Quota.objects.using(settings.DATABASE_REPLICA).filter(
+            ignore_for_event_availability=False
+        )
+
+        if cls is Event:
+            # Special case for the list of events: We only want to compute quotas for events if they are
+            # not an event series.
+            quota_base_qs = quota_base_qs.filter(subevent__isnull=True)
+
         return qs.annotate(
             has_paid_item=Exists(Item.objects.filter(event_id=OuterRef(cls._event_id), default_price__gt=0))
         ).prefetch_related(
             Prefetch(
                 'quotas',
                 to_attr='active_quotas',
-                queryset=Quota.objects.using(settings.DATABASE_REPLICA).annotate(
-                    active_items=Subquery(sq_active_item, output_field=models.TextField()),
-                    active_variations=Subquery(sq_active_variation, output_field=models.TextField()),
+                queryset=quota_base_qs.annotate(
+                    active_items=Subquery(
+                        sq_active_item.order_by().values_list('quotas__pk').annotate(
+                            items=GroupConcat('pk', delimiter=',')
+                        ).values('items'),
+                        output_field=models.TextField()
+                    ),
+                    active_variations=Subquery(
+                        sq_active_variation.order_by().values_list('quotas__pk').annotate(
+                            items=GroupConcat('pk', delimiter=',')
+                        ).values('items'),
+                        output_field=models.TextField()),
+                    has_active_items_with_waitinglist=Exists(
+                        sq_active_item.filter(allow_waitinglist=True),
+                    ),
+                    has_active_variations_with_waitinglist=Exists(
+                        sq_active_variation.filter(item__allow_waitinglist=True),
+                    ),
                 ).exclude(
                     Q(active_items="") & Q(active_variations="")
                 ).select_related('event', 'subevent')
             )
         )
 
-    @cached_property
+    @property
     def best_availability_state(self):
+        return self.best_availability[0]
+
+    @property
+    def best_availability_is_low(self):
+        """
+        Returns ``True`` if the availability of tickets in this event is lower than the percentage
+        given in setting ``low_availability_percentage``.
+        """
+        if not self.settings.low_availability_percentage:
+            return False
+        ba = self.best_availability
+        if ba[1] is None or not ba[2]:
+            return False
+
+        percentage = ba[1] / ba[2] * 100
+        return percentage < self.settings.low_availability_percentage
+
+    @cached_property
+    def best_availability(self):
+        """
+        Returns a 4-tuple of
+
+        - The availability state of this event (one of the ``Quota.AVAILABILITY_*`` constants)
+        - The number of tickets currently available (or ``None``)
+        - The number of tickets "originally" available (or ``None``)
+        - Whether a sold out product has the waiting list enabled
+
+        This can only be called on objects obtained through a queryset that has been passed through ``.annotated()``.
+        """
         from .items import Quota
 
         if not hasattr(self, 'active_quotas'):
             raise TypeError("Call this only if you fetched the subevents via Event/SubEvent.annotated()")
-        items_available = set()
-        vars_available = set()
-        items_reserved = set()
-        vars_reserved = set()
-        items_gone = set()
-        vars_gone = set()
 
+        if hasattr(self, 'disabled_items'):  # SubEventItem
+            items_disabled = set(self.disabled_items.split(","))
+        else:
+            items_disabled = set()
+
+        if hasattr(self, 'disabled_vars'):  # SubEventItemVariation
+            vars_disabled = set(self.disabled_vars.split(","))
+        else:
+            vars_disabled = set()
+
+        # Compute the availability of all quotas and build a item→quotas mapping with all non-disabled items
         r = getattr(self, '_quota_cache', {})
+        quotas_for_item = defaultdict(list)
+        quotas_for_variation = defaultdict(list)
+        waiting_list_found = False
         for q in self.active_quotas:
-            res = r[q] if q in r else q.availability(allow_cache=True)
+            if q not in r:
+                r[q] = q.availability(allow_cache=True)
 
-            if res[0] == Quota.AVAILABILITY_OK:
-                if q.active_items:
-                    items_available.update(q.active_items.split(","))
-                if q.active_variations:
-                    vars_available.update(q.active_variations.split(","))
-            elif res[0] == Quota.AVAILABILITY_RESERVED:
-                if q.active_items:
-                    items_reserved.update(q.active_items.split(","))
-                if q.active_variations:
-                    vars_available.update(q.active_variations.split(","))
-            elif res[0] < Quota.AVAILABILITY_RESERVED:
-                if q.active_items:
-                    items_gone.update(q.active_items.split(","))
-                if q.active_variations:
-                    vars_gone.update(q.active_variations.split(","))
-        if not self.active_quotas:
-            return None
-        if items_available - items_reserved - items_gone or vars_available - vars_reserved - vars_gone:
-            return Quota.AVAILABILITY_OK
-        if items_reserved - items_gone or vars_reserved - vars_gone:
-            return Quota.AVAILABILITY_RESERVED
-        return Quota.AVAILABILITY_GONE
+            if q.active_items:
+                for item_id in q.active_items.split(","):
+                    if item_id not in items_disabled:
+                        quotas_for_item[item_id].append(q)
+            if q.has_active_items_with_waitinglist or q.has_active_variations_with_waitinglist:
+                waiting_list_found = True
+            if q.active_variations:
+                for var_id in q.active_variations.split(","):
+                    if var_id not in vars_disabled:
+                        quotas_for_variation[var_id].append(q)
+
+        if not self.active_quotas or (not quotas_for_item and not quotas_for_variation):
+            # No item is enabled for this event, treat the event as "unknown"
+            return None, None, None, waiting_list_found
+
+        # We iterate over all items and variations and keep track of
+        # - `best_state_found` - the best availability state we have seen so far. If one item is available, the event is available!
+        # - `num_tickets_found` - the number of tickets currently available in total. We sum up all the items and variations, but keep
+        #   track of them per-quota in `quota_used_for_found_tickets` to make sure we don't count the same tickets twice if two or more
+        #   items share the same quota
+        # - `num_tickets_possible` - basically the same thing, just with the total size of quotas instead of their currently availability
+        #   since we need that for the percentage calculation
+        best_state_found = Quota.AVAILABILITY_GONE
+        num_tickets_found = 0
+        num_tickets_possible = 0
+        quota_used_for_found_tickets = Counter()
+        quota_used_for_possible_tickets = Counter()
+        for quota_list in list(quotas_for_item.values()) + list(quotas_for_variation.values()):
+            worst_state_for_ticket = min(r[q][0] for q in quota_list)
+            quotas_that_are_not_unlimited = [q for q in quota_list if q.size is not None]
+            if not quotas_that_are_not_unlimited:
+                # We found an unlimited ticket, no more need to do anything else
+                return Quota.AVAILABILITY_OK, None, None, waiting_list_found
+
+            if worst_state_for_ticket == Quota.AVAILABILITY_OK:
+                availability_of_this = min(max(0, r[q][1] - quota_used_for_found_tickets[q]) for q in quotas_that_are_not_unlimited)
+                num_tickets_found += availability_of_this
+                for q in quota_list:
+                    quota_used_for_found_tickets[q] += availability_of_this
+
+            possible_of_this = min(max(0, q.size - quota_used_for_possible_tickets[q]) for q in quotas_that_are_not_unlimited)
+            num_tickets_possible += possible_of_this
+            for q in quota_list:
+                quota_used_for_possible_tickets[q] += possible_of_this
+
+            best_state_found = max(best_state_found, worst_state_for_ticket)
+
+        return best_state_found, num_tickets_found, num_tickets_possible, waiting_list_found
 
     def free_seats(self, ignore_voucher=None, sales_channel='web', include_blocked=False):
+        assert isinstance(sales_channel, str) or sales_channel is None
         qs_annotated = self._seats(ignore_voucher=ignore_voucher)
 
         qs = qs_annotated.filter(has_order=False, has_cart=False, has_voucher=False)
@@ -335,6 +559,15 @@ class EventMixin:
         if self.settings.seating_minimal_distance > 0:
             q |= Q(has_closeby_taken=True, has_order=False)
         return qs.filter(q)
+
+
+def default_sales_channels():  # kept for legacy migration
+    from ..channels import get_all_sales_channel_types
+
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        warnings.warn('Method should not be used in new code.', DeprecationWarning)
+
+    return list(get_all_sales_channel_types().keys())
 
 
 @settings_hierarkey.add(parent_field='organizer', cache_namespace='event')
@@ -366,13 +599,14 @@ class Event(EventMixin, LoggedModel):
     :type presale_end: datetime
     :param location: venue
     :type location: str
-    :param plugins: A comma-separated list of plugin names that are active for this
-                    event.
+    :param plugins: A comma-separated list of plugin names that are active for this event.
     :type plugins: str
     :param has_subevents: Enable event series functionality
     :type has_subevents: bool
-    :param sales_channels: A list of sales channel identifiers, that this event is available for sale on
-    :type sales_channels: list
+    :param all_sales_channels: A flag indicating that this event is available on all channels and limit_sales_channels will be ignored.
+    :type all_sales_channels: bool
+    :param limit_sales_channels: A list of sales channel identifiers, that this event is available for sale on
+    :type limit_sales_channels: list
     """
 
     settings_namespace = 'event'
@@ -392,11 +626,8 @@ class Event(EventMixin, LoggedModel):
             "remembered, but you can also choose to use a random value. "
             "This will be used in URLs, order codes, invoice numbers, and bank transfer references."),
         validators=[
-            MinLengthValidator(
-                limit_value=2,
-            ),
             RegexValidator(
-                regex="^[a-zA-Z0-9][a-zA-Z0-9.-]*[a-zA-Z0-9]$",
+                regex="^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$",
                 message=_("The slug may only contain letters, numbers, dots and dashes."),
             ),
             EventSlugBanlistValidator()
@@ -432,6 +663,11 @@ class Event(EventMixin, LoggedModel):
         max_length=200,
         verbose_name=_("Location"),
     )
+    is_remote = models.BooleanField(
+        default=False,
+        verbose_name=_("This event is remote or partially remote."),
+        help_text=_("This will be used to let users know if the event is in a different timezone, and to let us calculate the local time of a user."),
+    )
     geo_lat = models.FloatField(
         verbose_name=_("Latitude"),
         null=True, blank=True,
@@ -461,18 +697,28 @@ class Event(EventMixin, LoggedModel):
         default=False
     )
     seating_plan = models.ForeignKey('SeatingPlan', on_delete=models.PROTECT, null=True, blank=True,
-                                     related_name='events')
-    sales_channels = MultiStringField(
-        verbose_name=_('Restrict to specific sales channels'),
-        help_text=_('Only sell tickets for this event on the following sales channels.'),
-        default=['web'],
+                                     related_name='events', verbose_name=_('Seating plan'))
+
+    last_modified = models.DateTimeField(
+        auto_now=True, db_index=True
     )
+
+    all_sales_channels = models.BooleanField(
+        verbose_name=_("Sell on all sales channels"),
+        default=True,
+    )
+    limit_sales_channels = models.ManyToManyField(
+        "SalesChannel",
+        verbose_name=_("Restrict to specific sales channels"),
+        blank=True,
+    )
+
     objects = ScopedManager(organizer='organizer')
 
     class Meta:
         verbose_name = _("Event")
         verbose_name_plural = _("Events")
-        ordering = ("date_from", "name")
+        ordering = ("date_from", "name", "slug")
         unique_together = (('organizer', 'slug'),)
 
     def __str__(self):
@@ -485,23 +731,42 @@ class Event(EventMixin, LoggedModel):
         """
         self.settings.invoice_renderer = 'modern1'
         self.settings.invoice_include_expire_date = True
+        self.settings.invoice_renderer_highlight_order_code = True
         self.settings.ticketoutput_pdf__enabled = True
         self.settings.ticketoutput_passbook__enabled = True
         self.settings.event_list_type = 'calendar'
+        self.settings.invoice_email_attachment = True
+        self.settings.name_scheme = 'given_family'
+        self.settings.payment_banktransfer_invoice_immediately = True
+        self.settings.low_availability_percentage = 10
+        self.settings.mail_send_order_free_attendee = True
+        self.settings.mail_send_order_placed_attendee = True
+        self.settings.mail_send_order_paid_attendee = True
+        self.settings.mail_send_order_approved_attendee = True
+        self.settings.mail_send_order_approved_free_attendee = True
+        self.settings.mail_send_download_reminder_attendee = True
 
     @property
     def social_image(self):
-        from pretix.multidomain.urlreverse import build_absolute_uri
+        from pretix.multidomain.urlreverse import eventreverse_absolute
 
         img = None
         logo_file = self.settings.get('logo_image', as_type=str, default='')[7:]
         og_file = self.settings.get('og_image', as_type=str, default='')[7:]
         if og_file:
-            img = get_thumbnail(og_file, '1200').thumb.url
+            try:
+                img = get_thumbnail(og_file, '1200').thumb.url
+            except:
+                logger.exception(f'Failed to create thumbnail of {og_file}')
+                img = default_storage.url(og_file)
         elif logo_file:
-            img = get_thumbnail(logo_file, '5000x120').thumb.url
+            try:
+                img = get_thumbnail(logo_file, '5000x1200').thumb.url
+            except:
+                logger.exception(f'Failed to create thumbnail of {logo_file}')
+                img = default_storage.url(logo_file)
         if img:
-            return urljoin(build_absolute_uri(self, 'presale:event.index'), img)
+            return urljoin(eventreverse_absolute(self, 'presale:event.index'), img)
 
     def _seats(self, ignore_voucher=None):
         from .seating import Seat
@@ -516,21 +781,26 @@ class Event(EventMixin, LoggedModel):
     @property
     def presale_has_ended(self):
         if self.has_subevents:
-            return self.presale_end and now() > self.presale_end
+            return self.presale_end and time_machine_now() > self.presale_end
         else:
             return super().presale_has_ended
 
     def delete_all_orders(self, really=False):
-        from .orders import OrderFee, OrderPayment, OrderPosition, OrderRefund
+        from .checkin import Checkin
+        from .orders import (
+            OrderFee, OrderPayment, OrderPosition, OrderRefund, Transaction,
+        )
 
         if not really:
             raise TypeError("Pass really=True as a parameter.")
 
+        Transaction.objects.filter(order__event=self).delete()
         OrderPosition.all.filter(order__event=self, addon_to__isnull=False).delete()
         OrderPosition.all.filter(order__event=self).delete()
         OrderFee.objects.filter(order__event=self).delete()
         OrderRefund.objects.filter(order__event=self).delete()
         OrderPayment.objects.filter(order__event=self).delete()
+        Checkin.objects.filter(list__event=self).delete()
         self.orders.all().delete()
 
     def save(self, *args, **kwargs):
@@ -571,28 +841,24 @@ class Event(EventMixin, LoggedModel):
         return ObjectRelatedCache(self)
 
     def lock(self):
-        """
-        Returns a contextmanager that can be used to lock an event for bookings.
-        """
-        from pretix.base.services import locking
+        raise NotImplementedError("this method has been removed")
 
-        return locking.LockManager(self)
-
-    def get_mail_backend(self, timeout=None, force_custom=False):
+    def get_mail_backend(self, timeout=None):
         """
         Returns an email server connection, either by using the system-wide connection
         or by returning a custom one based on the event's settings.
         """
-        from pretix.base.email import CustomSMTPBackend
 
-        if self.settings.smtp_use_custom or force_custom:
-            return CustomSMTPBackend(host=self.settings.smtp_host,
-                                     port=self.settings.smtp_port,
-                                     username=self.settings.smtp_username,
-                                     password=self.settings.smtp_password,
-                                     use_tls=self.settings.smtp_use_tls,
-                                     use_ssl=self.settings.smtp_use_ssl,
-                                     fail_silently=False, timeout=timeout)
+        if self.settings.smtp_use_custom:
+            return get_connection(backend=settings.EMAIL_CUSTOM_SMTP_BACKEND,
+                                  host=self.settings.smtp_host,
+                                  port=self.settings.smtp_port,
+                                  username=self.settings.smtp_username,
+                                  password=self.settings.smtp_password,
+                                  use_tls=self.settings.smtp_use_tls,
+                                  use_ssl=self.settings.smtp_use_ssl,
+                                  fail_silently=False,
+                                  timeout=timeout)
         else:
             return get_connection(fail_silently=False)
 
@@ -601,33 +867,98 @@ class Event(EventMixin, LoggedModel):
         """
         The last datetime of payments for this event.
         """
-        tz = pytz.timezone(self.settings.timezone)
+        tz = ZoneInfo(self.settings.timezone)
         return make_aware(datetime.combine(
             self.settings.get('payment_term_last', as_type=RelativeDateWrapper).datetime(self).date(),
             time(hour=23, minute=59, second=59)
         ), tz)
 
-    def copy_data_from(self, other):
+    def allow_copy_data(self, new_organizer, auth) -> bool:
+        """
+        Returns whether it is allowed to copy the event to the target organizer. Auth can be TeamAPIToken or User.
+        """
+        from ..permissions import get_all_event_permissions
+        from .auth import User
+
+        if self.organizer == new_organizer:
+            # Copying in the same organizer is always okay with any read access, we just need to ensure it does not
+            # grant more permissions than I had before, but that is handled by the view logic
+            return auth.has_event_permission(self.organizer, self, None)
+
+        if isinstance(auth, User):
+            # Cross-organizer copying requires almost full permission of source to prevent settings extraction
+            required_permissions = get_all_event_permissions() - {
+                # We do not require these, as this data is not copied
+                "event.orders:read", "event.orders:write", "event.vouchers:read", "event.vouchers:write",
+                "event.subevents:write",
+            }
+            given_permission = auth.get_event_permission_set(self.organizer, self)
+            return all(p in given_permission for p in required_permissions if ":" in p)
+
+        else:
+            # Tokens or devices can never copy between organizers, as they are organizer-bound. Kept for future
+            # compatibility and easier calling
+            return False
+
+    def copy_data_from(self, other, skip_meta_data=False):
         from ..signals import event_copy_data
         from . import (
-            Item, ItemAddOn, ItemBundle, ItemCategory, ItemMetaValue, Question,
-            Quota,
+            Discount, Item, ItemAddOn, ItemBundle, ItemCategory, ItemMetaValue,
+            ItemProgramTime, ItemVariationMetaValue, Question, Quota,
         )
 
+        is_cross_organizer = other.organizer_id != self.organizer_id
+
+        #  Note: avoid self.set_active_plugins(), it causes trouble e.g. for the badges plugin.
+        #  Plugins can create data in installed() hook based on existing data of the event.
+        #  Calling set_active_plugins() results in defaults being created while actually data
+        #  should come from the copied event. Instead plugins should use event_copy_data to move
+        #  over their data.
         self.plugins = other.plugins
         self.is_public = other.is_public
         if other.date_admission:
             self.date_admission = self.date_from + (other.date_admission - other.date_from)
         self.testmode = other.testmode
+        self.all_sales_channels = other.all_sales_channels
         self.save()
         self.log_action('pretix.object.cloned', data={'source': other.slug, 'source_id': other.pk})
+
+        if hasattr(other, 'alternative_domain_assignment') and not is_cross_organizer:
+            other.alternative_domain_assignment.domain.event_assignments.create(event=self)
+
+        if not self.all_sales_channels:
+            self.limit_sales_channels.set(
+                self.organizer.sales_channels.filter(
+                    identifier__in=other.limit_sales_channels.values_list("identifier", flat=True)
+                )
+            )
+
+        if not skip_meta_data:
+            for emv in EventMetaValue.objects.filter(event=other):
+                emv.pk = None
+                emv.event = self
+                if is_cross_organizer:
+                    try:
+                        emv.property = self.organizer.meta_properties.get(name=emv.property.name)
+                    except EventMetaProperty.DoesNotExist:
+                        meta_prop = emv.property
+                        meta_prop.pk = None
+                        meta_prop.organizer = self.organizer
+                        meta_prop.save(force_insert=True)
+                        emv.property = meta_prop
+                emv.save(force_insert=True)
+
+        for fl in EventFooterLink.objects.filter(event=other):
+            fl.pk = None
+            fl.event = self
+            fl.save(force_insert=True)
 
         tax_map = {}
         for t in other.tax_rules.all():
             tax_map[t.pk] = t
             t.pk = None
             t.event = self
-            t.save()
+            t.save(force_insert=True)
             t.log_action('pretix.object.cloned')
 
         category_map = {}
@@ -635,7 +966,7 @@ class Event(EventMixin, LoggedModel):
             category_map[c.pk] = c
             c.pk = None
             c.event = self
-            c.save()
+            c.save(force_insert=True)
             c.log_action('pretix.object.cloned')
 
         item_meta_properties_map = {}
@@ -643,41 +974,81 @@ class Event(EventMixin, LoggedModel):
             item_meta_properties_map[imp.pk] = imp
             imp.pk = None
             imp.event = self
-            imp.save()
+            imp.save(force_insert=True)
             imp.log_action('pretix.object.cloned')
 
         item_map = {}
         variation_map = {}
-        for i in Item.objects.filter(event=other).prefetch_related('variations'):
+        for i in Item.objects.filter(event=other).prefetch_related(
+            'variations', 'limit_sales_channels', 'require_membership_types',
+            'variations__limit_sales_channels', 'variations__require_membership_types',
+            'matched_by_cross_selling_categories',
+        ):
             vars = list(i.variations.all())
+            require_membership_types = list(i.require_membership_types.all())
+            limit_sales_channels = list(i.limit_sales_channels.all())
+            matched_by_cross_selling_categories = list(i.matched_by_cross_selling_categories.all())
             item_map[i.pk] = i
             i.pk = None
             i.event = self
+            i._prefetched_objects_cache = {}
             if i.picture:
-                i.picture.save(i.picture.name, i.picture)
+                i.picture.save(os.path.basename(i.picture.name), i.picture)
             if i.category_id:
                 i.category = category_map[i.category_id]
             if i.tax_rule_id:
                 i.tax_rule = tax_map[i.tax_rule_id]
-            i.save()
+
+            if i.grant_membership_type and is_cross_organizer:
+                i.grant_membership_type = None
+
+            i.save()  # no force_insert since i.picture.save could have already inserted
             i.log_action('pretix.object.cloned')
+
+            if require_membership_types and not is_cross_organizer:
+                i.require_membership_types.set(require_membership_types)
+
+            if not i.all_sales_channels:
+                i.limit_sales_channels.set(self.organizer.sales_channels.filter(identifier__in=[s.identifier for s in limit_sales_channels]))
+
             for v in vars:
+                require_membership_types = list(v.require_membership_types.all())
+                limit_sales_channels = list(v.limit_sales_channels.all())
                 variation_map[v.pk] = v
                 v.pk = None
                 v.item = i
-                v.save()
+                v._prefetched_objects_cache = {}
+                v.save(force_insert=True)
 
-        for imv in ItemMetaValue.objects.filter(item__event=other).prefetch_related('item', 'property'):
+                if require_membership_types and not is_cross_organizer:
+                    v.require_membership_types.set(require_membership_types)
+                if not v.all_sales_channels:
+                    v.limit_sales_channels.set(self.organizer.sales_channels.filter(identifier__in=[s.identifier for s in limit_sales_channels]))
+
+            if matched_by_cross_selling_categories:
+                i.matched_by_cross_selling_categories.set([category_map[c.pk] for c in matched_by_cross_selling_categories])
+
+        for i in self.items.filter(hidden_if_item_available__isnull=False):
+            i.hidden_if_item_available = item_map[i.hidden_if_item_available_id]
+            i.save()
+
+        for imv in ItemMetaValue.objects.filter(item__event=other):
             imv.pk = None
-            imv.property = item_meta_properties_map[imv.property.pk]
+            imv.property = item_meta_properties_map[imv.property_id]
             imv.item = item_map[imv.item.pk]
-            imv.save()
+            imv.save(force_insert=True)
+
+        for imv in ItemVariationMetaValue.objects.filter(variation__item__event=other):
+            imv.pk = None
+            imv.property = item_meta_properties_map[imv.property_id]
+            imv.variation = variation_map[imv.variation_id]
+            imv.save(force_insert=True)
 
         for ia in ItemAddOn.objects.filter(base_item__event=other).prefetch_related('base_item', 'addon_category'):
             ia.pk = None
             ia.base_item = item_map[ia.base_item.pk]
             ia.addon_category = category_map[ia.addon_category.pk]
-            ia.save()
+            ia.save(force_insert=True)
 
         for ia in ItemBundle.objects.filter(base_item__event=other).prefetch_related('base_item', 'bundled_item', 'bundled_variation'):
             ia.pk = None
@@ -685,16 +1056,25 @@ class Event(EventMixin, LoggedModel):
             ia.bundled_item = item_map[ia.bundled_item.pk]
             if ia.bundled_variation:
                 ia.bundled_variation = variation_map[ia.bundled_variation.pk]
-            ia.save()
+            ia.save(force_insert=True)
 
+        if not self.has_subevents and not other.has_subevents:
+            for ipt in ItemProgramTime.objects.filter(item__event=other).prefetch_related('item'):
+                ipt.pk = None
+                ipt.item = item_map[ipt.item.pk]
+                ipt.save(force_insert=True)
+
+        quota_map = {}
         for q in Quota.objects.filter(event=other, subevent__isnull=True).prefetch_related('items', 'variations'):
+            quota_map[q.pk] = q
             items = list(q.items.all())
             vars = list(q.variations.all())
             oldid = q.pk
             q.pk = None
+            q._prefetched_objects_cache = {}
             q.event = self
             q.closed = False
-            q.save()
+            q.save(force_insert=True)
             q.log_action('pretix.object.cloned')
             for i in items:
                 if i.pk in item_map:
@@ -703,14 +1083,36 @@ class Event(EventMixin, LoggedModel):
                 q.variations.add(variation_map[v.pk])
             self.items.filter(hidden_if_available_id=oldid).update(hidden_if_available=q)
 
+        for d in Discount.objects.filter(event=other).prefetch_related(
+            'condition_limit_products', 'benefit_limit_products', 'limit_sales_channels'
+        ):
+            c_items = list(d.condition_limit_products.all())
+            b_items = list(d.benefit_limit_products.all())
+            limit_sales_channels = list(d.limit_sales_channels.all())
+            d.pk = None
+            d.event = self
+            d._prefetched_objects_cache = {}
+            d.save(force_insert=True)
+            d.log_action('pretix.object.cloned')
+            for i in c_items:
+                if i.pk in item_map:
+                    d.condition_limit_products.add(item_map[i.pk])
+            for i in b_items:
+                if i.pk in item_map:
+                    d.benefit_limit_products.add(item_map[i.pk])
+
+            if not d.all_sales_channels:
+                d.limit_sales_channels.set(self.organizer.sales_channels.filter(identifier__in=[s.identifier for s in limit_sales_channels]))
+
         question_map = {}
         for q in Question.objects.filter(event=other).prefetch_related('items', 'options'):
             items = list(q.items.all())
             opts = list(q.options.all())
             question_map[q.pk] = q
             q.pk = None
+            q._prefetched_objects_cache = {}
             q.event = self
-            q.save()
+            q.save(force_insert=True)
             q.log_action('pretix.object.cloned')
 
             for i in items:
@@ -718,7 +1120,7 @@ class Event(EventMixin, LoggedModel):
             for o in opts:
                 o.pk = None
                 o.question = q
-                o.save()
+                o.save(force_insert=True)
 
         for q in self.questions.filter(dependency_question__isnull=False):
             q.dependency_question = question_map[q.dependency_question_id]
@@ -728,10 +1130,10 @@ class Event(EventMixin, LoggedModel):
             if isinstance(rules, dict):
                 for k, v in rules.items():
                     if k == 'lookup':
-                        if v[0] == 'product':
-                            v[1] = str(item_map.get(int(v[1]), 0).pk) if int(v[1]) in item_map else "0"
-                        elif v[0] == 'variation':
-                            v[1] = str(variation_map.get(int(v[1]), 0).pk) if int(v[1]) in variation_map else "0"
+                        if rules[k][0] == 'product':
+                            rules[k][1] = str(item_map.get(int(v[1]), 0).pk) if int(v[1]) in item_map else "0"
+                        elif rules[k][0] == 'variation':
+                            rules[k][1] = str(variation_map.get(int(v[1]), 0).pk) if int(v[1]) in variation_map else "0"
                     else:
                         _walk_rules(v)
             elif isinstance(rules, list):
@@ -739,15 +1141,18 @@ class Event(EventMixin, LoggedModel):
                     _walk_rules(i)
 
         checkin_list_map = {}
-        for cl in other.checkin_lists.filter(subevent__isnull=True).prefetch_related('limit_products'):
+        for cl in other.checkin_lists.filter(subevent__isnull=True).prefetch_related(
+            'limit_products'
+        ):
             items = list(cl.limit_products.all())
             checkin_list_map[cl.pk] = cl
             cl.pk = None
+            cl._prefetched_objects_cache = {}
             cl.event = self
             rules = cl.rules
             _walk_rules(rules)
             cl.rules = rules
-            cl.save()
+            cl.save(force_insert=True)
             cl.log_action('pretix.object.cloned')
             for i in items:
                 cl.limit_products.add(item_map[i.pk])
@@ -756,57 +1161,72 @@ class Event(EventMixin, LoggedModel):
             if other.seating_plan.organizer_id == self.organizer_id:
                 self.seating_plan = other.seating_plan
             else:
-                self.organizer.seating_plans.create(name=other.seating_plan.name, layout=other.seating_plan.layout)
+                sp = other.seating_plan
+                sp.pk = None
+                sp.organizer = self.organizer
+                sp.save(force_insert=True)
+                self.seating_plan = sp
             self.save()
 
         for m in other.seat_category_mappings.filter(subevent__isnull=True):
             m.pk = None
             m.event = self
             m.product = item_map[m.product_id]
-            m.save()
+            m.save(force_insert=True)
 
         for s in other.seats.filter(subevent__isnull=True):
             s.pk = None
             s.event = self
             if s.product_id:
                 s.product = item_map[s.product_id]
-            s.save()
+            s.save(force_insert=True)
 
-        skip_settings = (
+        valid_sales_channel_identifers = set(self.organizer.sales_channels.values_list("identifier", flat=True))
+        skip_settings = {
             'ticket_secrets_pretix_sig1_pubkey',
             'ticket_secrets_pretix_sig1_privkey',
-        )
+            # no longer used, but we still don't need to copy them
+            'presale_css_file',
+            'presale_css_checksum',
+            'presale_widget_css_file',
+            'presale_widget_css_checksum',
+        } | {
+            # Some settings might already exist due to e.g. the timezone being special in the API
+            s.key for s in self.settings._objects.all()
+        }
+        settings_to_save = []
         for s in other.settings._objects.all():
             if s.key in skip_settings:
                 continue
 
             s.object = self
             s.pk = None
-            if s.value.startswith('file://'):
-                fi = default_storage.open(s.value[7:], 'rb')
+            if s.value.startswith('file://') and settings_hierarkey.get_declared_type(s.key) == File:
+                fi = default_storage.open(s.value[len('file://'):], 'rb')
                 nonce = get_random_string(length=8)
+                fname_base = clean_filename(os.path.basename(s.value))
+
                 # TODO: make sure pub is always correct
                 fname = 'pub/%s/%s/%s.%s.%s' % (
-                    self.organizer.slug, self.slug, s.key, nonce, s.value.split('.')[-1]
+                    self.organizer.slug, self.slug, fname_base, nonce, s.value.split('.')[-1]
                 )
                 newname = default_storage.save(fname, fi)
                 s.value = 'file://' + newname
-                s.save()
-            elif s.key == 'tax_rate_default':
-                try:
-                    if int(s.value) in tax_map:
-                        s.value = tax_map.get(int(s.value)).pk
-                        s.save()
-                except ValueError:
-                    pass
+                settings_to_save.append(s)
+            elif s.key.startswith('payment_') and s.key.endswith('__restrict_to_sales_channels'):
+                data = other.settings._unserialize(s.value, as_type=list)
+                data = [ident for ident in data if ident in valid_sales_channel_identifers]
+                s.value = other.settings._serialize(data)
+                settings_to_save.append(s)
             else:
-                s.save()
+                settings_to_save.append(s)
+        other.settings._objects.bulk_create(settings_to_save)
 
         self.settings.flush()
         event_copy_data.send(
             sender=self, other=other,
             tax_map=tax_map, category_map=category_map, item_map=item_map, variation_map=variation_map,
-            question_map=question_map, checkin_list_map=checkin_list_map
+            question_map=question_map, checkin_list_map=checkin_list_map, quota_map=quota_map,
         )
 
     def get_payment_providers(self, cached=False) -> dict:
@@ -826,7 +1246,7 @@ class Event(EventMixin, LoggedModel):
                     providers[pp.identifier] = pp
 
             self._cached_payment_providers = OrderedDict(sorted(
-                providers.items(), key=lambda v: (-v[1].priority, str(v[1].verbose_name))
+                providers.items(), key=lambda v: (-v[1].priority, str(v[1].verbose_name).title())
             ))
         return self._cached_payment_providers
 
@@ -870,6 +1290,10 @@ class Event(EventMixin, LoggedModel):
                 pp = p(self)
                 renderers[pp.identifier] = pp
         return renderers
+
+    @cached_property
+    def cached_default_tax_rule(self):
+        return self.tax_rules.filter(default=True).first()
 
     @cached_property
     def ticket_secret_generators(self) -> dict:
@@ -920,8 +1344,8 @@ class Event(EventMixin, LoggedModel):
         irs = self.get_invoice_renderers()
         return irs[self.settings.invoice_renderer]
 
-    def subevents_annotated(self, channel):
-        return SubEvent.annotated(self.subevents, channel)
+    def subevents_annotated(self, channel, voucher=None):
+        return SubEvent.annotated(self.subevents, channel, voucher)
 
     def subevents_sorted(self, queryset):
         ordering = self.settings.get('frontpage_subevent_ordering', default='date_ascending', as_type=str)
@@ -938,10 +1362,15 @@ class Event(EventMixin, LoggedModel):
             )
         ).filter(
             Q(active=True) & Q(is_public=True) & (
-                Q(Q(date_to__isnull=True) & Q(date_from__gte=now() - timedelta(hours=24)))
-                | Q(date_to__gte=now() - timedelta(hours=24))
+                Q(Q(date_to__isnull=True) & Q(date_from__gte=time_machine_now() - timedelta(hours=24)))
+                | Q(date_to__gte=time_machine_now() - timedelta(hours=24))
             )
         )  # order_by doesn't make sense with I18nField
+        if ordering in ("date_ascending", "date_descending"):
+            # if primary order is by date, then order in database
+            # this allows to limit/slice results
+            return subevs.order_by(*orderfields)
+
         for f in reversed(orderfields):
             if f.startswith('-'):
                 subevs = sorted(subevs, key=attrgetter(f[1:]), reverse=True)
@@ -983,20 +1412,20 @@ class Event(EventMixin, LoggedModel):
         if self.has_paid_things and not self.has_payment_provider:
             issues.append(_('You have configured at least one paid product but have not enabled any payment methods.'))
 
+        if self.has_paid_things and self.currency == "XXX":
+            issues.append(_('You have configured at least one paid product but have not configured a currency.'))
+
         if not self.quotas.exists():
             issues.append(_('You need to configure at least one quota to sell anything.'))
 
         for mp in self.organizer.meta_properties.all():
             if mp.required and not self.meta_data.get(mp.name):
-                issues.append(
-                    ('<a {a_attr}>' + gettext('You need to fill the meta parameter "{property}".') + '</a>').format(
-                        property=mp.name,
-                        a_attr='href="%s#id_prop-%d-value"' % (
-                            reverse('control:event.settings', kwargs={'organizer': self.organizer.slug, 'event': self.slug}),
-                            mp.pk
-                        )
-                    )
-                )
+                issues.append(format_html(
+                    '<a href="{href}{href_hash}">{text}</a>',
+                    text=gettext('You need to fill the meta parameter "{property}".').format(property=mp.name),
+                    href=reverse('control:event.settings', kwargs={'organizer': self.organizer.slug, 'event': self.slug}),
+                    href_hash=f'#id_prop-{mp.pk}-value',
+                ))
 
         responses = event_live_issues.send(self)
         for receiver, response in sorted(responses, key=lambda r: str(r[0])):
@@ -1022,14 +1451,13 @@ class Event(EventMixin, LoggedModel):
         from .auth import User
 
         if permission:
-            kwargs = {permission: True}
+            qs = Team.objects.with_event_permission(permission)
         else:
-            kwargs = {}
+            qs = Team.objects.all()
 
-        team_with_perm = Team.objects.filter(
+        team_with_perm = qs.filter(
             members__pk=OuterRef('pk'),
             organizer=self.organizer,
-            **kwargs
         ).filter(
             Q(all_events=True) | Q(limit_events__pk=self.pk)
         )
@@ -1045,50 +1473,60 @@ class Event(EventMixin, LoggedModel):
         return not self.orders.exists() and not self.invoices.exists()
 
     def delete_sub_objects(self):
+        from .checkin import Checkin
+
+        Checkin.all.filter(successful=False, list__event=self).delete()
         self.cartposition_set.filter(addon_to__isnull=False).delete()
         self.cartposition_set.all().delete()
         self.vouchers.all().delete()
         self.items.all().delete()
         self.subevents.all().delete()
 
-    def set_active_plugins(self, modules, allow_restricted=False):
+    def get_available_plugins(self):
         from pretix.base.plugins import get_all_plugins
 
-        plugins_active = self.get_plugins()
-        plugins_available = {
-            p.module: p for p in get_all_plugins(self)
+        return {
+            p.module: p for p in get_all_plugins(event=self)
             if not p.name.startswith('.') and getattr(p, 'visible', True)
         }
+
+    def set_active_plugins(self, modules, allow_restricted=frozenset()):
+        plugins_active = self.get_plugins()
+        plugins_available = self.get_available_plugins()
 
         enable = [m for m in modules if m not in plugins_active and m in plugins_available]
 
         for module in enable:
-            if getattr(plugins_available[module].app, 'restricted', False) and not allow_restricted:
+            if getattr(plugins_available[module].app, 'restricted', False) and module not in allow_restricted:
                 modules.remove(module)
             elif hasattr(plugins_available[module].app, 'installed'):
                 getattr(plugins_available[module].app, 'installed')(self)
 
         self.plugins = ",".join(modules)
 
-    def enable_plugin(self, module, allow_restricted=False):
+    def enable_plugin(self, module, allow_restricted=frozenset()):
+        """
+        Adds a plugin to the list of plugins, calling its ``installed`` hook (if available).
+        It is the caller's responsibility to save the event object.
+        """
         plugins_active = self.get_plugins()
-        from pretix.presale.style import regenerate_css
-
         if module not in plugins_active:
             plugins_active.append(module)
             self.set_active_plugins(plugins_active, allow_restricted=allow_restricted)
 
-        regenerate_css.apply_async(args=(self.pk,))
-
     def disable_plugin(self, module):
+        """
+        Adds a plugin to the list of plugins, calling its ``uninstalled`` hook (if available).
+        It is the caller's responsibility to save the event object.
+        """
         plugins_active = self.get_plugins()
-        from pretix.presale.style import regenerate_css
-
         if module in plugins_active:
             plugins_active.remove(module)
             self.set_active_plugins(plugins_active)
 
-        regenerate_css.apply_async(args=(self.pk,))
+            plugins_available = self.get_available_plugins()
+            if module in plugins_available and hasattr(plugins_available[module].app, 'uninstalled'):
+                getattr(plugins_available[module].app, 'uninstalled')(self)
 
     @staticmethod
     def clean_has_subevents(event, has_subevents):
@@ -1194,16 +1632,19 @@ class SubEvent(EventMixin, LoggedModel):
     )
     frontpage_text = I18nTextField(
         null=True, blank=True,
-        verbose_name=_("Frontpage text")
+        verbose_name=_("Frontpage text"),
     )
     seating_plan = models.ForeignKey('SeatingPlan', on_delete=models.PROTECT, null=True, blank=True,
-                                     related_name='subevents')
+                                     related_name='subevents', verbose_name=_('Seating plan'))
+
+    comment = models.TextField(
+        verbose_name=_("Internal comment"),
+        null=True, blank=True
+    )
+
     last_modified = models.DateTimeField(
         auto_now=True, db_index=True
     )
-
-    items = models.ManyToManyField('Item', through='SubEventItem')
-    variations = models.ManyToManyField('ItemVariation', through='SubEventItemVariation')
 
     objects = ScopedManager(organizer='event__organizer')
 
@@ -1227,26 +1668,63 @@ class SubEvent(EventMixin, LoggedModel):
                                       distance_only_within_row=self.settings.seating_distance_within_row)
         return qs_annotated
 
+    @classmethod
+    def annotated(cls, qs, channel: "str | SalesChannel | list[SalesChannel]", voucher=None):
+        from .items import SubEventItem, SubEventItemVariation
+        from .organizer import SalesChannel
+
+        assert isinstance(channel, (SalesChannel, str, list))
+
+        if isinstance(channel, SalesChannel):
+            channel = [channel]
+
+        if isinstance(channel, list):
+            assert all(isinstance(c, SalesChannel) for c in channel)
+
+        qs = super().annotated(qs, channel, voucher=voucher)
+        qs = qs.annotate(
+            disabled_items=Coalesce(
+                Subquery(
+                    SubEventItem.objects.filter(
+                        Q(disabled=True) | Q(available_from__gt=time_machine_now()) | Q(available_until__lt=time_machine_now()),
+                        subevent=OuterRef('pk'),
+                    ).order_by().values('subevent').annotate(items=GroupConcat('item_id', delimiter=',')).values('items'),
+                    output_field=models.TextField(),
+                ),
+                Value(''),
+                output_field=models.TextField()
+            ),
+            disabled_vars=Coalesce(
+                Subquery(
+                    SubEventItemVariation.objects.filter(
+                        Q(disabled=True) | Q(available_from__gt=time_machine_now()) | Q(available_until__lt=time_machine_now()),
+                        subevent=OuterRef('pk'),
+                    ).order_by().values('subevent').annotate(items=GroupConcat('variation_id', delimiter=',')).values('items'),
+                    output_field=models.TextField(),
+                ),
+                Value(''),
+                output_field=models.TextField()
+            )
+        )
+
+        return qs
+
     @cached_property
     def settings(self):
         return self.event.settings
 
     @cached_property
     def item_overrides(self):
-        from .items import SubEventItem
-
         return {
             si.item_id: si
-            for si in SubEventItem.objects.filter(subevent=self)
+            for si in self.subeventitem_set.all()
         }
 
     @cached_property
     def var_overrides(self):
-        from .items import SubEventItemVariation
-
         return {
             si.variation_id: si
-            for si in SubEventItemVariation.objects.filter(subevent=self)
+            for si in self.subeventitemvariation_set.all()
         }
 
     @property
@@ -1266,7 +1744,10 @@ class SubEvent(EventMixin, LoggedModel):
     @property
     def meta_data(self):
         data = self.event.meta_data
-        data.update({v.property.name: v.value for v in self.meta_values.select_related('property').all()})
+        if hasattr(self, 'meta_values_cached'):
+            data.update({v.property.name: v.value for v in self.meta_values_cached})
+        else:
+            data.update({v.property.name: v.value for v in self.meta_values.select_related('property').all()})
         return data
 
     @property
@@ -1274,7 +1755,7 @@ class SubEvent(EventMixin, LoggedModel):
         return self.event.currency
 
     def allow_delete(self):
-        return not self.orderposition_set.exists()
+        return not self.orderposition_set.exists() and not self.transaction_set.exists()
 
     def delete(self, *args, **kwargs):
         clear_cache = kwargs.pop('clear_cache', False)
@@ -1289,12 +1770,14 @@ class SubEvent(EventMixin, LoggedModel):
     def save(self, *args, **kwargs):
         from .orders import Order
 
+        is_new = not bool(self.pk)
+
         clear_cache = kwargs.pop('clear_cache', False)
         super().save(*args, **kwargs)
         if self.event and clear_cache:
             self.event.cache.clear()
 
-        if (self.date_from, self.date_to) != self.__original_dates:
+        if not is_new and (self.date_from, self.date_to) != self.__original_dates:
             """
             This is required to guarantee a synchronization invariant of our scanning apps.
             Our syncing apps throw away order records of subevents more than X days ago, since
@@ -1326,60 +1809,6 @@ class EventLock(models.Model):
     event = models.CharField(max_length=36, primary_key=True)
     date = models.DateTimeField(auto_now=True)
     token = models.UUIDField(default=uuid.uuid4)
-
-
-class RequiredAction(models.Model):
-    """
-    Represents an action that is to be done by an admin. The admin will be
-    displayed a list of actions to do.
-
-    :param datatime: The timestamp of the required action
-    :type datetime: datetime
-    :param user: The user that performed the action
-    :type user: User
-    :param done: If this action has been completed or dismissed
-    :type done: bool
-    :param action_type: The type of action that has to be performed. This is
-       used to look up the renderer used to describe the action in a human-
-       readable way. This should be some namespaced value using dotted
-       notation to avoid duplicates, e.g.
-       ``"pretix.plugins.banktransfer.incoming_transfer"``.
-    :type action_type: str
-    :param data: Arbitrary data that can be used by the log action renderer
-    :type data: str
-    """
-    datetime = models.DateTimeField(auto_now_add=True, db_index=True)
-    done = models.BooleanField(default=False)
-    user = models.ForeignKey('User', null=True, blank=True, on_delete=models.PROTECT)
-    event = models.ForeignKey('Event', null=True, blank=True, on_delete=models.CASCADE)
-    action_type = models.CharField(max_length=255)
-    data = models.TextField(default='{}')
-
-    class Meta:
-        ordering = ('datetime',)
-
-    def display(self, request):
-        from ..signals import requiredaction_display
-
-        for receiver, response in requiredaction_display.send(self.event, action=self, request=request):
-            if response:
-                return response
-        return self.action_type
-
-    def save(self, *args, **kwargs):
-        created = not self.pk
-        super().save(*args, **kwargs)
-        if created:
-            from ..services.notifications import notify
-            from .log import LogEntry
-
-            logentry = LogEntry.objects.create(
-                content_object=self,
-                action_type='pretix.event.action_required',
-                event=self.event,
-                visible=False
-            )
-            notify.apply_async(args=(logentry.pk,))
 
 
 class EventMetaProperty(LoggedModel):
@@ -1416,18 +1845,41 @@ class EventMetaProperty(LoggedModel):
         help_text=_("If checked, an event can only be taken live if the property is set. In event series, its always "
                     "optional to set a value for individual dates")
     )
-    allowed_values = models.TextField(
+    choices = models.JSONField(
         null=True, blank=True,
+        encoder=CustomJSONEncoder,
         verbose_name=_("Valid values"),
-        help_text=_("If you keep this empty, any value is allowed. Otherwise, enter one possible value per line.")
+    )
+    filter_public = models.BooleanField(
+        default=False, verbose_name=_("Show filter option to customers"),
+        help_text=_("This field will be shown to filter events in the public event list and calendar.")
+    )
+    public_label = I18nCharField(
+        verbose_name=_("Public name"),
+        null=True, blank=True,
+    )
+    filter_allowed = models.BooleanField(
+        default=True, verbose_name=_("Can be used for filtering"),
+        help_text=_("This field will be shown to filter events or reports in the backend, and it can also be used "
+                    "for hidden filter parameters in the frontend (e.g. using the widget).")
+    )
+    position = models.IntegerField(
+        default=0
     )
 
     def full_clean(self, exclude=None, validate_unique=True):
         super().full_clean(exclude, validate_unique)
         if self.default and self.required:
             raise ValidationError(_("A property can either be required or have a default value, not both."))
-        if self.default and self.allowed_values and self.default not in self.allowed_values.splitlines():
-            raise ValidationError(_("You cannot set a default value that is not a valid value."))
+
+    class Meta:
+        ordering = ("position", "name",)
+        unique_together = ('organizer', 'name')
+
+    @property
+    def choice_keys(self):
+        if self.choices:
+            return [v["key"] for v in self.choices]
 
 
 class EventMetaValue(LoggedModel):
@@ -1456,6 +1908,8 @@ class EventMetaValue(LoggedModel):
             self.event.cache.clear()
 
     def save(self, *args, **kwargs):
+        if self.event and self.event.organizer != self.property.organizer:
+            raise ValidationError(_("Property and event must belong to the same organizer."))
         super().save(*args, **kwargs)
         if self.event:
             self.event.cache.clear()
@@ -1490,3 +1944,25 @@ class SubEventMetaValue(LoggedModel):
         super().save(*args, **kwargs)
         if self.subevent:
             self.subevent.event.cache.clear()
+
+
+class EventFooterLink(models.Model):
+    """
+    A footer link assigned to an event.
+    """
+    event = models.ForeignKey('Event', on_delete=models.CASCADE, related_name='footer_links')
+    label = I18nCharField(
+        max_length=200,
+        verbose_name=_("Link text"),
+    )
+    url = models.URLField(
+        verbose_name=_("Link URL"),
+    )
+
+    def delete(self, *args, **kwargs):
+        super().delete(*args, **kwargs)
+        self.event.cache.clear()
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        self.event.cache.clear()

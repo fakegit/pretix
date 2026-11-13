@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -47,6 +47,7 @@ class EventCancelTests(TestCase):
                 code='FOO', event=self.event, email='dummy@dummy.test',
                 status=Order.STATUS_PENDING, locale='en',
                 datetime=now(), expires=now() + timedelta(days=10),
+                sales_channel=self.event.organizer.sales_channels.get(identifier="web"),
                 total=Decimal('46.00'),
             )
             self.ticket = Item.objects.create(event=self.event, name='Early-bird ticket',
@@ -62,6 +63,15 @@ class EventCancelTests(TestCase):
             generate_invoice(self.order)
             djmail.outbox = []
 
+    def _cancel_with_dryrun(self, *args, expected_refunds, **kwargs):
+        dry_run = cancel_event(
+            *args, **kwargs, dry_run=True
+        )
+        assert dry_run["refund_total"] == expected_refunds
+        cancel_event(
+            *args, **kwargs,
+        )
+
     @classscope(attr='o')
     def test_cancel_send_mail(self):
         gc = self.o.issued_gift_cards.create(currency="EUR")
@@ -73,11 +83,11 @@ class EventCancelTests(TestCase):
         )
         self.order.status = Order.STATUS_PAID
         self.order.save()
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-( {refund_amount}",
-            user=None
+            user=None, expected_refunds=Decimal("46.00")
         )
         assert len(djmail.outbox) == 1
         self.order.refresh_from_db()
@@ -99,6 +109,42 @@ class EventCancelTests(TestCase):
         assert self.order.status == Order.STATUS_CANCELED
 
     @classscope(attr='o')
+    def test_cancel_auto_refund_skip_blocked(self):
+        gc = self.o.issued_gift_cards.create(currency="EUR")
+        p1 = self.order.payments.create(
+            amount=Decimal('46.00'),
+            state=OrderPayment.PAYMENT_STATE_CONFIRMED,
+            provider='giftcard',
+            info='{"gift_card": %d}' % gc.pk
+        )
+        self.order.status = Order.STATUS_PAID
+        self.order.save()
+
+        self.op1.blocked = ["admin"]
+        self.op1.save()
+
+        self._cancel_with_dryrun(
+            self.event.pk, subevent=None,
+            auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
+            send=True, send_subject="Event canceled", send_message="Event canceled :-(",
+            user=None, expected_refunds=Decimal("23.00")
+        )
+
+        self.op1.refresh_from_db()
+        assert not self.op1.canceled
+        self.op2.refresh_from_db()
+        assert self.op2.canceled
+
+        r = self.order.refunds.get()
+        assert r.state == OrderRefund.REFUND_STATE_DONE
+        assert r.amount == Decimal('23.00')
+        assert r.source == OrderRefund.REFUND_SOURCE_ADMIN
+        assert r.payment == p1
+        assert self.order.all_logentries().filter(action_type='pretix.event.order.refund.created').exists()
+        assert not self.order.all_logentries().filter(action_type='pretix.event.order.refund.requested').exists()
+        assert gc.value == Decimal('23.00')
+
+    @classscope(attr='o')
     def test_cancel_auto_refund(self):
         gc = self.o.issued_gift_cards.create(currency="EUR")
         p1 = self.order.payments.create(
@@ -110,11 +156,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("46.00")
         )
 
         r = self.order.refunds.get()
@@ -138,11 +184,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=False, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("46.00")
         )
 
         self.order.refresh_from_db()
@@ -161,11 +207,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="2.00",
             send=False, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("42.00")
         )
 
         r = self.order.refunds.get()
@@ -189,11 +235,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="2.00",
             send=False, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("44.00")
         )
 
         r = self.order.refunds.get()
@@ -215,11 +261,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="2.00",
             send=False, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("44.00")
         )
 
         r = self.order.refunds.get()
@@ -239,11 +285,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=True, keep_fee_fixed="10.00", keep_fee_percentage="10.00", keep_fee_per_ticket="",
             send=False, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("31.40")
         )
 
         r = self.order.refunds.get()
@@ -267,11 +313,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PENDING
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=True, keep_fee_fixed="10.00", keep_fee_percentage="10.00", keep_fee_per_ticket="",
             send=False, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("12.00")
         )
 
         assert not self.order.refunds.exists()
@@ -298,10 +344,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="10.00", keep_fees=[OrderFee.FEE_TYPE_PAYMENT], keep_fee_per_ticket="",
-            send=False, send_subject="Event canceled", send_message="Event canceled :-(", user=None
+            send=False, send_subject="Event canceled", send_message="Event canceled :-(", user=None,
+            expected_refunds=Decimal("36.90")
         )
         r = self.order.refunds.get()
         assert r.state == OrderRefund.REFUND_STATE_DONE
@@ -334,11 +381,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="10.00", keep_fees=[OrderFee.FEE_TYPE_PAYMENT], keep_fee_per_ticket="",
             send=False, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("39.40")
         )
         r = self.order.refunds.get()
         assert r.amount == Decimal('39.40')
@@ -363,11 +410,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None, manual_refund=True,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=False, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("46.00")
         )
 
         assert self.order.refunds.count() == 2
@@ -399,11 +446,11 @@ class EventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None, manual_refund=False,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=False, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("46.00")
         )
 
         assert self.order.refunds.count() == 1
@@ -412,6 +459,37 @@ class EventCancelTests(TestCase):
         assert r.amount == Decimal('20.00')
         assert r.source == OrderRefund.REFUND_SOURCE_ADMIN
         assert r.payment == p1
+
+    @classscope(attr='o')
+    def test_cancel_refund_paid_only_manual(self):
+        gc = self.o.issued_gift_cards.create(currency="EUR")
+        self.order.payments.create(
+            amount=Decimal('20.00'),
+            state=OrderPayment.PAYMENT_STATE_CONFIRMED,
+            provider='giftcard',
+            info='{"gift_card": %d}' % gc.pk
+        )
+        self.order.payments.create(
+            amount=Decimal('26.00'),
+            state=OrderPayment.PAYMENT_STATE_CONFIRMED,
+            provider='manual',
+        )
+        self.order.status = Order.STATUS_PAID
+        self.order.save()
+
+        self._cancel_with_dryrun(
+            self.event.pk, subevent=None, manual_refund=True,
+            auto_refund=False, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
+            send=False, send_subject="Event canceled", send_message="Event canceled :-(",
+            user=None, expected_refunds=Decimal("46.00")
+        )
+
+        assert self.order.refunds.count() == 1
+        r = self.order.refunds.get(provider='manual')
+        assert r.state == OrderRefund.REFUND_STATE_CREATED
+        assert r.amount == Decimal('46.00')
+        assert r.source == OrderRefund.REFUND_SOURCE_ADMIN
+        assert r.payment is None
 
 
 class SubEventCancelTests(TestCase):
@@ -428,6 +506,7 @@ class SubEventCancelTests(TestCase):
                 status=Order.STATUS_PENDING, locale='en',
                 datetime=now(), expires=now() + timedelta(days=10),
                 total=Decimal('46.00'),
+                sales_channel=self.event.organizer.sales_channels.get(identifier="web"),
             )
             self.ticket = Item.objects.create(event=self.event, name='Early-bird ticket',
                                               default_price=Decimal('23.00'), admission=True)
@@ -442,17 +521,26 @@ class SubEventCancelTests(TestCase):
             generate_invoice(self.order)
             djmail.outbox = []
 
+    def _cancel_with_dryrun(self, *args, expected_refunds, **kwargs):
+        dry_run = cancel_event(
+            *args, **kwargs, dry_run=True
+        )
+        assert dry_run["refund_total"] == expected_refunds
+        cancel_event(
+            *args, **kwargs,
+        )
+
     @classscope(attr='o')
     def test_cancel_partially_send_mail_attendees(self):
         self.op1.attendee_email = 'foo@example.com'
         self.op1.save()
         self.op2.attendee_email = 'foo@example.org'
         self.op2.save()
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=self.se1.pk,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("0.00")
         )
         assert len(djmail.outbox) == 2
         self.order.refresh_from_db()
@@ -463,19 +551,19 @@ class SubEventCancelTests(TestCase):
     def test_cancel_subevent_range(self):
         self.op2.subevent = self.se1
         self.op2.save()
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None, subevents_from=self.se1.date_from - timedelta(days=3), subevents_to=self.se1.date_from - timedelta(days=2),
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("0.00")
         )
         self.order.refresh_from_db()
         assert self.order.status == Order.STATUS_PENDING
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None, subevents_from=self.se1.date_from - timedelta(days=3), subevents_to=self.se1.date_from + timedelta(days=2),
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("0.00")
         )
         self.order.refresh_from_db()
         assert self.order.status == Order.STATUS_CANCELED
@@ -484,22 +572,40 @@ class SubEventCancelTests(TestCase):
     def test_cancel_simple_order(self):
         self.op2.subevent = self.se1
         self.op2.save()
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=self.se1.pk,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("0.00")
         )
         self.order.refresh_from_db()
         assert self.order.status == Order.STATUS_CANCELED
 
     @classscope(attr='o')
+    def test_cancel_skip_blocked(self):
+        self.op2.subevent = self.se1
+        self.op2.blocked = ["admin"]
+        self.op2.save()
+        self._cancel_with_dryrun(
+            self.event.pk, subevent=self.se1.pk,
+            auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
+            send=True, send_subject="Event canceled", send_message="Event canceled :-(",
+            user=None, expected_refunds=Decimal("0.00")
+        )
+        self.order.refresh_from_db()
+        assert self.order.status == Order.STATUS_PENDING
+        self.op1.refresh_from_db()
+        assert self.op1.canceled
+        self.op2.refresh_from_db()
+        assert not self.op2.canceled
+
+    @classscope(attr='o')
     def test_cancel_all_subevents(self):
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("0.00")
         )
         self.order.refresh_from_db()
         assert self.order.status == Order.STATUS_CANCELED
@@ -515,11 +621,12 @@ class SubEventCancelTests(TestCase):
         )
         self.order.status = Order.STATUS_PAID
         self.order.save()
-        cancel_event(
+        self.order.refresh_from_db()
+        self._cancel_with_dryrun(
             self.event.pk, subevent=self.se1.pk,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-( {refund_amount}",
-            user=None
+            user=None, expected_refunds=Decimal("23.00")
         )
         self.order.refresh_from_db()
         assert self.order.status == Order.STATUS_PAID
@@ -527,20 +634,20 @@ class SubEventCancelTests(TestCase):
 
     @classscope(attr='o')
     def test_cancel_mixed_order_range(self):
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None, subevents_from=self.se1.date_from - timedelta(days=3), subevents_to=self.se1.date_from - timedelta(days=2),
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-( {refund_amount}",
-            user=None
+            user=None, expected_refunds=Decimal("0.00")
         )
         self.order.refresh_from_db()
         assert self.order.status == Order.STATUS_PENDING
         assert self.order.positions.count() == 2
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=None, subevents_from=self.se1.date_from - timedelta(days=3), subevents_to=self.se1.date_from + timedelta(days=2),
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="",
             send=True, send_subject="Event canceled", send_message="Event canceled :-( {refund_amount}",
-            user=None
+            user=None, expected_refunds=Decimal("0.00")
         )
         self.order.refresh_from_db()
         assert self.order.status == Order.STATUS_PENDING
@@ -564,11 +671,11 @@ class SubEventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=self.se1.pk,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="10.00", keep_fee_per_ticket="",
             send=False, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("16.20")
         )
         r = self.order.refunds.get()
         assert r.state == OrderRefund.REFUND_STATE_DONE
@@ -595,11 +702,11 @@ class SubEventCancelTests(TestCase):
         self.order.status = Order.STATUS_PAID
         self.order.save()
 
-        cancel_event(
+        self._cancel_with_dryrun(
             self.event.pk, subevent=self.se1.pk,
             auto_refund=True, keep_fee_fixed="0.00", keep_fee_percentage="0.00", keep_fee_per_ticket="2.00",
             send=False, send_subject="Event canceled", send_message="Event canceled :-(",
-            user=None
+            user=None, expected_refunds=Decimal("21.00")
         )
         r = self.order.refunds.get()
         assert r.state == OrderRefund.REFUND_STATE_DONE

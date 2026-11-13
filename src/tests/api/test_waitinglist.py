@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -25,7 +25,6 @@ from unittest import mock
 
 import pytest
 from django_scopes import scopes_disabled
-from pytz import UTC
 
 from pretix.base.models import WaitingListEntry
 
@@ -44,7 +43,7 @@ def quota(event, item):
 
 @pytest.fixture
 def wle(event, item):
-    testtime = datetime.datetime(2017, 12, 1, 10, 0, 0, tzinfo=UTC)
+    testtime = datetime.datetime(2017, 12, 1, 10, 0, 0, tzinfo=datetime.timezone.utc)
 
     with mock.patch('django.utils.timezone.now') as mock_now:
         mock_now.return_value = testtime
@@ -140,7 +139,7 @@ def test_wle_list(token_client, organizer, event, wle, item, subevent):
         '/api/v1/organizers/{}/events/{}/waitinglistentries/?subevent={}'.format(organizer.slug, event.slug, subevent.pk))
     assert [res] == resp.data['results']
     with scopes_disabled():
-        se2 = event.subevents.create(name="Foobar", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=UTC))
+        se2 = event.subevents.create(name="Foobar", date_from=datetime.datetime(2017, 12, 27, 10, 0, 0, tzinfo=datetime.timezone.utc))
     resp = token_client.get(
         '/api/v1/organizers/{}/events/{}/waitinglistentries/?subevent={}'.format(organizer.slug, event.slug,
                                                                                  se2.pk))
@@ -470,3 +469,21 @@ def test_wle_send_voucher_unavailable(token_client, organizer, event, item, wle,
     assert resp.status_code == 400
     wle.refresh_from_db()
     assert not wle.voucher
+
+
+@pytest.mark.django_db
+def test_wle_locale_optional(token_client, organizer, event, item, quota):
+    event.settings.locale = "de"
+    event.settings.locales = ["en", "de"]
+    quota.size = 0
+    quota.save()
+    wle = create_wle(
+        token_client, organizer, event,
+        data={
+            'email': 'testdummy@pretix.eu',
+            'item': item.pk,
+            'variation': None,
+            'subevent': None
+        },
+    )
+    assert wle.locale == "de"

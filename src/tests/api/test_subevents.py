@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,17 +19,16 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from unittest import mock
 
 import pytest
 from django_countries.fields import Country
 from django_scopes import scopes_disabled
-from pytz import UTC
 
 from pretix.base.models import (
-    InvoiceAddress, Order, OrderPosition, SeatingPlan, SubEvent,
+    InvoiceAddress, ItemVariation, Order, OrderPosition, SeatingPlan, SubEvent,
 )
 from pretix.base.models.orders import OrderFee
 
@@ -52,15 +51,16 @@ def variations2(item2):
 
 @pytest.fixture
 def order(event, item, taxrule):
-    testtime = datetime(2017, 12, 1, 10, 0, 0, tzinfo=UTC)
+    testtime = datetime(2017, 12, 1, 10, 0, 0, tzinfo=timezone.utc)
 
     with mock.patch('django.utils.timezone.now') as mock_now:
         mock_now.return_value = testtime
         o = Order.objects.create(
             code='FOO', event=event, email='dummy@dummy.test',
             status=Order.STATUS_PENDING, secret="k24fiuwvu8kxz3y1",
-            datetime=datetime(2017, 12, 1, 10, 0, 0, tzinfo=UTC),
-            expires=datetime(2017, 12, 10, 10, 0, 0, tzinfo=UTC),
+            datetime=datetime(2017, 12, 1, 10, 0, 0, tzinfo=timezone.utc),
+            expires=datetime(2017, 12, 10, 10, 0, 0, tzinfo=timezone.utc),
+            sales_channel=event.organizer.sales_channels.get(identifier="web"),
             total=23, locale='en'
         )
         o.fees.create(fee_type=OrderFee.FEE_TYPE_PAYMENT, value=Decimal('0.25'), tax_rate=Decimal('19.00'),
@@ -105,6 +105,7 @@ TEST_SUBEVENT_RES = {
     "geo_lon": None,
     'is_public': True,
     'item_price_overrides': [],
+    'comment': None,
     'meta_data': {'type': 'Workshop'}
 }
 
@@ -152,6 +153,10 @@ def test_subevent_list(token_client, organizer, event, subevent):
         '/api/v1/organizers/{}/events/{}/subevents/?ends_after=2017-12-27T10:01:01Z'.format(organizer.slug, event.slug))
     assert [] == resp.data['results']
 
+    resp = token_client.get('/api/v1/organizers/{}/events/?with_availability_for=web'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['results'][0]['best_availability_state'] is None
+
 
 @pytest.mark.django_db
 def test_subevent_list_filter(token_client, organizer, event, subevent):
@@ -163,12 +168,100 @@ def test_subevent_list_filter(token_client, organizer, event, subevent):
     assert resp.status_code == 200
     assert resp.data['count'] == 0
 
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/subevents/?search=Foobar'.format(organizer.slug, event.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/subevents/?search=Barfoo'.format(organizer.slug, event.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 0
+
+    resp = token_client.get(
+        '/api/v1/organizers/{}/events/{}/subevents/?date_from_after=2017-12-27T10:00:00Z'.format(
+            organizer.slug, event.slug
+        )
+    )
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get(
+        '/api/v1/organizers/{}/events/{}/subevents/?date_from_after=2017-12-27T10:00:01Z'.format(
+            organizer.slug, event.slug
+        )
+    )
+    assert resp.status_code == 200
+    assert resp.data['count'] == 0
+
+    resp = token_client.get(
+        '/api/v1/organizers/{}/events/{}/subevents/?date_from_before=2017-12-27T10:00:00Z'.format(
+            organizer.slug, event.slug
+        )
+    )
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get(
+        '/api/v1/organizers/{}/events/{}/subevents/?date_from_before=2017-12-27T09:59:00Z'.format(
+            organizer.slug, event.slug
+        )
+    )
+    assert resp.status_code == 200
+    assert resp.data['count'] == 0
+
+
+@pytest.mark.django_db
+def test_all_subevents_list_filter(token_client, organizer, event, subevent):
+    resp = token_client.get('/api/v1/organizers/{}/subevents/?attr[type]=Workshop'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get('/api/v1/organizers/{}/subevents/?attr[type]=Conference'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 0
+
+    resp = token_client.get('/api/v1/organizers/{}/subevents/?search=Foobar'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get('/api/v1/organizers/{}/subevents/?search=Barfoo'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 0
+
+    resp = token_client.get('/api/v1/organizers/{}/subevents/?search=dummy'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get(
+        '/api/v1/organizers/{}/subevents/?date_from_after=2017-12-27T10:00:00Z'.format(organizer.slug)
+    )
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get(
+        '/api/v1/organizers/{}/subevents/?date_from_after=2017-12-27T10:00:01Z'.format(organizer.slug)
+    )
+    assert resp.status_code == 200
+    assert resp.data['count'] == 0
+
+    resp = token_client.get(
+        '/api/v1/organizers/{}/subevents/?date_from_before=2017-12-27T10:00:00Z'.format(organizer.slug)
+    )
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get(
+        '/api/v1/organizers/{}/subevents/?date_from_before=2017-12-27T09:59:00Z'.format(organizer.slug)
+    )
+    assert resp.status_code == 200
+    assert resp.data['count'] == 0
+
 
 @pytest.mark.django_db
 def test_subevent_create(team, token_client, organizer, event, subevent, meta_prop, item):
-    meta_prop.allowed_values = "Conference\nWorkshop"
+    meta_prop.choices = [{"key": "Conference", "label": {"en": "Conference"}}, {"key": "Workshop", "label": {"en": "Workshop"}}]
     meta_prop.save()
-    team.can_change_organizer_settings = False
+    team.limit_organizer_permissions = {"organizer.events:create": True}
+    team.all_organizer_permissions = False
     team.save()
     organizer.meta_properties.create(
         name="protected", protected=True
@@ -332,8 +425,8 @@ def test_subevent_update(token_client, organizer, event, subevent, item, item2, 
     assert resp.status_code == 200
     with scopes_disabled():
         subevent = event.subevents.get(id=subevent.id)
-    assert subevent.date_from == datetime(2018, 12, 27, 10, 0, tzinfo=UTC)
-    assert subevent.date_to == datetime(2018, 12, 28, 10, 0, tzinfo=UTC)
+    assert subevent.date_from == datetime(2018, 12, 27, 10, 0, tzinfo=timezone.utc)
+    assert subevent.date_to == datetime(2018, 12, 28, 10, 0, tzinfo=timezone.utc)
 
     resp = token_client.patch(
         '/api/v1/organizers/{}/events/{}/subevents/{}/'.format(organizer.slug, event.slug, subevent.pk),
@@ -412,7 +505,7 @@ def test_subevent_update(token_client, organizer, event, subevent, item, item2, 
     )
     assert resp.status_code == 200
     with scopes_disabled():
-        assert subevent.items.get(id=item.pk).default_price == Decimal('23.00')
+        assert event.items.get(id=item.pk).default_price == Decimal('23.00')
     assert subevent.item_price_overrides[item.pk] == Decimal('99.99')
 
     resp = token_client.patch(
@@ -518,7 +611,7 @@ def test_subevent_update(token_client, organizer, event, subevent, item, item2, 
     )
     assert resp.status_code == 200
     with scopes_disabled():
-        assert subevent.variations.get(id=variations[0].pk).default_price == Decimal('12.00')
+        assert ItemVariation.objects.get(id=variations[0].pk).default_price == Decimal('12.00')
         assert subevent.var_price_overrides[variations[0].pk] == Decimal('99.99')
 
     resp = token_client.patch(

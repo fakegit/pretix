@@ -1,4 +1,4 @@
-.. spelling::
+.. spelling:word-list::
 
    checkin
    datetime
@@ -8,10 +8,23 @@
 Questions
 =========
 
+.. warning:: This resource is **deprecated**. It is only provided for compatibility with existing applications
+             and should not be used in new development.
+
+             New applications must use the :ref:`rest-datafields` and :ref:`rest-questionnaires` resources.
+             The new version is expected to be released for hosted pretix early December and for self-hosted pretix with
+             version 2027.1.
+             You can find more information `on our blog <https://pretix.eu/about/en/blog/20261110-questionnaires/>`_.
+
+             This resource will continue to work in read-only mode on events where the
+             :ref:`questionnaire configuration <rest-questionnaires>` is compatible with the old data model.
+             If incompatible configuration is detected, all endpoints return HTTP 410.
+
+
 Resource description
 --------------------
 
-Questions define additional fields that need to be filled out by customers during checkout.
+Questions define additional fields related to an order position that need to be filled out by customers during checkout.
 The question resource contains the following public fields:
 
 .. rst-class:: rest-resource-table
@@ -44,6 +57,8 @@ identifier                            string                     An arbitrary st
 ask_during_checkin                    boolean                    If ``true``, this question will not be asked while
                                                                  buying the ticket, but will show up when redeeming
                                                                  the ticket instead.
+show_during_checkin                   boolean                    If ``true``, the answer to the question will be shown
+                                                                 during check-in (if the check-in client supports it).
 hidden                                boolean                    If ``true``, the question will only be shown in the
                                                                  backend.
 print_on_invoice                      boolean                    If ``true``, the question will only be shown on
@@ -63,6 +78,8 @@ valid_date_max                        date                       Maximum value f
 valid_datetime_min                    datetime                   Minimum value for date and time questions (optional)
 valid_datetime_max                    datetime                   Maximum value for date and time questions (optional)
 valid_file_portrait                   boolean                    Turn on file validation for portrait photos
+valid_string_length_min               integer                    Minimum length for string questions (optional)
+valid_string_length_max               integer                    Maximum length for string questions (optional)
 dependency_question                   integer                    Internal ID of a different question. The current
                                                                  question will only be shown if the question given in
                                                                  this attribute is set to the value given in
@@ -76,25 +93,16 @@ dependency_value                      string                     An old version 
                                                                  for one value. **Deprecated.**
 ===================================== ========================== =======================================================
 
-.. versionchanged:: 3.5
+.. versionchanged:: 2023.8
 
-  The attribute ``help_text`` has been added.
+   The ``show_during_checkin`` attribute has been added.
 
-.. versionchanged:: 3.14
+.. versionchanged:: 2026.[TODO]
 
-  The attributes ``valid_*`` have been added.
-
-.. versionchanged:: 3.18
-
-  The attribute ``valid_file_portrait`` have been added.
+   The questions resource was deprecated and replaced by the :ref:`rest-datafields` and :ref:`rest-questionnaires` resources.
 
 Endpoints
 ---------
-
-.. versionchanged:: 1.15
-
-   The questions endpoint has been extended by the filter queries ``ask_during_checkin``, ``requred``, and
-   ``identifier``.
 
 .. http:get:: /api/v1/organizers/(organizer)/events/(event)/questions/
 
@@ -131,6 +139,7 @@ Endpoints
             "position": 1,
             "identifier": "WY3TP9SL",
             "ask_during_checkin": false,
+            "show_during_checkin": false,
             "hidden": false,
             "print_on_invoice": false,
             "valid_number_min": null,
@@ -139,6 +148,8 @@ Endpoints
             "valid_date_max": null,
             "valid_datetime_min": null,
             "valid_datetime_max": null,
+            "valid_string_length_min": null,
+            "valid_string_length_max": null,
             "valid_file_portrait": false,
             "dependency_question": null,
             "dependency_value": null,
@@ -209,6 +220,7 @@ Endpoints
         "position": 1,
         "identifier": "WY3TP9SL",
         "ask_during_checkin": false,
+        "show_during_checkin": false,
         "hidden": false,
         "print_on_invoice": false,
         "valid_number_min": null,
@@ -218,6 +230,8 @@ Endpoints
         "valid_datetime_min": null,
         "valid_datetime_max": null,
         "valid_file_portrait": false,
+        "valid_string_length_min": null,
+        "valid_string_length_max": null,
         "dependency_question": null,
         "dependency_value": null,
         "dependency_values": [],
@@ -252,6 +266,13 @@ Endpoints
 
 .. http:post:: /api/v1/organizers/(organizer)/events/(event)/questions/
 
+   .. warning:: This endpoint is **deprecated** and will be removed as part of an upcoming API change.
+                The new version is expected to be released for hosted pretix early December and for self-hosted
+                pretix with version 2027.1.
+                You can find more information `on our blog <https://pretix.eu/about/en/blog/20261110-questionnaires/>`_.
+                After the change, instead create a :ref:`data field <rest-datafields>` first, then add
+                it to a :ref:`questionnaire <rest-questionnaires>`.
+
    Creates a new question
 
    **Example request**:
@@ -271,6 +292,7 @@ Endpoints
         "items": [1, 2],
         "position": 1,
         "ask_during_checkin": false,
+        "show_during_checkin": false,
         "hidden": false,
         "print_on_invoice": false,
         "dependency_question": null,
@@ -307,6 +329,7 @@ Endpoints
         "position": 1,
         "identifier": "WY3TP9SL",
         "ask_during_checkin": false,
+        "show_during_checkin": false,
         "hidden": false,
         "print_on_invoice": false,
         "dependency_question": null,
@@ -319,6 +342,8 @@ Endpoints
         "valid_datetime_min": null,
         "valid_datetime_max": null,
         "valid_file_portrait": false,
+        "valid_string_length_min": null,
+        "valid_string_length_max": null,
         "options": [
           {
             "id": 1,
@@ -350,6 +375,13 @@ Endpoints
 
 .. http:patch:: /api/v1/organizers/(organizer)/events/(event)/questions/(id)/
 
+   .. warning:: This endpoint is **deprecated** and will be removed as part of an upcoming API change.
+                The new version is expected to be released for hosted pretix early December and for self-hosted
+                pretix with version 2027.1.
+                You can find more information `on our blog <https://pretix.eu/about/en/blog/20261110-questionnaires/>`_.
+                After the change, instead update the relevant :ref:`data field <rest-datafields>`, or
+                the reference to it inside a :ref:`questionnaire <rest-questionnaires>`.
+
    Update a question. You can also use ``PUT`` instead of ``PATCH``. With ``PUT``, you have to provide all fields of
    the resource, other fields will be reset to default. With ``PATCH``, you only need to provide the fields that you
    want to change.
@@ -361,7 +393,7 @@ Endpoints
 
    .. sourcecode:: http
 
-      PATCH /api/v1/organizers/bigevents/events/sampleconf/items/1/ HTTP/1.1
+      PATCH /api/v1/organizers/bigevents/events/sampleconf/questions/1/ HTTP/1.1
       Host: pretix.eu
       Accept: application/json, text/javascript
       Content-Type: application/json
@@ -389,6 +421,7 @@ Endpoints
         "position": 2,
         "identifier": "WY3TP9SL",
         "ask_during_checkin": false,
+        "show_during_checkin": false,
         "hidden": false,
         "print_on_invoice": false,
         "dependency_question": null,
@@ -401,6 +434,8 @@ Endpoints
         "valid_datetime_min": null,
         "valid_datetime_max": null,
         "valid_file_portrait": false,
+        "valid_string_length_min": null,
+        "valid_string_length_max": null,
         "options": [
           {
             "id": 1,
@@ -427,11 +462,19 @@ Endpoints
    :param event: The ``slug`` field of the event to modify
    :param id: The ``id`` field of the question to modify
    :statuscode 200: no error
-   :statuscode 400: The item could not be modified due to invalid submitted data
+   :statuscode 400: The question could not be modified due to invalid submitted data
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer/event does not exist **or** you have no permission to change this resource.
 
 .. http:delete:: /api/v1/organizers/(organizer)/events/(event)/questions/(id)/
+
+
+   .. warning:: This endpoint is **deprecated** and will be removed as part of an upcoming API change.
+                The new version is expected to be released for hosted pretix early December and for self-hosted
+                pretix with version 2027.1.
+                You can find more information `on our blog <https://pretix.eu/about/en/blog/20261110-questionnaires/>`_.
+                After the change, insteadremove the questionnaire child from its :ref:`questionnaire <rest-questionnaires>`,
+                or delete the relevant :ref:`data field <rest-datafields>`.
 
    Delete a question.
 
@@ -439,7 +482,7 @@ Endpoints
 
    .. sourcecode:: http
 
-      DELETE /api/v1/organizers/bigevents/events/sampleconf/items/1/ HTTP/1.1
+      DELETE /api/v1/organizers/bigevents/events/sampleconf/questions/1/ HTTP/1.1
       Host: pretix.eu
       Accept: application/json, text/javascript
 
@@ -452,7 +495,7 @@ Endpoints
 
    :param organizer: The ``slug`` field of the organizer to modify
    :param event: The ``slug`` field of the event to modify
-   :param id: The ``id`` field of the item to delete
+   :param id: The ``id`` field of the question to delete
    :statuscode 204: no error
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer/event does not exist **or** you have no permission to delete this resource.

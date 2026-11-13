@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,6 +19,7 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import json
 from datetime import timedelta
 
 import pytest
@@ -43,21 +44,21 @@ def organizer2():
 @pytest.fixture
 def gift_card(organizer):
     gc = organizer.issued_gift_cards.create(currency="EUR")
-    gc.transactions.create(value=42)
+    gc.transactions.create(value=42, acceptor=organizer)
     return gc
 
 
 @pytest.fixture
 def admin_user(organizer):
     u = User.objects.create_user('dummy@dummy.dummy', 'dummy')
-    admin_team = Team.objects.create(organizer=organizer, can_manage_gift_cards=True, name='Admin team')
+    admin_team = Team.objects.create(organizer=organizer, name='Admin team', all_organizer_permissions=True)
     admin_team.members.add(u)
     return u
 
 
 @pytest.fixture
 def team2(admin_user, organizer2):
-    admin_team = Team.objects.create(organizer=organizer2, can_manage_gift_cards=True, name='Admin team')
+    admin_team = Team.objects.create(organizer=organizer2, name='Admin team', all_organizer_permissions=True)
     admin_team.members.add(admin_user)
 
 
@@ -131,7 +132,8 @@ def test_card_detail_view_transact_revert_refund(organizer, admin_user, gift_car
             code='FOO', event=event, email='dummy@dummy.test',
             status=Order.STATUS_CANCELED,
             datetime=now(), expires=now() + timedelta(days=10),
-            total=14, locale='en'
+            total=14, locale='en',
+            sales_channel=event.organizer.sales_channels.get(identifier="web"),
         )
         o.payments.create(
             amount=o.total, provider='banktransfer', state=OrderPayment.PAYMENT_STATE_CONFIRMED
@@ -139,7 +141,7 @@ def test_card_detail_view_transact_revert_refund(organizer, admin_user, gift_car
         r = o.refunds.create(
             amount=o.total, provider='giftcard', state=OrderRefund.REFUND_STATE_DONE
         )
-        t = gift_card.transactions.create(value=14, order=o, refund=r)
+        t = gift_card.transactions.create(value=14, order=o, refund=r, acceptor=organizer)
 
     client.login(email='dummy@dummy.dummy', password='dummy')
     r = client.post('/control/organizer/dummy/giftcard/{}/'.format(gift_card.pk), {
@@ -173,21 +175,50 @@ def test_card_detail_view_transact_invalid_value(organizer, admin_user, gift_car
 
 @pytest.mark.django_db
 def test_manage_acceptance(organizer, organizer2, admin_user, gift_card, client, team2):
+    gca = organizer.gift_card_issuer_acceptance.create(issuer=organizer2, active=False)
+
     client.login(email='dummy@dummy.dummy', password='dummy')
-    client.post('/control/organizer/dummy/giftcards'.format(gift_card.pk), {
-        'add': organizer2.slug
+    client.post('/control/organizer/dummy/giftcards/acceptance', {
+        'accept_issuer': organizer2.slug
     })
-    assert organizer.gift_card_issuer_acceptance.filter(issuer=organizer2).exists()
-    client.post('/control/organizer/dummy/giftcards'.format(gift_card.pk), {
-        'del': organizer2.slug
+
+    gca.refresh_from_db()
+    assert gca.active
+
+    client.post('/control/organizer/dummy/giftcards/acceptance', {
+        'delete_issuer': organizer2.slug
     })
     assert not organizer.gift_card_issuer_acceptance.filter(issuer=organizer2).exists()
+
+    client.post('/control/organizer/dummy/giftcards/acceptance/invite', {
+        'acceptor': organizer2.slug
+    })
+    assert organizer.gift_card_acceptor_acceptance.filter(acceptor=organizer2).exists()
+    client.post('/control/organizer/dummy/giftcards/acceptance', {
+        'delete_acceptor': organizer2.slug
+    })
+    assert not organizer.gift_card_acceptor_acceptance.filter(acceptor=organizer2).exists()
 
 
 @pytest.mark.django_db
-def test_manage_acceptance_permission_required(organizer, organizer2, admin_user, gift_card, client):
+def test_typeahead(organizer, admin_user, client, gift_card):
     client.login(email='dummy@dummy.dummy', password='dummy')
-    client.post('/control/organizer/dummy/giftcards'.format(gift_card.pk), {
-        'add': organizer2.slug
-    })
-    assert not organizer.gift_card_issuer_acceptance.filter(issuer=organizer2).exists()
+    with scopes_disabled():
+        team = organizer.teams.get()
+
+    # Privileged user can search
+    r = client.get('/control/organizer/dummy/giftcards/select2?query=' + gift_card.secret[0:3])
+    d = json.loads(r.content)
+    assert d == {"results": [{"id": gift_card.pk, "text": gift_card.secret}], "pagination": {"more": False}}
+
+    # Unprivileged user can only do exact match
+    team.all_organizer_permissions = False
+    team.limit_organizer_permissions = {"organizer.reusablemedia:write": True, "organizer.reusablemedia:read": True}
+    team.save()
+
+    r = client.get('/control/organizer/dummy/giftcards/select2?query=' + gift_card.secret[0:3])
+    d = json.loads(r.content)
+    assert d == {"results": [], "pagination": {"more": False}}
+    r = client.get('/control/organizer/dummy/giftcards/select2?query=' + gift_card.secret)
+    d = json.loads(r.content)
+    assert d == {"results": [{"id": gift_card.pk, "text": gift_card.secret}], "pagination": {"more": False}}

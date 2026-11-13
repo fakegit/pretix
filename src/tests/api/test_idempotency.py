@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -24,7 +24,6 @@ import json
 
 import pytest
 from django.utils.timezone import now
-from pytz import UTC
 
 from pretix.api.models import ApiCall
 from pretix.base.models import Order
@@ -67,7 +66,7 @@ def test_scoped_by_key(token_client, organizer):
                              PAYLOAD, format='json', HTTP_X_IDEMPOTENCY_KEY='foo')
     assert resp.status_code == 201
     assert d1.data == json.loads(resp.content.decode())
-    assert d1._headers == resp._headers
+    assert d1.headers._store == resp.headers._store
     resp = token_client.post('/api/v1/organizers/{}/events/'.format(organizer.slug),
                              PAYLOAD, format='json', HTTP_X_IDEMPOTENCY_KEY='bar')
     assert resp.status_code == 400
@@ -104,6 +103,19 @@ def test_ignore_path_method_body(token_client, organizer):
 
 
 @pytest.mark.django_db
+def test_query_key(token_client, organizer):
+    resp = token_client.post('/api/v1/organizers/{}/events/'.format(organizer.slug),
+                             PAYLOAD, format='json', HTTP_X_IDEMPOTENCY_KEY='foo')
+    assert resp.status_code == 201
+    data = resp.content
+    resp = token_client.get('/api/v1/idempotency_query?key=foo')
+    assert resp.content == data
+    assert resp.status_code == 201
+    resp = token_client.get('/api/v1/idempotency_query?key=bar')
+    assert resp.status_code == 404
+
+
+@pytest.mark.django_db
 def test_scoped_by_token(token_client, device, organizer):
     resp = token_client.post('/api/v1/organizers/{}/events/'.format(organizer.slug),
                              PAYLOAD, format='json', HTTP_X_IDEMPOTENCY_KEY='foo')
@@ -133,10 +145,10 @@ def test_ignore_get(token_client, organizer, event):
 
 @pytest.mark.django_db
 def test_ignore_outside_api(token_client, organizer):
-    resp = token_client.post('/control/login'.format(organizer.slug),
+    resp = token_client.post('/control/login',
                              PAYLOAD, format='json', HTTP_X_IDEMPOTENCY_KEY='foo')
     assert resp.status_code == 200
-    resp = token_client.post('/control/invalid/'.format(organizer.slug),
+    resp = token_client.post('/control/invalid/',
                              PAYLOAD, format='json', HTTP_X_IDEMPOTENCY_KEY='foo')
     assert resp.status_code == 302
 
@@ -146,8 +158,9 @@ def order(event):
     return Order.objects.create(
         code='FOO', event=event, email='dummy@dummy.test',
         status=Order.STATUS_PENDING, secret="k24fiuwvu8kxz3y1",
-        datetime=datetime.datetime(2017, 12, 1, 10, 0, 0, tzinfo=UTC),
-        expires=datetime.datetime(2017, 12, 10, 10, 0, 0, tzinfo=UTC),
+        datetime=datetime.datetime(2017, 12, 1, 10, 0, 0, tzinfo=datetime.timezone.utc),
+        expires=datetime.datetime(2017, 12, 10, 10, 0, 0, tzinfo=datetime.timezone.utc),
+        sales_channel=event.organizer.sales_channels.get(identifier="web"),
         total=23, locale='en'
     )
 
@@ -156,15 +169,14 @@ def order(event):
 def test_allow_retry_409(token_client, organizer, event, order):
     order.status = Order.STATUS_EXPIRED
     order.save()
-    with event.lock():
-        resp = token_client.post(
-            '/api/v1/organizers/{}/events/{}/orders/{}/mark_paid/'.format(
-                organizer.slug, event.slug, order.code
-            ), format='json', HTTP_X_IDEMPOTENCY_KEY='foo'
-        )
-        assert resp.status_code == 409
-        order.refresh_from_db()
-        assert order.status == Order.STATUS_EXPIRED
+    resp = token_client.post(
+        '/api/v1/organizers/{}/events/{}/orders/{}/mark_paid/?_debug_flag=fail-locking'.format(
+            organizer.slug, event.slug, order.code
+        ), format='json', HTTP_X_IDEMPOTENCY_KEY='foo'
+    )
+    assert resp.status_code == 409
+    order.refresh_from_db()
+    assert order.status == Order.STATUS_EXPIRED
     resp = token_client.post(
         '/api/v1/organizers/{}/events/{}/orders/{}/mark_paid/'.format(
             organizer.slug, event.slug, order.code

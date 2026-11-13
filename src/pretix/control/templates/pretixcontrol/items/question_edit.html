@@ -24,7 +24,9 @@
                 <legend>{% trans "General" %}</legend>
                 {% bootstrap_field form.question layout="control" %}
                 {% bootstrap_field form.type layout="control" %}
-                {% bootstrap_field form.items layout="control" %}
+                {% if form.items %}
+                    {% bootstrap_field form.items layout="control" %}
+                {% endif %}
                 {% bootstrap_field form.required layout="control" %}
                 <div class="alert alert-info alert-required-boolean">
                     {% blocktrans trimmed %}
@@ -44,6 +46,10 @@
                     {% bootstrap_field form.valid_datetime_min layout="control" %}
                     {% bootstrap_field form.valid_datetime_max layout="control" %}
                 </div>
+                <div id="valid-string">
+                    {% bootstrap_field form.valid_string_length_min layout="control" %}
+                    {% bootstrap_field form.valid_string_length_max layout="control" %}
+                </div>
                 <div id="valid-file">
                     {% bootstrap_field form.valid_file_portrait layout="control" %}
                 </div>
@@ -52,7 +58,7 @@
                     <noscript>
                         <p>{% trans "Only applicable if you choose 'Choose one/multiple from a list' above." %}</p>
                     </noscript>
-                    <div class="formset" data-formset data-formset-prefix="{{ formset.prefix }}">
+                    <div class="formset" data-formset data-formset-prefix="{{ formset.prefix }}" data-formset-delete-confirm-text="{% trans "If you delete an answer option, you will no longer be able to see statistical data on customers who previously selected this option, and when such customers edit their answers, they need to select a different option." %}">
                         {{ formset.management_form }}
                         {% bootstrap_formset_errors formset %}
                         <div data-formset-body>
@@ -125,9 +131,16 @@
                 <legend>{% trans "Advanced" %}</legend>
                 {% bootstrap_field form.help_text layout="control" %}
                 {% bootstrap_field form.identifier layout="control" %}
-                {% bootstrap_field form.ask_during_checkin layout="control" %}
+                {% if form.ask_during_checkin %}
+                    {% bootstrap_field form.ask_during_checkin layout="control" %}
+                {% endif %}
+                {% if form.show_during_checkin %}
+                    {% bootstrap_field form.show_during_checkin layout="control" %}
+                {% endif %}
                 {% bootstrap_field form.hidden layout="control" %}
-                {% bootstrap_field form.print_on_invoice layout="control" %}
+                {% if form.print_on_invoice %}
+                    {% bootstrap_field form.print_on_invoice layout="control" %}
+                {% endif %}
 
                 <div class="form-group">
                     <label class="col-md-3 control-label" for="id_dependency_question">

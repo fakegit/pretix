@@ -62,11 +62,15 @@ The provider class
 
    .. autoattribute:: public_name
 
+   .. autoattribute:: confirm_button_name
+
    .. autoattribute:: is_enabled
 
    .. autoattribute:: priority
 
    .. autoattribute:: settings_form_fields
+
+   .. autoattribute:: walletqueries
 
    .. automethod:: settings_form_clean
 
@@ -100,6 +104,8 @@ The provider class
 
    .. automethod:: render_invoice_text
 
+   .. automethod:: render_invoice_stamp
+
    .. automethod:: order_change_allowed
 
    .. automethod:: payment_prepare
@@ -118,13 +124,19 @@ The provider class
 
    .. automethod:: refund_control_render
 
+   .. automethod:: refund_control_render_short
+
    .. automethod:: new_refund_control_form_render
 
    .. automethod:: new_refund_control_form_process
 
    .. automethod:: api_payment_details
 
+   .. automethod:: api_refund_details
+
    .. automethod:: matching_id
+
+   .. automethod:: refund_matching_id
 
    .. automethod:: shred_payment_info
 
@@ -133,6 +145,10 @@ The provider class
    .. autoattribute:: is_implicit
 
    .. autoattribute:: is_meta
+
+   .. autoattribute:: execute_payment_needs_user
+
+   .. autoattribute:: multi_use_supported
 
    .. autoattribute:: test_mode_message
 

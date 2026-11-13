@@ -1,25 +1,29 @@
 {% load i18n %}
 {% load bootstrap3 %}
+{% load textbubble %}
+{# Changes should be replicated in pretixcontrol/orders/fragment_order_status.html and in pretix/base/models/orders.py #}
 {% if order.status == "n" %}
     {% if order.require_approval %}
-        <span class="label label-warning {{ class }}">{% trans "Approval pending" %}</span>
+        {% textbubble "warning" icon="exclamation-triangle" %}{% trans "Approval pending" %}{% endtextbubble %}
     {% elif order.total == 0 %}
-        <span class="label label-warning {{ class }}">{% trans "Confirmation pending" context "order state" %}</span>
+        {% textbubble "warning" icon="exclamation-triangle" %}{% trans "Confirmation pending" context "order state" %}{% endtextbubble %}
     {% elif event.settings.payment_pending_hidden %}
         {# intentionally left blank #}
+    {% elif order.valid_if_pending %}
+        {% textbubble "info" icon="info-circle" %}{% trans "Confirmed" context "order state" %}{% endtextbubble %}
     {% else %}
-        <span class="label label-warning {{ class }}">{% trans "Payment pending" %}</span>
+        {% textbubble "warning" icon="exclamation-triangle" %}{% trans "Payment pending" %}{% endtextbubble %}
     {% endif %}
 {% elif order.status == "p" %}
     {% if order.count_positions == 0 %}
-        <span class="label label-info {{ class }}">{% trans "Canceled (paid fee)" %}</span>
+        {% textbubble "info" icon="info-circle" %}{% trans "Canceled (paid fee)" %}{% endtextbubble %}
     {% elif order.total == 0 %}
-        <span class="label label-success {{ class }}">{% trans "Confirmed" context "order state" %}</span>
+        {% textbubble "success" icon="check" %}{% trans "Confirmed" context "order state" %}{% endtextbubble %}
     {% else %}
-        <span class="label label-success {{ class }}">{% trans "Paid" %}</span>
+        {% textbubble "success" icon="check" %}{% trans "Paid" %}{% endtextbubble %}
     {% endif %}
 {% elif order.status == "e" %}
-    <span class="label label-danger {{ class }}">{% trans "Expired" %}</span>
+    {% textbubble "danger" icon="minus" %}{% trans "Expired" %}{% endtextbubble %}
 {% elif order.status == "c" %}
-    <span class="label label-danger {{ class }}">{% trans "Canceled" %}</span>
+    {% textbubble "danger" icon="times" %}{% trans "Canceled" %}{% endtextbubble %}
 {% endif %}

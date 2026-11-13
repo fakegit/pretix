@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -31,12 +31,19 @@ from django.urls import reverse
 from django.utils.crypto import get_random_string
 from django.utils.functional import cached_property
 
+from pretix.helpers.celery import get_task_priority
 from pretix.helpers.json import CustomJSONEncoder
 
 
 def cachedfile_name(instance, filename: str) -> str:
     secret = get_random_string(length=12)
-    return 'cachedfiles/%s.%s.%s' % (instance.id, secret, filename.split('.')[-1])
+    return '%s.%s.%s' % (instance.id, secret, filename.split('.')[-1])
+
+
+def _cachedfile_name(instance, filename: str) -> str:
+    # This was previously combined with cachedfile_name in one function, but a security patch for Django introduced
+    # additional file name validation in May 2021, and this was the best way to fix it without breaking plugins.
+    return 'cachedfiles/' + cachedfile_name(instance, filename)
 
 
 class CachedFile(models.Model):
@@ -48,9 +55,40 @@ class CachedFile(models.Model):
     date = models.DateTimeField(null=True, blank=True)
     filename = models.CharField(max_length=255)
     type = models.CharField(max_length=255)
-    file = models.FileField(null=True, blank=True, upload_to=cachedfile_name, max_length=255)
+    file = models.FileField(null=True, blank=True, upload_to=_cachedfile_name, max_length=255)
     web_download = models.BooleanField(default=True)  # allow web download, True for backwards compatibility in plugins
     session_key = models.TextField(null=True, blank=True)  # only allow download in this session
+
+    def session_key_for_request(self, request, salt=None):
+        from ...api.models import OAuthAccessToken, OAuthApplication
+        from .devices import Device
+        from .organizer import TeamAPIToken
+
+        if hasattr(request, "auth") and isinstance(request.auth, OAuthAccessToken):
+            k = f'app:{request.auth.application.pk}'
+        elif hasattr(request, "auth") and isinstance(request.auth, OAuthApplication):
+            k = f'app:{request.auth.pk}'
+        elif hasattr(request, "auth") and isinstance(request.auth, TeamAPIToken):
+            k = f'token:{request.auth.pk}'
+        elif hasattr(request, "auth") and isinstance(request.auth, Device):
+            k = f'device:{request.auth.pk}'
+        elif request.session.session_key:
+            k = request.session.session_key
+        else:
+            raise ValueError("No auth method found to bind to")
+
+        if salt:
+            k = f"{k}!{salt}"
+        return k
+
+    def allowed_for_session(self, request, salt=None):
+        return (
+            not self.session_key or
+            self.session_key_for_request(request, salt) == self.session_key
+        )
+
+    def bind_to_session(self, request, salt=None):
+        self.session_key = self.session_key_for_request(request, salt)
 
 
 @receiver(post_delete, sender=CachedFile)
@@ -78,13 +116,23 @@ class LoggingMixin:
         from .devices import Device
         from .event import Event
         from .log import LogEntry
-        from .organizer import TeamAPIToken
+        from .organizer import Organizer, TeamAPIToken
 
         event = None
-        if isinstance(self, Event):
+        organizer_id = None
+        if isinstance(self, Organizer):
+            organizer_id = self.pk
+        elif isinstance(self, Event):
             event = self
-        elif hasattr(self, 'event'):
+            organizer_id = self.organizer_id
+        elif hasattr(self, 'event') and self.event:
             event = self.event
+            organizer_id = self.event.organizer_id
+        elif hasattr(self, 'organizer_id'):
+            organizer_id = self.organizer_id
+        elif hasattr(self, 'issuer_id'):
+            organizer_id = self.issuer_id
+
         if user and not user.is_authenticated:
             user = None
 
@@ -100,14 +148,32 @@ class LoggingMixin:
         elif isinstance(api_token, TeamAPIToken):
             kwargs['api_token'] = api_token
 
-        logentry = LogEntry(content_object=self, user=user, action_type=action, event=event, **kwargs)
+        logentry = LogEntry(content_object=self, user=user, action_type=action, event=event,
+                            organizer_id=organizer_id, **kwargs)
         if isinstance(data, dict):
-            sensitivekeys = ['password', 'secret', 'api_key']
+            # sensitivekeys are matched whether contained, not exactly
+            sensitivekeys = [
+                'auth',
+                'key',
+                'token',
+                'password',
+                'Password',
+                '_pass',
+                'salt',
+                'secret',
+            ]
 
-            for sensitivekey in sensitivekeys:
-                for k, v in data.items():
-                    if (sensitivekey in k) and v:
+            def clean_recursive(d):
+                data = d
+                data_iterator = d.items() if isinstance(d, dict) else enumerate(d)
+                for k, v in data_iterator:
+                    if v and any([sensitivekey in str(k) for sensitivekey in sensitivekeys]):
                         data[k] = "********"
+                    elif isinstance(v, (list, dict)):
+                        data[k] = clean_recursive(v)
+                return data
+
+            data = clean_recursive(data)
 
             logentry.data = json.dumps(data, cls=CustomJSONEncoder, sort_keys=True)
         elif data:
@@ -116,9 +182,15 @@ class LoggingMixin:
             logentry.save()
 
             if logentry.notification_type:
-                notify.apply_async(args=(logentry.pk,))
+                notify.apply_async(
+                    args=(logentry.pk,),
+                    priority=get_task_priority("notifications", logentry.organizer_id),
+                )
             if logentry.webhook_type:
-                notify_webhooks.apply_async(args=(logentry.pk,))
+                notify_webhooks.apply_async(
+                    args=(logentry.pk,),
+                    priority=get_task_priority("notifications", logentry.organizer_id),
+                )
 
         return logentry
 
@@ -172,7 +244,7 @@ class LoggedModel(models.Model, LoggingMixin):
 
         return LogEntry.objects.filter(
             content_type=self.logs_content_type, object_id=self.pk
-        ).select_related('user', 'event', 'oauth_application', 'api_token', 'device')
+        ).select_related('user', 'event', 'event__organizer', 'oauth_application', 'api_token', 'device')
 
 
 class LockModel:

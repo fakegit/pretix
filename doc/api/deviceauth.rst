@@ -32,9 +32,15 @@ as well as the type of underlying hardware. Example:
        "token": "kpp4jn8g2ynzonp6",
        "hardware_brand": "Samsung",
        "hardware_model": "Galaxy S",
+       "os_name": "Android",
+       "os_version": "2.3.6",
        "software_brand": "pretixdroid",
-       "software_version": "4.0.0"
+       "software_version": "4.0.0",
+       "rsa_pubkey": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqh…nswIDAQAB\n-----END PUBLIC KEY-----\n"
    }
+
+The ``rsa_pubkey`` is optional any only required for certain features such as working with reusable
+media and NFC cryptography.
 
 Every initialization token can only be used once. On success, you will receive a response containing
 information on your device as well as your API token:
@@ -98,11 +104,65 @@ following endpoint:
    {
        "hardware_brand": "Samsung",
        "hardware_model": "Galaxy S",
+       "os_name": "Android",
+       "os_version": "2.3.6",
        "software_brand": "pretixdroid",
-       "software_version": "4.1.0"
+       "software_version": "4.1.0",
+       "info": {"arbitrary": "data"}
    }
 
 You will receive a response equivalent to the response of your initialization request.
+
+Device Information
+------------------
+
+You can request information about your device and the server with one call:
+
+.. sourcecode:: http
+
+   GET /api/v1/device/info HTTP/1.1
+   Host: pretix.eu
+
+The response will look like this:
+
+.. sourcecode:: http
+
+   HTTP/1.1 200 OK
+   Content-Type: application/json
+
+   {
+     "device": {
+       "organizer": "foo",
+       "device_id": 5,
+       "unique_serial": "HHZ9LW9JWP390VFZ",
+       "api_token": "1kcsh572fonm3hawalrncam4l1gktr2rzx25a22l8g9hx108o9oi0rztpcvwnfnd",
+       "name": "Bar",
+       "gate": {
+         "id": 3,
+         "name": "South entrance"
+       }
+     },
+     "server": {
+       "version": {
+         "pretix": "3.6.0.dev0",
+         "pretix_numeric": 30060001000
+       }
+     },
+     "medium_key_sets": [
+       {
+         "public_id": 3456349,
+         "organizer": "foo",
+         "active": true,
+         "media_type": "nfc_mf0aes",
+         "uid_key": "base64-encoded-encrypted-key",
+         "diversification_key": "base64-encoded-encrypted-key",
+       }
+     ]
+   }
+
+``"medium_key_sets`` will always be empty if you did not set an ``rsa_pubkey``.
+The individual keys in the key sets are encrypted with the device's ``rsa_pubkey``
+using ``RSA/ECB/PKCS1Padding``.
 
 Creating a new API key
 ----------------------
@@ -137,30 +197,17 @@ Permissions & security profiles
 
 Device authentication is currently hardcoded to grant the following permissions:
 
-* View event meta data and products etc.
-* View orders
-* Change orders
-* Manage gift cards
+* Read event meta data and products etc.
+* Read and write orders
+* Read and write gift cards
+* Read and write reusable media
+* Read vouchers
 
 Devices cannot change events or products and cannot access vouchers.
 
 Additionally, when creating a device through the user interface or API, a user can specify a "security profile" for
 the device. These include an allow list of specific API calls that may be made by the device. pretix ships with security
 policies for official pretix apps like pretixSCAN and pretixPOS.
-
-Removing a device
------------------
-
-If you want implement a way to to deprovision a device in your software, you can call the ``revoke`` endpoint to
-invalidate your API key. There is no way to reverse this operation.
-
-.. sourcecode:: http
-
-   POST /api/v1/device/revoke HTTP/1.1
-   Host: pretix.eu
-   Authorization: Device 1kcsh572fonm3hawalrncam4l1gktr2rzx25a22l8g9hx108o9oi0rztpcvwnfnd
-
-This can also be done by the user through the web interface.
 
 Event selection
 ---------------
@@ -189,8 +236,10 @@ You can get three response codes:
    Content-Type: application/json
 
    {
-      "event": "democon",
+      "event": {
+        "name": "Demo Conference",
+        "slug": "democon"
+      },
       "subevent": 23,
       "checkinlist": 5
    }
-

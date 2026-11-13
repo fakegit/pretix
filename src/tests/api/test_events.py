@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -33,22 +33,23 @@
 # License for the specific language governing permissions and limitations under the License.
 
 import copy
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest import mock
 
 import pytest
 from django.conf import settings
 from django.core.files.base import ContentFile
+from django.utils.timezone import now
 from django_countries.fields import Country
-from django_scopes import scopes_disabled
-from pytz import UTC
+from django_scopes import scope, scopes_disabled
+from tests.const import SAMPLE_PNG
 
 from pretix.base.models import (
-    Event, InvoiceAddress, Order, OrderPosition, SeatingPlan,
+    Event, InvoiceAddress, Order, OrderPosition, Organizer, SeatingPlan,
 )
 from pretix.base.models.orders import OrderFee
-from pretix.testutils.mock import mocker_context
+from pretix.testutils.queries import assert_num_queries
 
 
 @pytest.fixture
@@ -61,15 +62,16 @@ def variations(item):
 
 @pytest.fixture
 def order(event, item, taxrule):
-    testtime = datetime(2017, 12, 1, 10, 0, 0, tzinfo=UTC)
+    testtime = datetime(2017, 12, 1, 10, 0, 0, tzinfo=timezone.utc)
 
     with mock.patch('django.utils.timezone.now') as mock_now:
         mock_now.return_value = testtime
         o = Order.objects.create(
             code='FOO', event=event, email='dummy@dummy.test',
             status=Order.STATUS_PENDING, secret="k24fiuwvu8kxz3y1",
-            datetime=datetime(2017, 12, 1, 10, 0, 0, tzinfo=UTC),
-            expires=datetime(2017, 12, 10, 10, 0, 0, tzinfo=UTC),
+            datetime=datetime(2017, 12, 1, 10, 0, 0, tzinfo=timezone.utc),
+            expires=datetime(2017, 12, 10, 10, 0, 0, tzinfo=timezone.utc),
+            sales_channel=event.organizer.sales_channels.get(identifier="web"),
             total=23, locale='en'
         )
         o.fees.create(fee_type=OrderFee.FEE_TYPE_PAYMENT, value=Decimal('0.25'), tax_rate=Decimal('19.00'),
@@ -121,7 +123,10 @@ TEST_EVENT_RES = {
     'item_meta_properties': {
         'day': 'Monday',
     },
-    'sales_channels': ['web']
+    'sales_channels': ['bar', 'baz', 'web'],
+    'all_sales_channels': True,
+    'limit_sales_channels': [],
+    'public_url': 'http://example.com/dummy/dummy/'
 }
 
 
@@ -155,6 +160,13 @@ def test_event_list(token_client, organizer, event):
     assert resp.status_code == 200
     assert [TEST_EVENT_RES] == resp.data['results']
 
+    resp = token_client.get('/api/v1/organizers/{}/events/?testmode=true'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert [] == resp.data['results']
+    resp = token_client.get('/api/v1/organizers/{}/events/?testmode=false'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert [TEST_EVENT_RES] == resp.data['results']
+
     resp = token_client.get('/api/v1/organizers/{}/events/?is_public=false'.format(organizer.slug))
     assert resp.status_code == 200
     assert [] == resp.data['results']
@@ -176,6 +188,10 @@ def test_event_list(token_client, organizer, event):
     assert resp.status_code == 200
     assert [TEST_EVENT_RES] == resp.data['results']
 
+    resp = token_client.get('/api/v1/organizers/{}/events/?with_availability_for=web'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['results'][0]['best_availability_state'] is None
+
 
 @pytest.mark.django_db
 def test_event_list_filter(token_client, organizer, event):
@@ -184,6 +200,29 @@ def test_event_list_filter(token_client, organizer, event):
     assert resp.data['count'] == 1
 
     resp = token_client.get('/api/v1/organizers/{}/events/?attr[type]='.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get('/api/v1/organizers/{}/events/?attr[type]=Unknown'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 0
+
+    resp = token_client.get('/api/v1/organizers/{}/events/?date_from_after=2017-12-27T10:00:00Z'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get('/api/v1/organizers/{}/events/?date_from_after=2017-12-27T10:00:01Z'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 0
+
+
+@pytest.mark.django_db
+def test_event_list_name_filter(token_client, organizer, event):
+    resp = token_client.get('/api/v1/organizers/{}/events/?search=Dummy'.format(organizer.slug))
+    assert resp.status_code == 200
+    assert resp.data['count'] == 1
+
+    resp = token_client.get('/api/v1/organizers/{}/events/?search=notdummy'.format(organizer.slug))
     assert resp.status_code == 200
     assert resp.data['count'] == 0
 
@@ -199,9 +238,13 @@ def test_event_get(token_client, organizer, event):
 
 @pytest.mark.django_db
 def test_event_create(team, token_client, organizer, event, meta_prop):
-    meta_prop.allowed_values = "Conference\nWorkshop"
+    meta_prop.choices = [
+        {"key": "Conference", "label": {"en": "Conference"}},
+        {"key": "Workshop", "label": {"en": "Workshop"}},
+    ]
     meta_prop.save()
-    team.can_change_organizer_settings = False
+    team.limit_organizer_permissions = {"organizer.events:create": True}
+    team.all_organizer_permissions = False
     team.save()
     organizer.meta_properties.create(
         name="protected", protected=True
@@ -351,9 +394,15 @@ def test_event_create(team, token_client, organizer, event, meta_prop):
 
 
 @pytest.mark.django_db
-def test_event_create_with_clone(token_client, organizer, event, meta_prop):
+@pytest.mark.parametrize("urlstyle", [
+    '/api/v1/organizers/{}/events/{}/clone/',
+    '/api/v1/organizers/{}/events/?clone_from={}',
+])
+def test_event_create_with_clone(token_client, organizer, event, meta_prop, urlstyle):
+    event.date_admission = event.date_from - timedelta(hours=1)
+    event.save()
     resp = token_client.post(
-        '/api/v1/organizers/{}/events/{}/clone/'.format(organizer.slug, event.slug),
+        urlstyle.format(organizer.slug, event.slug),
         {
             "name": {
                 "de": "Demo Konference 2020 Test",
@@ -364,14 +413,14 @@ def test_event_create_with_clone(token_client, organizer, event, meta_prop):
             "currency": "EUR",
             "date_from": "2018-12-27T10:00:00Z",
             "date_to": "2018-12-28T10:00:00Z",
-            "date_admission": None,
+            "date_admission": "2018-12-27T08:00:00Z",
             "is_public": False,
             "presale_start": None,
             "presale_end": None,
             "location": None,
             "slug": "2030",
             "meta_data": {
-                "type": "Conference"
+                "type": "Workshop"
             },
             "plugins": [
                 "pretix.plugins.ticketoutputpdf"
@@ -387,13 +436,14 @@ def test_event_create_with_clone(token_client, organizer, event, meta_prop):
         assert cloned_event.plugins == 'pretix.plugins.ticketoutputpdf'
         assert cloned_event.is_public is False
         assert cloned_event.testmode
+        assert cloned_event.date_admission.isoformat() == "2018-12-27T08:00:00+00:00"
         assert organizer.events.get(slug="2030").meta_values.filter(
-            property__name=meta_prop.name, value="Conference"
+            property__name=meta_prop.name, value="Workshop"
         ).exists()
         assert cloned_event.settings.timezone == "Europe/Vienna"
 
     resp = token_client.post(
-        '/api/v1/organizers/{}/events/{}/clone/'.format(organizer.slug, event.slug),
+        urlstyle.format(organizer.slug, event.slug),
         {
             "name": {
                 "de": "Demo Konference 2020 Test",
@@ -408,9 +458,6 @@ def test_event_create_with_clone(token_client, organizer, event, meta_prop):
             "presale_end": None,
             "location": None,
             "slug": "2031",
-            "meta_data": {
-                "type": "Conference"
-            }
         },
         format='json'
     )
@@ -418,14 +465,14 @@ def test_event_create_with_clone(token_client, organizer, event, meta_prop):
     assert resp.status_code == 201
     with scopes_disabled():
         cloned_event = Event.objects.get(organizer=organizer.pk, slug='2031')
-        assert cloned_event.plugins == "pretix.plugins.banktransfer,pretix.plugins.ticketoutputpdf"
+        assert cloned_event.plugins == event.plugins
         assert cloned_event.is_public is True
         assert organizer.events.get(slug="2031").meta_values.filter(
             property__name=meta_prop.name, value="Conference"
         ).exists()
 
     resp = token_client.post(
-        '/api/v1/organizers/{}/events/{}/clone/'.format(organizer.slug, event.slug),
+        urlstyle.format(organizer.slug, event.slug),
         {
             "name": {
                 "de": "Demo Konference 2020 Test",
@@ -449,6 +496,177 @@ def test_event_create_with_clone(token_client, organizer, event, meta_prop):
     with scopes_disabled():
         cloned_event = Event.objects.get(organizer=organizer.pk, slug='2032')
         assert cloned_event.plugins == ""
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize("urlstyle", [
+    '/api/v1/organizers/{}/events/{}/clone/',
+    '/api/v1/organizers/{}/events/?clone_from={}',
+])
+def test_event_create_with_clone_migrate_sales_channels(token_client, organizer, event, meta_prop, urlstyle):
+    with scopes_disabled():
+        all_channels = list(organizer.sales_channels.values_list("identifier", flat=True))
+    resp = token_client.post(
+        urlstyle.format(organizer.slug, event.slug),
+        {
+            "name": {
+                "de": "Demo Konference 2020 Test",
+                "en": "Demo Conference 2020 Test"
+            },
+            "live": False,
+            "testmode": True,
+            "currency": "EUR",
+            "date_from": "2018-12-27T10:00:00Z",
+            "date_to": "2018-12-28T10:00:00Z",
+            "date_admission": "2018-12-27T08:00:00Z",
+            "is_public": False,
+            "presale_start": None,
+            "presale_end": None,
+            "location": None,
+            "slug": "2030",
+            "sales_channels": all_channels,
+            "meta_data": {
+                "type": "Workshop"
+            },
+            "plugins": [
+                "pretix.plugins.ticketoutputpdf"
+            ],
+            "timezone": "Europe/Vienna"
+        },
+        format='json'
+    )
+
+    assert resp.status_code == 201
+    with scopes_disabled():
+        cloned_event = Event.objects.get(organizer=organizer.pk, slug='2030')
+        assert cloned_event.all_sales_channels
+        assert not cloned_event.limit_sales_channels.exists()
+
+
+@pytest.mark.django_db
+def test_event_create_with_clone_unknown_source(user, user_client, organizer, event):
+    with scopes_disabled():
+        target_org = Organizer.objects.create(name='Dummy', slug='dummy2')
+        target_org.events.create(slug='bar', name='bar', date_from=now())
+    resp = user_client.post(
+        '/api/v1/organizers/{}/events/?clone_from={}/{}'.format(organizer.slug, 'dummy2', 'bar'),
+        {
+            "name": {
+                "de": "Demo Konference 2020 Test",
+                "en": "Demo Conference 2020 Test"
+            },
+            "live": False,
+            "testmode": True,
+            "currency": "EUR",
+            "date_from": "2018-12-27T10:00:00Z",
+            "date_to": "2018-12-28T10:00:00Z",
+            "date_admission": None,
+            "is_public": False,
+            "presale_start": None,
+            "presale_end": None,
+            "location": None,
+            "slug": "2030",
+            "plugins": [
+                "pretix.plugins.ticketoutputpdf"
+            ],
+            "timezone": "Europe/Vienna"
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.django_db
+def test_event_create_with_clone_across_organizers(user, user_client, organizer, event, taxrule, team):
+    team.all_event_permissions = True
+    team.save()
+    with scopes_disabled():
+        target_org = Organizer.objects.create(name='Dummy', slug='dummy2')
+        team = target_org.teams.create(
+            name="Test-Team",
+            all_event_permissions=True,
+            all_organizer_permissions=True,
+        )
+        team.members.add(user)
+
+    resp = user_client.post(
+        '/api/v1/organizers/{}/events/?clone_from={}/{}'.format(target_org.slug, organizer.slug, event.slug),
+        {
+            "name": {
+                "de": "Demo Konference 2020 Test",
+                "en": "Demo Conference 2020 Test"
+            },
+            "live": False,
+            "testmode": True,
+            "currency": "EUR",
+            "date_from": "2018-12-27T10:00:00Z",
+            "date_to": "2018-12-28T10:00:00Z",
+            "date_admission": None,
+            "is_public": False,
+            "presale_start": None,
+            "presale_end": None,
+            "location": None,
+            "slug": "2030",
+            "plugins": [
+                "pretix.plugins.ticketoutputpdf"
+            ],
+            "timezone": "Europe/Vienna"
+        },
+        format='json'
+    )
+    assert resp.status_code == 201
+    with scopes_disabled():
+        cloned_event = Event.objects.get(organizer=target_org.pk, slug='2030')
+        assert cloned_event.plugins == 'pretix.plugins.ticketoutputpdf'
+        assert cloned_event.is_public is False
+        assert cloned_event.testmode
+        assert cloned_event.settings.timezone == "Europe/Vienna"
+        assert cloned_event.tax_rules.exists()
+
+
+@pytest.mark.django_db
+def test_event_create_with_clone_across_organizers_lack_of_permission_on_source(user, user_client, team, organizer, event, taxrule):
+    team.all_event_permissions = False
+    team.limit_event_permissions = {
+        "event.settings.general:write": True,
+    }
+    team.save()
+    with scopes_disabled():
+        target_org = Organizer.objects.create(name='Dummy', slug='dummy2')
+        team = target_org.teams.create(
+            name="Test-Team",
+            all_event_permissions=True,
+            all_organizer_permissions=True,
+        )
+        team.members.add(user)
+
+    resp = user_client.post(
+        '/api/v1/organizers/{}/events/?clone_from={}/{}'.format(target_org.slug, organizer.slug, event.slug),
+        {
+            "name": {
+                "de": "Demo Konference 2020 Test",
+                "en": "Demo Conference 2020 Test"
+            },
+            "live": False,
+            "testmode": True,
+            "currency": "EUR",
+            "date_from": "2018-12-27T10:00:00Z",
+            "date_to": "2018-12-28T10:00:00Z",
+            "date_admission": None,
+            "is_public": False,
+            "presale_start": None,
+            "presale_end": None,
+            "location": None,
+            "slug": "2030",
+            "plugins": [
+                "pretix.plugins.ticketoutputpdf"
+            ],
+            "timezone": "Europe/Vienna"
+        },
+        format='json'
+    )
+    assert resp.status_code == 403
+    assert resp.data["detail"] == "Not sufficient permission on source event to copy"
 
 
 @pytest.mark.django_db
@@ -485,7 +703,7 @@ def test_event_delete_with_clone(token_client, organizer, event, meta_prop):
 
 
 @pytest.mark.django_db
-def test_event_update(token_client, organizer, event, item, meta_prop):
+def test_event_update(token_client, team, organizer, event, item, meta_prop, meta_prop_choices):
     resp = token_client.patch(
         '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
         {
@@ -556,9 +774,32 @@ def test_event_update(token_client, organizer, event, item, meta_prop):
         format='json'
     )
     assert resp.status_code == 200
+    assert resp.data["meta_data"] == {
+        meta_prop.name: "Workshop"
+    }
     with scopes_disabled():
         assert organizer.events.get(slug=resp.data['slug']).meta_values.filter(
             property__name=meta_prop.name, value="Workshop"
+        ).exists()
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "meta_data": {
+                meta_prop.name: "Workshop",
+                meta_prop_choices.name: "B"
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert resp.data["meta_data"] == {
+        meta_prop.name: "Workshop",
+        meta_prop_choices.name: "B"
+    }
+    with scopes_disabled():
+        assert organizer.events.get(slug=resp.data['slug']).meta_values.filter(
+            property__name=meta_prop_choices.name, value="B"
         ).exists()
 
     resp = token_client.patch(
@@ -574,6 +815,51 @@ def test_event_update(token_client, organizer, event, item, meta_prop):
         assert not organizer.events.get(slug=resp.data['slug']).meta_values.filter(
             property__name=meta_prop.name
         ).exists()
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "meta_data": {
+                meta_prop_choices.name: "invalid"
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.content.decode() == '{"meta_data":["Meta data property \'department\' does not allow value \'invalid\'."]}'
+
+    meta_prop_choices.protected = True
+    meta_prop_choices.save()
+    team.all_organizer_permissions = False
+    team.limit_organizer_permissions = {}
+    team.save()
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "meta_data": {
+                meta_prop_choices.name: "A"
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 200   # silently ignored
+    assert resp.data["meta_data"] == {}
+
+    team.all_organizer_permissions = True
+    team.save()
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "meta_data": {
+                meta_prop_choices.name: "A"
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert resp.data["meta_data"] == {
+        meta_prop_choices.name: "A"
+    }
 
     resp = token_client.patch(
         '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
@@ -615,6 +901,110 @@ def test_event_update(token_client, organizer, event, item, meta_prop):
         assert not organizer.events.get(slug=resp.data['slug']).item_meta_properties.filter(
             name="Foo"
         ).exists()
+
+    # Noop does not write log
+    cnt = event.all_logentries().count()
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "date_from": "2018-12-27T10:00:00Z",
+            "date_to": "2018-12-28T10:00:00Z",
+            "currency": "DKK",
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert cnt == event.all_logentries().count()
+
+
+@pytest.mark.django_db
+def test_event_update_plugins_validation(token_client, organizer, event, item, meta_prop):
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "plugins": ["pretix.plugins.paypal2", "unknown"]
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.data == {"plugins": ["Unknown plugin: 'unknown'."]}
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "plugins": ["pretix.plugins.paypal2", "tests.testdummyhidden"]
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.data == {"plugins": ["Unknown plugin: 'tests.testdummyhidden'."]}
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "plugins": ["pretix.plugins.paypal2", "tests.testdummyrestricted"]
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.data == {"plugins": ["Restricted plugin: 'tests.testdummyrestricted'."]}
+
+    organizer.settings.allowed_restricted_plugins = ["tests.testdummyrestricted"]
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "plugins": ["pretix.plugins.paypal2", "tests.testdummyrestricted"]
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "plugins": ["tests.testdummyorga"]
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.data == {"plugins": ["Plugin cannot be enabled on this level: 'tests.testdummyorga'."]}
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "plugins": ["tests.testdummyhybrid"]
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.data == {"plugins": ["Plugin should be enabled on organizer level first: 'tests.testdummyhybrid'."]}
+
+    with scopes_disabled():
+        organizer.enable_plugin("tests.testdummyhybrid")
+        organizer.save()
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "plugins": ["tests.testdummyhybrid"]
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "all_sales_channels": False,
+            "limit_sales_channels": ["web"],
+            "sales_channels": ["bar"],
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.content.decode() == ('{"limit_sales_channels":["If \'limit_sales_channels\' is set, the legacy '
+                                     'attribute \'sales_channels\' must not be set or set to the same list."]}')
 
 
 @pytest.mark.django_db
@@ -678,6 +1068,99 @@ def test_event_update_live_free_product(token_client, organizer, event, free_ite
         format='json'
     )
     assert resp.status_code == 200
+
+
+@pytest.mark.django_db
+def test_event_update_live_required_meta_data_missing(token_client, organizer, event, free_quota):
+    organizer.meta_properties.create(name="required_prop", required=True)
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "live": True
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert list(resp.data.keys()) == ['live']
+    assert len(resp.data['live']) == 1
+    assert '<a' not in resp.data['live'][0]
+    assert 'required_prop' in resp.data['live'][0]
+    event.refresh_from_db()
+    assert not event.live
+
+
+@pytest.mark.django_db
+def test_event_update_live_required_meta_data_set_in_same_request(token_client, organizer, event, free_quota):
+    organizer.meta_properties.create(name="required_prop", required=True)
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "live": True,
+            "meta_data": {
+                "type": "Conference",
+                "required_prop": "set",
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert resp.data['live'] is True
+    event.refresh_from_db()
+    assert event.live
+    with scopes_disabled():
+        assert event.meta_values.filter(property__name="required_prop", value="set").exists()
+
+
+@pytest.mark.django_db
+def test_live_event_update_removing_required_meta_data(token_client, organizer, event, free_quota):
+    prop = organizer.meta_properties.create(name="required_prop", required=True)
+    with scopes_disabled():
+        event.meta_values.create(property=prop, value="set")
+    event.live = True
+    event.save()
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "meta_data": {
+                "type": "Conference",
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert list(resp.data.keys()) == ['live']
+    assert 'required_prop' in resp.data['live'][0]
+
+    event.refresh_from_db()
+    assert event.live
+    with scopes_disabled():
+        assert event.meta_values.filter(property__name="required_prop", value="set").exists()
+
+
+@pytest.mark.django_db
+def test_live_event_update_removing_required_meta_data_while_going_offline(token_client, organizer, event, free_quota):
+    prop = organizer.meta_properties.create(name="required_prop", required=True)
+    with scopes_disabled():
+        event.meta_values.create(property=prop, value="set")
+    event.live = True
+    event.save()
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "live": False,
+            "meta_data": {
+                "type": "Conference",
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    event.refresh_from_db()
+    assert not event.live
+    with scopes_disabled():
+        assert not event.meta_values.filter(property__name="required_prop").exists()
 
 
 @pytest.mark.django_db
@@ -809,6 +1292,10 @@ def seatingplan(event, organizer, item):
 
 @pytest.mark.django_db
 def test_event_update_seating(token_client, organizer, event, item, seatingplan):
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/seats/'.format(organizer.slug, event.slug))
+    assert resp.status_code == 200
+    assert len(resp.data['results']) == 0
+
     resp = token_client.patch(
         '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
         {
@@ -828,6 +1315,27 @@ def test_event_update_seating(token_client, organizer, event, item, seatingplan)
         m = event.seat_category_mappings.get()
     assert m.layout_category == 'Stalls'
     assert m.product == item
+
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/seats/'.format(organizer.slug, event.slug))
+    assert resp.status_code == 200
+    assert len(resp.data['results']) == 3
+    assert all(seat['product'] == item.pk for seat in resp.data['results'])
+
+
+@pytest.mark.django_db
+def test_event_no_create_or_delete_seats(token_client, organizer, event, item, seatingplan):
+    resp = token_client.post(
+        '/api/v1/organizers/{}/events/{}/seats/'.format(organizer.slug, event.slug),
+        {
+            'blocked': False,
+        },
+        format='json'
+    )
+    assert resp.status_code == 405
+    resp = token_client.delete(
+        '/api/v1/organizers/{}/events/{}/seats/3/'.format(organizer.slug, event.slug),
+    )
+    assert resp.status_code == 405
 
 
 @pytest.mark.django_db
@@ -957,6 +1465,41 @@ def test_remove_seating_forbidden(token_client, organizer, event, item, seatingp
 
 
 @pytest.mark.django_db
+def test_remove_seating_canceled_seat(token_client, organizer, event, item, seatingplan, order_position):
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "seating_plan": seatingplan.pk,
+            "seat_category_mapping": {
+                "Stalls": item.pk
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    event.refresh_from_db()
+    assert event.seating_plan == seatingplan
+    with scopes_disabled():
+        assert event.seats.count() == 3
+        assert event.seat_category_mappings.count() == 1
+
+        order_position.seat = event.seats.first()
+        order_position.canceled = True
+        order_position.save()
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "seating_plan": None
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    order_position.refresh_from_db()
+    assert order_position.seat is None
+
+
+@pytest.mark.django_db
 def test_no_seating_for_series(token_client, organizer, event, item, seatingplan, order_position):
     event.has_subevents = True
     event.save()
@@ -1044,102 +1587,212 @@ def test_event_create_with_seating_maps(token_client, organizer, event, meta_pro
 @pytest.mark.django_db
 def test_get_event_settings(token_client, organizer, event):
     event.settings.imprint_url = "https://example.org"
+    event.settings.contact_url = "https://example.org/contact"
     resp = token_client.get(
         '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
     )
     assert resp.status_code == 200
-    assert resp.data['imprint_url'] == "https://example.org"
+    assert resp.data['imprint_url'] == {
+        "en": "https://example.org",
+    }
+    assert resp.data['contact_url'] == {
+        "en": "https://example.org/contact",
+    }
+    assert resp.data['seating_allow_blocked_seats_for_channel'] == []
 
     resp = token_client.get(
         '/api/v1/organizers/{}/events/{}/settings/?explain=true'.format(organizer.slug, event.slug),
     )
     assert resp.status_code == 200
     assert resp.data['imprint_url'] == {
-        "value": "https://example.org",
+        "value": {
+            "en": "https://example.org",
+        },
         "label": "Imprint URL",
         "help_text": "This should point e.g. to a part of your website that has your contact details and legal "
-                     "information."
+                     "information.",
+        "readonly": False,
     }
 
 
 @pytest.mark.django_db
-def test_patch_event_settings(token_client, organizer, event):
-    with mocker_context() as mocker:
-        mocked = mocker.patch('pretix.presale.style.regenerate_css.apply_async')
-        organizer.settings.imprint_url = 'https://example.org'
-        resp = token_client.patch(
-            '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
-            {
-                'imprint_url': 'https://example.com'
-            },
-            format='json'
-        )
-        assert resp.status_code == 200
-        assert resp.data['imprint_url'] == "https://example.com"
-        event.settings.flush()
-        assert event.settings.imprint_url == 'https://example.com'
-        mocked.assert_not_called()
+def test_patch_event_settings(token_client, organizer, event, team):
+    team.all_event_permissions = False
+    team.limit_event_permissions = {
+        "event.settings.general:write": True,
+        "event.settings.tax:write": True,
+    }
+    team.save()
 
-        resp = token_client.patch(
-            '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
-            {
-                'primary_color': '#ff0000'
-            },
-            format='json'
-        )
-        assert resp.status_code == 200
-        mocked.assert_any_call(args=(event.pk,))
+    organizer.settings.imprint_url = 'https://example.org'
+    organizer.settings.contact_url = 'https://example.org/contact'
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'contact_url': 'https://example.com/contact',
+            'imprint_url': 'https://example.com',
+            'confirm_texts': [
+                {
+                    'de': 'Ich bin mit den AGB einverstanden.'
+                }
+            ],
+            'reusable_media_active': True,  # readonly, ignored
+            'seating_allow_blocked_seats_for_channel': ['web']
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert resp.data['contact_url'] == {
+        "en": "https://example.com/contact",
+    }
+    assert resp.data['imprint_url'] == {
+        "en": "https://example.com",
+    }
+    assert resp.data['seating_allow_blocked_seats_for_channel'] == ['web']
+    assert not resp.data['reusable_media_active']
+    event.settings.flush()
+    assert event.settings.contact_url == 'https://example.com/contact'
+    assert event.settings.imprint_url == 'https://example.com'
+    assert event.settings.seating_allow_blocked_seats_for_channel == ['web']
+    assert not event.settings.reusable_media_active
+    assert event.all_logentries().filter(action_type="pretix.event.settings").count() == 1
 
-        resp = token_client.patch(
-            '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
-            {
-                'imprint_url': None,
-            },
-            format='json'
-        )
-        assert resp.status_code == 200
-        assert resp.data['imprint_url'] == "https://example.org"
-        event.settings.flush()
-        assert event.settings.imprint_url == 'https://example.org'
+    # The same settings again do not create a new log entry
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'contact_url': 'https://example.com/contact',
+            'imprint_url': 'https://example.com',
+            'confirm_texts': [
+                {
+                    'de': 'Ich bin mit den AGB einverstanden.'
+                }
+            ],
+            'reusable_media_active': True,  # readonly, ignored
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert event.all_logentries().filter(action_type="pretix.event.settings").count() == 1
 
-        resp = token_client.put(
-            '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
-            {
-                'imprint_url': 'invalid'
-            },
-            format='json'
-        )
-        assert resp.status_code == 405
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'primary_color': '#ff0000',
+            'theme_color_background': '#ff0000',
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    event.settings.flush()
+    assert event.settings.primary_color == '#ff0000'
+    assert event.all_logentries().filter(action_type="pretix.event.settings").count() == 2
 
-        locales = event.settings.locales
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'primary_color': None,
+            'theme_color_background': None,
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    event.settings.flush()
+    assert event.settings.primary_color != '#ff0000'
+    assert 'primary_color' not in event.settings._cache()
 
-        resp = token_client.patch(
-            '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
-            {
-                'locales': event.settings.locales + ['de', 'de-informal'],
-            },
-            format='json'
-        )
-        assert resp.status_code == 200
-        assert set(resp.data['locales']) == set(locales + ['de', 'de-informal'])
-        event.settings.flush()
-        assert set(event.settings.locales) == set(locales + ['de', 'de-informal'])
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'contact_url': None,
+            'imprint_url': None,
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert resp.data['contact_url'] == {
+        "en": "https://example.org/contact",
+    }
+    assert resp.data['imprint_url'] == {
+        "en": "https://example.org",
+    }
+    event.settings.flush()
+    assert event.settings.contact_url == 'https://example.org/contact'
+    assert event.settings.imprint_url == 'https://example.org'
 
-        resp = token_client.patch(
-            '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
-            {
-                'locales': locales,
-            },
-            format='json'
-        )
-        assert resp.status_code == 200
-        assert set(resp.data['locales']) == set(locales)
-        event.settings.flush()
-        assert set(event.settings.locales) == set(locales)
+    resp = token_client.put(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'imprint_url': 'invalid'
+        },
+        format='json'
+    )
+    assert resp.status_code == 405
+
+    locales = event.settings.locales
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'locales': event.settings.locales + ['de', 'de-informal'],
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert set(resp.data['locales']) == set(locales + ['de', 'de-informal'])
+    event.settings.flush()
+    assert set(event.settings.locales) == set(locales + ['de', 'de-informal'])
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'locales': locales,
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert set(resp.data['locales']) == set(locales)
+    event.settings.flush()
+    assert set(event.settings.locales) == set(locales)
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'display_net_prices': True,
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    event.settings.flush()
+    assert event.settings.display_net_prices
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'invoice_address_asked': False,
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.data == {
+        'invoice_address_asked': ['Setting this field requires permission event.settings.invoicing:write']
+    }
 
 
 @pytest.mark.django_db
 def test_patch_event_settings_validation(token_client, organizer, event):
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'contact_url': 'invalid',
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.data == {
+        'contact_url': ['Enter a valid URL.']
+    }
+
     resp = token_client.patch(
         '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
         {
@@ -1178,6 +1831,18 @@ def test_patch_event_settings_validation(token_client, organizer, event):
         'cancel_allow_user_until': ['Invalid relative date']
     }
 
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
+        {
+            'seating_allow_blocked_seats_for_channel': ['lolnope'],
+        },
+        format='json'
+    )
+    assert resp.status_code == 400
+    assert resp.data == {
+        'seating_allow_blocked_seats_for_channel': ['The value \"lolnope\" is not a valid sales channel.']
+    }
+
 
 @pytest.mark.django_db
 def test_patch_event_settings_file(token_client, organizer, event):
@@ -1185,7 +1850,7 @@ def test_patch_event_settings_file(token_client, organizer, event):
         '/api/v1/upload',
         data={
             'media_type': 'image/png',
-            'file': ContentFile('file.png', 'invalid png content')
+            'file': ContentFile(SAMPLE_PNG)
         },
         format='upload',
         HTTP_CONTENT_DISPOSITION='attachment; filename="file.png"',
@@ -1197,7 +1862,7 @@ def test_patch_event_settings_file(token_client, organizer, event):
         '/api/v1/upload',
         data={
             'media_type': 'application/pdf',
-            'file': ContentFile('file.pdf', 'invalid pdf content')
+            'file': ContentFile('invalid pdf content')
         },
         format='upload',
         HTTP_CONTENT_DISPOSITION='attachment; filename="file.pdf"',
@@ -1238,6 +1903,7 @@ def test_patch_event_settings_file(token_client, organizer, event):
     )
     assert resp.status_code == 200
     assert resp.data['logo_image'].startswith('http')
+    assert '/pub/' in resp.data['logo_image']
 
     resp = token_client.patch(
         '/api/v1/organizers/{}/events/{}/settings/'.format(organizer.slug, event.slug),
@@ -1248,3 +1914,180 @@ def test_patch_event_settings_file(token_client, organizer, event):
     )
     assert resp.status_code == 200
     assert resp.data['logo_image'] is None
+
+
+@pytest.mark.django_db
+def test_event_block_unblock_seat(token_client, organizer, event, seatingplan, item):
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "seating_plan": seatingplan.pk,
+            "seat_category_mapping": {
+                "Stalls": item.pk
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    event.refresh_from_db()
+
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/seats/'.format(organizer.slug, event.slug))
+    assert resp.status_code == 200
+
+    seat_id = resp.data['results'][0]['id']
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/seats/{}/'.format(organizer.slug, event.slug, seat_id),
+        {
+            "blocked": True,
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert resp.data['blocked'] is True
+
+    resp = token_client.get('/api/v1/organizers/{}/events/{}/seats/{}/'
+                            '?expand=orderposition&expand=cartposition&expand=voucher'
+                            .format(organizer.slug, event.slug, seat_id))
+    assert resp.status_code == 200
+    assert resp.data['blocked'] is True
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/seats/{}/'.format(organizer.slug, event.slug, seat_id),
+        {
+            "blocked": False,
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    assert resp.data['blocked'] is False
+
+
+@pytest.mark.django_db
+def test_event_block_unblock_seat_bulk(token_client, organizer, event, seatingplan, item):
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "seating_plan": seatingplan.pk,
+            "seat_category_mapping": {
+                "Stalls": item.pk
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    event.refresh_from_db()
+
+    s1 = event.seats.first()
+    s2 = event.seats.last()
+    resp = token_client.post(
+        '/api/v1/organizers/{}/events/{}/seats/bulk_block/'.format(organizer.slug, event.slug),
+        {
+            "ids": [s1.pk, s2.pk],
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+
+    s1.refresh_from_db()
+    s2.refresh_from_db()
+    assert s1.blocked
+    assert s2.blocked
+
+    resp = token_client.post(
+        '/api/v1/organizers/{}/events/{}/seats/bulk_unblock/'.format(organizer.slug, event.slug),
+        {
+            "ids": [s1.pk, s2.pk],
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+
+    s1.refresh_from_db()
+    s2.refresh_from_db()
+    assert not s1.blocked
+    assert not s2.blocked
+
+    resp = token_client.post(
+        '/api/v1/organizers/{}/events/{}/seats/bulk_block/'.format(organizer.slug, event.slug),
+        {
+            "seat_guids": [s1.seat_guid, s2.seat_guid],
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+
+    s1.refresh_from_db()
+    s2.refresh_from_db()
+    assert s1.blocked
+    assert s2.blocked
+
+    resp = token_client.post(
+        '/api/v1/organizers/{}/events/{}/seats/bulk_unblock/'.format(organizer.slug, event.slug),
+        {
+            "seat_guids": [s1.seat_guid, s2.seat_guid],
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+
+    s1.refresh_from_db()
+    s2.refresh_from_db()
+    assert not s1.blocked
+    assert not s2.blocked
+
+
+@pytest.mark.django_db(transaction=True)
+def test_event_expand_seat_filter_and_querycount(token_client, organizer, event, seatingplan, item):
+    event.settings.seating_minimal_distance = 2
+
+    resp = token_client.patch(
+        '/api/v1/organizers/{}/events/{}/'.format(organizer.slug, event.slug),
+        {
+            "seating_plan": seatingplan.pk,
+            "seat_category_mapping": {
+                "Stalls": item.pk
+            }
+        },
+        format='json'
+    )
+    assert resp.status_code == 200
+    event.refresh_from_db()
+
+    with assert_num_queries(10):
+        resp = token_client.get('/api/v1/organizers/{}/events/{}/seats/'
+                                '?expand=orderposition&expand=cartposition&expand=voucher&is_available=true'
+                                .format(organizer.slug, event.slug))
+        assert resp.status_code == 200
+        assert len(resp.data['results']) == 3
+
+    with scope(organizer=organizer):
+        v0 = event.vouchers.create(item=item, seat=event.seats.get(seat_guid='0-0'))
+
+    with assert_num_queries(12):
+        resp = token_client.get('/api/v1/organizers/{}/events/{}/seats/'
+                                '?expand=orderposition&expand=cartposition&expand=voucher&is_available=false'
+                                .format(organizer.slug, event.slug))
+        assert resp.status_code == 200
+        assert len(resp.data['results']) == 1
+        assert resp.data['results'][0]['voucher']['id'] == v0.pk
+
+    with assert_num_queries(10):
+        resp = token_client.get('/api/v1/organizers/{}/events/{}/seats/'
+                                '?expand=orderposition&expand=cartposition&expand=voucher&is_available=true'
+                                .format(organizer.slug, event.slug))
+        assert resp.status_code == 200
+        assert len(resp.data['results']) == 2
+
+    with scope(organizer=organizer):
+        v1 = event.vouchers.create(item=item, seat=event.seats.get(seat_guid='0-1'))
+        v2 = event.vouchers.create(item=item, seat=event.seats.get(seat_guid='0-2'))
+
+    with assert_num_queries(14):
+        resp = token_client.get('/api/v1/organizers/{}/events/{}/seats/'
+                                '?expand=orderposition&expand=cartposition&expand=voucher&is_available=false'
+                                .format(organizer.slug, event.slug))
+        assert resp.status_code == 200
+        assert len(resp.data['results']) == 3
+        assert resp.data['results'][0]['voucher']['id'] == v0.pk
+        assert resp.data['results'][1]['voucher']['id'] == v1.pk
+        assert resp.data['results'][2]['voucher']['id'] == v2.pk

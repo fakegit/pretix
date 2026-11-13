@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -20,6 +20,8 @@
 # <https://www.gnu.org/licenses/>.
 #
 from django import template
+from django.utils.html import escape
+from django.utils.safestring import mark_safe
 from phonenumber_field.phonenumber import PhoneNumber
 from phonenumbers import NumberParseException
 
@@ -27,17 +29,20 @@ register = template.Library()
 
 
 @register.filter("phone_format")
-def phone_format(value: str):
+def phone_format(value: str, html=True):
     if not value:
-        return ""
-
-    if isinstance(value, str):
+        v = ""
+    elif isinstance(value, str):
         try:
-            return PhoneNumber.from_string(value).as_international
+            v = PhoneNumber.from_string(value).as_international
         except NumberParseException:
-            return value
+            v = value
+    elif isinstance(value, PhoneNumber) and value.national_number:
+        v = value.as_international
+    else:
+        v = str(value)
 
-    if isinstance(value, PhoneNumber) and value.national_number:
-        return value.as_international
+    if html:
+        v = mark_safe('<span class="force-ltr">' + escape(v) + '</span>')
 
-    return str(value)
+    return v

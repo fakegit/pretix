@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -36,4 +36,4 @@ def get_source(request):
         n = d.get('source_notice', '')
         return render(request, 'source.html', {'notice': n})
     else:
-        raise Http404(f'Not used under AGPL ({d["base_license"]})')
+        raise Http404(f'Not used under AGPL ({d.get("base_license")})')

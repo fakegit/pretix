@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -26,7 +26,7 @@ from django.db.models import Q
 from django.utils.timezone import now
 from django_filters.rest_framework import DjangoFilterBackend, FilterSet
 from rest_framework import serializers, status, viewsets
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.mixins import CreateModelMixin
 from rest_framework.response import Response
 
@@ -46,7 +46,7 @@ class BankTransactionSerializer(serializers.ModelSerializer):
     class Meta:
         model = BankTransaction
         fields = ('state', 'message', 'checksum', 'payer', 'reference', 'amount', 'date', 'order',
-                  'comment', 'iban', 'bic')
+                  'comment', 'iban', 'bic', 'currency', 'external_id')
 
 
 class BankImportJobSerializer(serializers.ModelSerializer):
@@ -57,13 +57,25 @@ class BankImportJobSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = BankImportJob
-        fields = ('id', 'event', 'created', 'state', 'transactions')
+        fields = ('id', 'event', 'created', 'state', 'transactions', 'currency')
 
     def __init__(self, *args, **kwargs):
         self.organizer = kwargs.pop('organizer')
         self.fields['event'].read_only = False
         self.fields['event'].queryset = self.organizer.events.all()
         super().__init__(*args, **kwargs)
+
+    def validate(self, attrs):
+        if not attrs.get("event"):
+            if "currency" not in attrs:
+                currencies = list(
+                    self.organizer.events.order_by('currency').values_list('currency', flat=True).distinct()
+                )
+                if len(currencies) != 1:
+                    raise ValidationError({"currency": ["Currency is ambiguous, please set explicitly."]})
+                else:
+                    attrs["currency"] = currencies[0]
+        return attrs
 
     def create(self, validated_data):
         trans_data = validated_data.pop('transactions')
@@ -85,7 +97,6 @@ class BankImportJobViewSet(CreateModelMixin, viewsets.ReadOnlyModelViewSet):
     queryset = BankImportJob.objects.none()
     filter_backends = (DjangoFilterBackend,)
     filterset_class = JobFilter
-    permission = 'can_view_orders'
 
     def get_queryset(self):
         return BankImportJob.objects.filter(organizer=self.request.organizer)
@@ -93,14 +104,35 @@ class BankImportJobViewSet(CreateModelMixin, viewsets.ReadOnlyModelViewSet):
     def perform_create(self, serializer):
         return serializer.save()
 
+    def retrieve(self, request, *args, **kwargs):
+        perm_holder = (request.auth if isinstance(request.auth, (Device, TeamAPIToken)) else request.user)
+        has_any_event_perm = perm_holder.get_events_with_permission(
+            "event.orders:read", request=request
+        ).filter(organizer=request.organizer).exists()
+        if not has_any_event_perm:
+            raise PermissionDenied('Invalid set of permissions')
+        return super().retrieve(request, *args, **kwargs)
+
+    def list(self, request, *args, **kwargs):
+        perm_holder = (request.auth if isinstance(request.auth, (Device, TeamAPIToken)) else request.user)
+        has_any_event_perm = perm_holder.get_events_with_permission(
+            "event.orders:read", request=request
+        ).filter(organizer=request.organizer).exists()
+        if not has_any_event_perm:
+            raise PermissionDenied('Invalid set of permissions')
+        return super().list(request, *args, **kwargs)
+
     def create(self, request, *args, **kwargs):
         perm_holder = (request.auth if isinstance(request.auth, (Device, TeamAPIToken)) else request.user)
-        if not perm_holder.has_organizer_permission(request.organizer, 'can_change_orders'):
+        has_any_event_perm = perm_holder.get_events_with_permission(
+            "event.orders:write", request=request
+        ).filter(organizer=request.organizer).exists()
+        if not has_any_event_perm:
             raise PermissionDenied('Invalid set of permissions')
 
         if BankImportJob.objects.filter(Q(organizer=request.organizer)).filter(
             state=BankImportJob.STATE_RUNNING,
-            created__lte=now() - timedelta(minutes=30)  # safety timeout
+            created__gte=now() - timedelta(minutes=30)  # safety timeout
         ).exists():
             return Response({'error': ['A job is currently running.']}, status=status.HTTP_409_CONFLICT)
 

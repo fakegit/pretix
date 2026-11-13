@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,6 +19,7 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import datetime
 import json
 from collections import OrderedDict
 from decimal import Decimal
@@ -28,37 +29,57 @@ from django.core.files.uploadedfile import UploadedFile
 from django.db import IntegrityError
 from django.db.models import Prefetch, QuerySet
 from django.utils.functional import cached_property
+from django.utils.timezone import make_aware
 
 from pretix.base.forms.questions import (
-    BaseInvoiceAddressForm, BaseInvoiceNameForm, BaseQuestionsForm,
+    BaseInvoiceAddressForm, BaseInvoiceNameForm, OrderLevelQuestionsForm,
+    TicketLevelQuestionsForm,
 )
 from pretix.base.models import (
     CartPosition, InvoiceAddress, OrderPosition, Question, QuestionAnswer,
     QuestionOption,
 )
+from pretix.base.models.customers import AttendeeProfile
+from pretix.base.models.orders import CheckoutSession, Order
 from pretix.presale.signals import contact_form_fields_overrides
 
 
 class BaseQuestionsViewMixin:
-    form_class = BaseQuestionsForm
+    order_form_class = OrderLevelQuestionsForm
+    orderposition_form_class = TicketLevelQuestionsForm
     all_optional = False
-
-    @staticmethod
-    def _keyfunc(pos):
-        # Sort addons after the item they are an addon to
-        if isinstance(pos, OrderPosition):
-            i = pos.addon_to.positionid if pos.addon_to else pos.positionid
-        else:
-            i = pos.addon_to.pk if pos.addon_to else pos.pk
-        addon_penalty = 1 if pos.addon_to else 0
-        return i, addon_penalty, pos.pk
 
     @cached_property
     def _positions_for_questions(self):
         raise NotImplementedError()
 
-    def get_question_override_sets(self, position):
+    def get_question_override_sets(self, position, index):
         return []
+
+    def question_form_kwargs(self, cr):
+        return {}
+
+    @property
+    def order_question_container(self):
+        raise NotImplementedError()
+
+    @cached_property
+    def order_questions_form(self):
+        container = self.order_question_container
+        if container is None:
+            return None
+        kwargs = {}  # self.question_form_kwargs(cr)
+        form = self.order_form_class(
+            event=self.request.event,
+            prefix='order',
+            request=self.request,
+            container=container,
+            all_optional=self.all_optional,
+            data=(self.request.POST if self.request.method == 'POST' else None),
+            files=(self.request.FILES if self.request.method == 'POST' else None),
+            **kwargs
+        )
+        return form
 
     @cached_property
     def forms(self):
@@ -68,20 +89,26 @@ class BaseQuestionsViewMixin:
         submitted at once.
         """
         formlist = []
-        for cr in self._positions_for_questions:
+        for idx, cr in enumerate(self._positions_for_questions):
             cartpos = cr if isinstance(cr, CartPosition) else None
             orderpos = cr if isinstance(cr, OrderPosition) else None
-            form = self.form_class(event=self.request.event,
-                                   prefix=cr.id,
-                                   cartpos=cartpos,
-                                   orderpos=orderpos,
-                                   all_optional=self.all_optional,
-                                   data=(self.request.POST if self.request.method == 'POST' else None),
-                                   files=(self.request.FILES if self.request.method == 'POST' else None))
+
+            kwargs = self.question_form_kwargs(cr)
+            form = self.orderposition_form_class(
+                event=self.request.event,
+                prefix=cr.id,
+                request=self.request,
+                cartpos=cartpos,
+                orderpos=orderpos,
+                all_optional=self.all_optional,
+                data=(self.request.POST if self.request.method == 'POST' else None),
+                files=(self.request.FILES if self.request.method == 'POST' else None),
+                **kwargs
+            )
             form.pos = cartpos or orderpos
             form.show_copy_answers_to_addon_button = form.pos.addon_to and (
                 set(form.pos.addon_to.item.questions.all()) & set(form.pos.item.questions.all()) or
-                (form.pos.addon_to.item.admission and form.pos.item.admission and (
+                (form.pos.addon_to.item.ask_attendee_data and form.pos.item.ask_attendee_data and (
                     self.request.event.settings.attendee_names_asked or
                     self.request.event.settings.attendee_emails_asked or
                     self.request.event.settings.attendee_company_asked or
@@ -89,21 +116,27 @@ class BaseQuestionsViewMixin:
                 ))
             )
 
-            override_sets = self.get_question_override_sets(cr)
+            override_sets = self.get_question_override_sets(cr, idx)
             for overrides in override_sets:
                 for question_name, question_field in form.fields.items():
                     if hasattr(question_field, 'question'):
-                        if question_field.question.identifier in overrides:
-                            if 'initial' in overrides[question_field.question.identifier]:
-                                question_field.initial = overrides[question_field.question.identifier]['initial']
-                            if 'disabled' in overrides[question_field.question.identifier]:
-                                question_field.disabled = overrides[question_field.question.identifier]['disabled']
+                        src = overrides.get(question_field.question.identifier)
                     else:
-                        if question_name in overrides:
-                            if 'initial' in overrides[question_name]:
-                                question_field.initial = overrides[question_name]['initial']
-                            if 'disabled' in overrides[question_name]:
-                                question_field.disabled = overrides[question_name]['disabled']
+                        src = overrides.get(question_name)
+                    if not src:
+                        continue
+
+                    if 'disabled' in src:
+                        question_field.disabled = src['disabled']
+                    if 'initial' in src:
+                        if question_field.disabled:
+                            question_field.initial = src['initial']
+                        else:
+                            question_field.initial = getattr(question_field, 'initial', None) or src['initial']
+                    if 'validators' in src:
+                        question_field.validators += src['validators']
+                    if 'label' in src:
+                        question_field.label = src['label']
 
             if len(form.fields) > 0:
                 formlist.append(form)
@@ -126,31 +159,72 @@ class BaseQuestionsViewMixin:
 
     def save(self):
         failed = False
+        if self.order_questions_form:
+            if not self.order_questions_form.is_valid():
+                failed = True
+            else:
+                checkoutsession = self.order_question_container if isinstance(self.order_question_container, CheckoutSession) else None
+                order = self.order_question_container if isinstance(self.order_question_container, Order) else None
+                for k, v in self.order_questions_form.cleaned_data.items():
+                    if k.startswith('question_'):
+                        field = self.order_questions_form.fields[k]
+                        if hasattr(field, 'answer'):
+                            # We already have a cached answer object, so we don't
+                            # have to create a new one
+                            if v == '' or v is None or (isinstance(field, forms.FileField) and v is False) \
+                                    or (isinstance(v, QuerySet) and not v.exists()):
+                                if field.answer.file:
+                                    field.answer.file.delete()
+                                field.answer.delete()
+                            else:
+                                self._save_to_answer(field, field.answer, v)
+                                field.answer.save()
+                        elif v != '' and v is not None:
+                            self._upsert_answer(
+                                field, v,
+                                checkoutsession=checkoutsession,
+                                order=order,
+                                question=field.question,
+                            )
+
         for form in self.forms:
             meta_info = form.pos.meta_info_data
+            cartposition = form.pos if isinstance(form.pos, CartPosition) else None
+            orderposition = form.pos if isinstance(form.pos, OrderPosition) else None
             # Every form represents a CartPosition or OrderPosition with questions attached
             if not form.is_valid():
                 failed = True
             else:
+                if form.cleaned_data.get('saved_id'):
+                    prof = AttendeeProfile.objects.filter(
+                        customer=self.cart_customer, pk=form.cleaned_data.get('saved_id')
+                    ).first() or AttendeeProfile(customer=getattr(self, 'cart_customer', None))
+                else:
+                    prof = AttendeeProfile(customer=getattr(self, 'cart_customer', None))
+
                 # This form was correctly filled, so we store the data as
                 # answers to the questions / in the CartPosition object
                 for k, v in form.cleaned_data.items():
-                    if k == 'attendee_name_parts':
+                    if k in ('save', 'saved_id'):
+                        continue
+                    elif k == 'attendee_name_parts':
                         form.pos.attendee_name_parts = v if v else None
-                    elif k == 'attendee_email':
-                        form.pos.attendee_email = v if v != '' else None
-                    elif k == 'company':
-                        form.pos.company = v if v != '' else None
-                    elif k == 'street':
-                        form.pos.street = v if v != '' else None
-                    elif k == 'zipcode':
-                        form.pos.zipcode = v if v != '' else None
-                    elif k == 'city':
-                        form.pos.city = v if v != '' else None
-                    elif k == 'country':
-                        form.pos.country = v if v != '' else None
-                    elif k == 'state':
-                        form.pos.state = v if v != '' else None
+                        prof.attendee_name_parts = form.pos.attendee_name_parts
+                        prof.attendee_name_cached = form.pos.attendee_name
+                    elif k in ('attendee_email', 'company', 'street', 'zipcode', 'city', 'country', 'state'):
+                        v = v if v != '' else None
+                        setattr(form.pos, k, v)
+                        setattr(prof, k, v)
+                    elif k == 'requested_valid_from':
+                        if isinstance(v, datetime.datetime):
+                            form.pos.requested_valid_from = v
+                        elif isinstance(v, datetime.date):
+                            form.pos.requested_valid_from = make_aware(datetime.datetime.combine(
+                                v,
+                                datetime.time(hour=0, minute=0, second=0, microsecond=0)
+                            ), self.request.event.timezone)
+                        else:
+                            form.pos.requested_valid_from = None
                     elif k.startswith('question_'):
                         field = form.fields[k]
                         if hasattr(field, 'answer'):
@@ -164,31 +238,23 @@ class BaseQuestionsViewMixin:
                             else:
                                 self._save_to_answer(field, field.answer, v)
                                 field.answer.save()
+
+                                answer_dict = self._build_answer_dict(field, field.answer, k)
+                                prof.store_answer(answer_dict)
                         elif v != '' and v is not None:
-                            answer = QuestionAnswer(
-                                cartposition=(form.pos if isinstance(form.pos, CartPosition) else None),
-                                orderposition=(form.pos if isinstance(form.pos, OrderPosition) else None),
+                            answer = self._upsert_answer(
+                                field, v,
+                                cartposition=cartposition,
+                                orderposition=orderposition,
                                 question=field.question,
                             )
-                            try:
-                                self._save_to_answer(field, answer, v)
-                                answer.save()
-                            except IntegrityError:
-                                # Since we prefill ``field.answer`` at form creation time, there's a possible race condition
-                                # here if the users submits their save request a second time while the first one is still running,
-                                # thus leading to duplicate QuestionAnswer objects. Since Django doesn't support UPSERT, the "proper"
-                                # fix would be a transaction with select_for_update(), or at least fetching using get_or_create here
-                                # again. However, both of these approaches have a significant performance overhead for *all* requests,
-                                # while the issue happens very very rarely. So we opt for just catching the error and retrying properly.
-                                answer = QuestionAnswer.objects.get(
-                                    cartposition=(form.pos if isinstance(form.pos, CartPosition) else None),
-                                    orderposition=(form.pos if isinstance(form.pos, OrderPosition) else None),
-                                    question=field.question,
-                                )
-                                self._save_to_answer(field, answer, v)
-                                answer.save()
+
+                            answer_dict = self._build_answer_dict(field, answer, k)
+                            prof.store_answer(answer_dict)
 
                     else:
+                        field = form.fields[k]
+
                         meta_info.setdefault('question_form_data', {})
                         if v is None:
                             if k in meta_info['question_form_data']:
@@ -196,9 +262,40 @@ class BaseQuestionsViewMixin:
                         else:
                             meta_info['question_form_data'][k] = v
 
+                        answer_dict = {
+                            'field_name': k,
+                            'field_label': str(field.label),
+                            'value': str(v),
+                            'question_type': None,
+                            'question_identifier': None,
+                        }
+                        prof.store_answer(answer_dict)
+
             form.pos.meta_info = json.dumps(meta_info)
             form.pos.save()
+
+            if form.cleaned_data.get('save') and not failed:
+                prof.save()
+                self.cart_session[f'saved_attendee_profile_{form.pos.pk}'] = prof.pk
+
         return not failed
+
+    def _upsert_answer(self, field, v, **answer_kwargs):
+        answer = QuestionAnswer(**answer_kwargs)
+        try:
+            self._save_to_answer(field, answer, v)
+            answer.save()
+        except IntegrityError:
+            # Since we prefill ``field.answer`` at form creation time, there's a possible race condition
+            # here if the users submits their save request a second time while the first one is still running,
+            # thus leading to duplicate QuestionAnswer objects. Since Django doesn't support UPSERT, the "proper"
+            # fix would be a transaction with select_for_update(), or at least fetching using get_or_create here
+            # again. However, both of these approaches have a significant performance overhead for *all* requests,
+            # while the issue happens very very rarely. So we opt for just catching the error and retrying properly.
+            answer = QuestionAnswer.objects.get(**answer_kwargs)
+            self._save_to_answer(field, answer, v)
+            answer.save()
+        return answer
 
     def _save_to_answer(self, field, answer, value):
         if isinstance(field, forms.ModelMultipleChoiceField):
@@ -223,6 +320,21 @@ class BaseQuestionsViewMixin:
         else:
             answer.answer = value
 
+    def _build_answer_dict(self, field, answer, k):
+        if isinstance(field, forms.ModelMultipleChoiceField) or isinstance(field, forms.ModelChoiceField):
+            answer_value = {o.identifier: str(o) for o in answer.options.all()}
+        elif isinstance(field, forms.BooleanField):
+            answer_value = bool(answer.answer)
+        else:
+            answer_value = str(answer.answer)
+        return {
+            'field_name': k,
+            'field_label': str(field.label),
+            'value': answer_value,
+            'question_type': field.question.type,
+            'question_identifier': field.question.identifier,
+        }
+
 
 class OrderQuestionsViewMixin(BaseQuestionsViewMixin):
     invoice_form_class = BaseInvoiceAddressForm
@@ -238,7 +350,7 @@ class OrderQuestionsViewMixin(BaseQuestionsViewMixin):
     def positions(self):
         qqs = self.request.event.questions.all()
         if self.only_user_visible:
-            qqs = qqs.filter(ask_during_checkin=False, hidden=False)
+            qqs = qqs.filter(ask_during_checkin=False, hidden=False, container_type=Question.ContainerType.ORDERPOSITION)
         return list(self.order.positions.select_related(
             'item', 'variation'
         ).prefetch_related(
@@ -288,19 +400,28 @@ class OrderQuestionsViewMixin(BaseQuestionsViewMixin):
         return override_sets
 
     @cached_property
+    def vat_id_validation_enabled(self):
+        return any([p.item.tax_rule and (p.item.tax_rule.eu_reverse_charge or p.item.tax_rule.custom_rules)
+                    for p in self.positions])
+
+    @cached_property
     def invoice_form(self):
         if not self.address_asked and self.request.event.settings.invoice_name_required:
             f = self.invoice_name_form_class(
                 data=self.request.POST if self.request.method == "POST" else None,
                 event=self.request.event,
-                instance=self.invoice_address, validate_vat_id=False,
+                instance=self.invoice_address,
+                validate_vat_id=False,
+                request=self.request,
                 all_optional=self.all_optional
             )
         elif self.address_asked:
             f = self.invoice_form_class(
                 data=self.request.POST if self.request.method == "POST" else None,
                 event=self.request.event,
-                instance=self.invoice_address, validate_vat_id=False,
+                instance=self.invoice_address,
+                validate_vat_id=self.vat_id_validation_enabled,
+                request=self.request,
                 all_optional=self.all_optional,
             )
         else:
@@ -317,6 +438,7 @@ class OrderQuestionsViewMixin(BaseQuestionsViewMixin):
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
         ctx['order'] = self.order
+        ctx['order_questions_form'] = self.order_questions_form
         ctx['formgroups'] = self.formdict.items()
         ctx['invoice_form'] = self.invoice_form
         ctx['invoice_address_asked'] = self.address_asked

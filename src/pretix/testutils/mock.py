@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,8 +19,10 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
+import os
 from contextlib import contextmanager
 
+import fakeredis
 from pytest_mock import MockFixture
 
 
@@ -34,3 +36,12 @@ def mocker_context():
     result = MockFixture(FakePytestConfig())
     yield result
     result.stopall()
+
+
+def get_redis_connection(alias="default", write=True):
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker_id and worker_id.startswith("gw"):
+        redis_port = 1000 + int(worker_id.replace("gw", ""))
+    else:
+        redis_port = 1000
+    return fakeredis.FakeStrictRedis(server=fakeredis.FakeServer.get_server(f"127.0.0.1:{redis_port}:redis:v(7, 0)", (7, 0), server_type="redis"))

@@ -10,10 +10,12 @@
         {% if card.testmode %}
             <span class="label label-warning">{% trans "TEST MODE" %}</span>
         {% endif %}
-        <a href="{% url "control:organizer.giftcard.edit" organizer=request.organizer.slug giftcard=card.id %}"
-                class="btn btn-default">
-            <i class="fa fa-edit"></i> {% trans "Edit" %}
-        </a>
+        {% if "organizer.giftcards:write" in request.orgapermset %}
+            <a href="{% url "control:organizer.giftcard.edit" organizer=request.organizer.slug giftcard=card.id %}"
+                    class="btn btn-default">
+                <i class="fa fa-edit"></i> {% trans "Edit" %}
+            </a>
+        {% endif %}
     </h1>
     <div class="row">
         <div class="col-md-10 col-xs-12">
@@ -46,6 +48,22 @@
                                     {{ card.issued_in.order.full_code }}</a>-{{ card.issued_in.positionid }}
                             </dd>
                         {% endif %}
+                        {% if card.owner_ticket %}
+                            <dt>{% trans "Owned by ticket holder" %}</dt>
+                            <dd>
+                                <span class="fa fa-ticket fa-fw"></span>
+                                <a href="{% url "control:event.order" event=card.owner_ticket.order.event.slug organizer=request.organizer.slug code=card.owner_ticket.order.code %}">
+                                    {{ card.owner_ticket.order.code }}</a>-{{ card.owner_ticket.positionid }}
+                            </dd>
+                        {% endif %}
+                        {% if card.customer %}
+                            <dt>{% trans "Customer account" %}</dt>
+                            <dd>
+                                <a href="{% url "control:organizer.customer" organizer=request.organizer.slug customer=card.customer.identifier %}">
+                                    {{ card.customer.identifier }} – {{ card.customer.email }}
+                                </a>
+                            </dd>
+                        {% endif %}
                     </dl>
                 </div>
             </div>
@@ -57,33 +75,37 @@
                 </div>
                 <form class="" method="post" action="">
                     {% csrf_token %}
+                    <button type="submit" class="hidden">Add</button> <!-- Required because pressing enter in the text fields will submit the first button -->
                     <table class="panel-body table">
                         <thead>
                         <tr>
                             <th>{% trans "Date" %}</th>
-                            <th>{% trans "Order" %}</th>
+                            <th>{% trans "Information" %}</th>
                             <th class="text-right">{% trans "Value" %}</th>
                         </tr>
                         </thead>
                         <tbody>
-                        {% for t in card.transactions.all %}
+                        {% for t in transactions %}
                             <tr>
                                 <td>{{ t.datetime|date:"SHORT_DATETIME_FORMAT" }}</td>
                                 <td>
-                                    {% if t.order %}
-                                        <a href="{% url "control:event.order" event=t.order.event.slug organizer=t.order.event.organizer.slug code=t.order.code %}">
-                                            {{ t.order.full_code }}
-                                        </a>
-                                        {% if t.refund and t.value > 0 and t.value <= card.value %}
-                                            <button type="submit" name="revert" value="{{ t.pk }}"
-                                                    class="btn btn-default btn-xs" data-toggle="tooltip"
-                                                    title="{% trans "Create a payment on the respective order that cancels out with this transaction. The order will then likely be overpaid." %}">
-                                                <span class="fa fa-repeat"></span>
-                                                {% trans "Revert" %}
-                                            </button>
-                                        {% endif %}
-                                    {% else %}
-                                        <em>{% trans "Manual transaction" %}{% if t.text %}: {{ t.text }}{% endif %}</em>
+                                    {{ t.display_backend }}
+                                    {% if t.refund and t.value > 0 and t.value <= card.value %}
+                                        <button type="submit" name="revert" value="{{ t.pk }}"
+                                                class="btn btn-default btn-xs" data-toggle="tooltip"
+                                                title="{% trans "Create a payment on the respective order that cancels out with this transaction. The order will then likely be overpaid." %}">
+                                            <span class="fa fa-repeat"></span>
+                                            {% trans "Revert" %}
+                                        </button>
+                                    {% endif %}
+                                    {% if staff_session and t.info %}
+                                        <pre class="admin-only"><code>{{ t.info|pprint }}</code></pre>
+                                    {% endif %}
+                                    {% if t.acceptor and t.acceptor != request.organizer %}
+                                        <span class="text-muted">
+                                            <br>
+                                            <span class="fa fa-group"></span> {{ t.acceptor }}
+                                        </span>
                                     {% endif %}
                                 </td>
                                 <td class="text-right">
@@ -92,22 +114,24 @@
                             </tr>
                         {% endfor %}
                         </tbody>
-                        <tfoot>
-                        <tr>
-                            <td></td>
-                            <td>
-                                <input type="text" class="form-control helper-display-block" placeholder="{% trans "Text" %}"
-                                        name="text">
-                            </td>
-                            <td class="text-right form-inline">
-                                <input type="text" class="form-control input-sm" placeholder="{% trans "Value" %}" name="value">
-                                <button class="btn btn-primary">
-                                    <span class="fa fa-plus"></span>
-                                </button>
-                            </td>
+                        {% if "organizer.giftcards:write" in request.orgapermset %}
+                            <tfoot>
+                            <tr>
+                                <td></td>
+                                <td>
+                                    <input type="text" class="form-control helper-display-block" placeholder="{% trans "Text" %}"
+                                            name="text">
+                                </td>
+                                <td class="text-right form-inline">
+                                    <input type="text" class="form-control input-sm" placeholder="{% trans "Value" %}" name="value">
+                                    <button type="submit" class="btn btn-primary">
+                                        <span class="fa fa-plus"></span>
+                                    </button>
+                                </td>
 
-                        </tr>
-                        </tfoot>
+                            </tr>
+                            </tfoot>
+                        {% endif %}
                     </table>
                 </form>
             </div>

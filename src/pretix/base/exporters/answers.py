@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -39,21 +39,26 @@ from zipfile import ZipFile
 
 from django import forms
 from django.dispatch import receiver
-from django.utils.translation import gettext_lazy as _
+from django.urls import reverse
+from django.utils.translation import gettext_lazy as _, pgettext_lazy
 
 from pretix.base.models import QuestionAnswer
 
+from ...control.forms.widgets import Select2
 from ..exporter import BaseExporter
 from ..signals import register_data_exporters
 
 
 class AnswerFilesExporter(BaseExporter):
     identifier = 'answerfiles'
-    verbose_name = _('Answers to file upload questions')
+    verbose_name = _('Question answer file uploads')
+    category = pgettext_lazy('export_category', 'Order data')
+    description = _('Download a ZIP file including all files that have been uploaded by your customers while creating '
+                    'an order.')
 
     @property
     def export_form_fields(self):
-        return OrderedDict(
+        d = OrderedDict(
             [
                 ('questions',
                  forms.ModelMultipleChoiceField(
@@ -66,11 +71,32 @@ class AnswerFilesExporter(BaseExporter):
                  )),
             ]
         )
+        if self.event.has_subevents:
+            d['subevent'] = forms.ModelChoiceField(
+                label=pgettext_lazy('subevent', 'Date'),
+                queryset=self.event.subevents.all(),
+                required=False,
+                empty_label=pgettext_lazy('subevent', 'All dates')
+            )
+            d['subevent'].widget = Select2(
+                attrs={
+                    'data-model-select2': 'event',
+                    'data-select2-url': reverse('control:event.subevents.select2', kwargs={
+                        'event': self.event.slug,
+                        'organizer': self.event.organizer.slug,
+                    }),
+                    'data-placeholder': pgettext_lazy('subevent', 'All dates')
+                }
+            )
+            d['subevent'].widget.choices = d['subevent'].choices
+        return d
 
     def render(self, form_data: dict):
         qs = QuestionAnswer.objects.filter(
             orderposition__order__event=self.event,
         ).select_related('orderposition', 'orderposition__order', 'question')
+        if form_data.get('subevent'):
+            qs = qs.filter(orderposition__subevent=form_data.get('subevent'))
         if form_data.get('questions'):
             qs = qs.filter(question__in=form_data['questions'])
         with tempfile.TemporaryDirectory() as d:

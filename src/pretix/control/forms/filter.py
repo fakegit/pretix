@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -39,32 +39,44 @@ from urllib.parse import urlencode
 from django import forms
 from django.apps import apps
 from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
 from django.db.models import (
-    Count, Exists, F, Max, Model, OuterRef, Q, QuerySet,
+    Count, Exists, F, Max, Model, OrderBy, OuterRef, Q, QuerySet,
 )
-from django.db.models.functions import Coalesce, ExtractWeekDay
+from django.db.models.functions import Coalesce, ExtractWeekDay, Upper
 from django.urls import reverse, reverse_lazy
 from django.utils.formats import date_format, localize
 from django.utils.functional import cached_property
 from django.utils.timezone import get_current_timezone, make_aware, now
 from django.utils.translation import gettext, gettext_lazy as _, pgettext_lazy
+from django_countries.fields import CountryField
+from django_scopes.forms import SafeModelChoiceField
 
-from pretix.base.channels import get_all_sales_channels
 from pretix.base.forms.widgets import (
-    DatePickerWidget, SplitDateTimePickerWidget,
+    DatePickerWidget, SplitDateTimePickerWidget, TimePickerWidget,
 )
 from pretix.base.models import (
-    Checkin, Event, EventMetaProperty, EventMetaValue, Invoice, InvoiceAddress,
-    Item, Order, OrderPayment, OrderPosition, OrderRefund, Organizer, Question,
-    QuestionAnswer, SubEvent,
+    Checkin, CheckinList, Device, Event, EventMetaProperty, EventMetaValue,
+    Gate, Invoice, InvoiceAddress, Item, Order, OrderPayment, OrderPosition,
+    OrderRefund, Organizer, OutgoingMail, Question, QuestionAnswer, Quota,
+    SalesChannel, SubEvent, SubEventMetaValue, Team, TeamAPIToken, TeamInvite,
+    User, Voucher,
 )
 from pretix.base.signals import register_payment_providers
-from pretix.control.forms.widgets import Select2
+from pretix.base.timeframes import (
+    DateFrameField,
+    resolve_timeframe_to_datetime_start_inclusive_end_exclusive,
+)
+from pretix.control.forms import SplitDateTimeField
+from pretix.control.forms.widgets import Select2, Select2ItemVarQuota
 from pretix.control.signals import order_search_filter_q
 from pretix.helpers.countries import CachedCountries
-from pretix.helpers.database import FixedOrderBy, rolledback_transaction
+from pretix.helpers.database import (
+    get_deterministic_ordering, rolledback_transaction,
+)
 from pretix.helpers.dicts import move_to_end
-from pretix.helpers.i18n import i18ncomp
+from pretix.helpers.i18n import get_format_without_seconds, i18ncomp
+from pretix.helpers.models import flatten_choices
 
 PAYMENT_PROVIDERS = []
 
@@ -75,13 +87,44 @@ def get_all_payment_providers():
     if PAYMENT_PROVIDERS:
         return PAYMENT_PROVIDERS
 
+    class FakeSettings:
+        def __init__(self, orig_settings):
+            self.orig_settings = orig_settings
+
+        def set(self, *args, **kwargs):
+            pass
+
+        def __getattr__(self, item):
+            return getattr(self.orig_settings, item)
+
+    class FakeEvent:
+        def __init__(self, orig_event):
+            self.orig_event = orig_event
+
+        @property
+        def settings(self):
+            return FakeSettings(self.orig_event.settings)
+
+        def __getattr__(self, item):
+            return getattr(self.orig_event, item)
+
+        @property
+        def __class__(self):  # hackhack
+            return Event
+
     with rolledback_transaction():
+        plugins = ",".join([app.name for app in apps.get_app_configs()])
+        organizer = Organizer.objects.create(
+            name="INTERNAL",
+            plugins=plugins,
+        )
         event = Event.objects.create(
-            plugins=",".join([app.name for app in apps.get_app_configs()]),
+            plugins=plugins,
             name="INTERNAL",
             date_from=now(),
-            organizer=Organizer.objects.create(name="INTERNAL")
+            organizer=organizer,
         )
+        event = FakeEvent(event)
         provs = register_payment_providers.send(
             sender=event
         )
@@ -146,10 +189,10 @@ class FilterForm(forms.Form):
             elif isinstance(v, Model):
                 val = '"' + str(v) + '"'
             elif isinstance(f, forms.MultipleChoiceField):
-                valdict = dict(f.choices)
+                valdict = dict(flatten_choices(f.choices))
                 val = ' or '.join([str(valdict.get(m)) for m in v])
             elif isinstance(f, forms.ChoiceField):
-                val = str(dict(f.choices).get(v))
+                val = str(dict(flatten_choices(f.choices)).get(v))
             elif isinstance(v, datetime):
                 val = date_format(v, 'SHORT_DATETIME_FORMAT')
             elif isinstance(v, Decimal):
@@ -165,7 +208,6 @@ class OrderFilterForm(FilterForm):
         label=_('Search for…'),
         widget=forms.TextInput(attrs={
             'placeholder': _('Search for…'),
-            'autofocus': 'autofocus'
         }),
         required=False
     )
@@ -182,12 +224,14 @@ class OrderFilterForm(FilterForm):
             ('', _('All orders')),
             (_('Valid orders'), (
                 (Order.STATUS_PAID, _('Paid (or canceled with paid fee)')),
+                (Order.STATUS_PAID + 'v', _('Paid or confirmed')),
                 (Order.STATUS_PENDING, _('Pending')),
                 (Order.STATUS_PENDING + Order.STATUS_PAID, _('Pending or paid')),
             )),
             (_('Cancellations'), (
                 (Order.STATUS_CANCELED, _('Canceled (fully)')),
                 ('cp', _('Canceled (fully or with paid fee)')),
+                ('cany', _('Canceled (at least one position)')),
                 ('rc', _('Cancellation requested')),
                 ('cni', _('Fully canceled but invoice not canceled')),
             )),
@@ -199,10 +243,15 @@ class OrderFilterForm(FilterForm):
                 ('partially_paid', _('Partially paid')),
                 ('underpaid', _('Underpaid (but confirmed)')),
                 ('pendingpaid', _('Pending (but fully paid)')),
+                ('pendingnopayment', _('Pending (but no current payment)')),
             )),
             (_('Approval process'), (
                 ('na', _('Approved, payment pending')),
                 ('pa', _('Approval pending')),
+            )),
+            (_('Follow-up date'), (
+                ('custom_followup_at', _('Follow-up configured')),
+                ('custom_followup_due', _('Follow-up due')),
             )),
             ('testmode', _('Test mode')),
         ),
@@ -221,14 +270,19 @@ class OrderFilterForm(FilterForm):
             else:
                 code = Q(code__icontains=Order.normalize_code(u))
 
+            invoice_nos = {u, u.upper()}
+            if u.isdigit():
+                for i in range(2, 12):
+                    invoice_nos.add(u.zfill(i))
+
             matching_invoices = Invoice.objects.filter(
-                Q(invoice_no__iexact=u)
-                | Q(invoice_no__iexact=u.zfill(5))
+                Q(invoice_no__in=invoice_nos)
                 | Q(full_invoice_no__iexact=u)
             ).values_list('order_id', flat=True)
-            matching_positions = OrderPosition.objects.filter(
+            matching_positions = OrderPosition.all.filter(
                 Q(
                     Q(attendee_name_cached__icontains=u) | Q(attendee_email__icontains=u)
+                    | Q(company__icontains=u)
                     | Q(secret__istartswith=u)
                     | Q(pseudonymization_id__istartswith=u)
                 )
@@ -249,7 +303,6 @@ class OrderFilterForm(FilterForm):
                 | Q(pk__in=matching_invoices)
                 | Q(pk__in=matching_positions)
                 | Q(pk__in=matching_invoice_addresses)
-                | Q(pk__in=matching_invoices)
             )
             for recv, q in order_search_filter_q.send(sender=getattr(self, 'event', None), query=u):
                 mainq = mainq | q
@@ -265,14 +318,13 @@ class OrderFilterForm(FilterForm):
                 qs = qs.filter(status__in=[Order.STATUS_PENDING, Order.STATUS_PAID])
             elif s == 'ne':
                 qs = qs.filter(status__in=[Order.STATUS_PENDING, Order.STATUS_EXPIRED])
+            elif s == 'pv':
+                qs = qs.filter(Q(status=Order.STATUS_PAID) | Q(status=Order.STATUS_PENDING, valid_if_pending=True))
             elif s in ('p', 'n', 'e', 'c', 'r'):
                 qs = qs.filter(status=s)
             elif s == 'overpaid':
-                qs = Order.annotate_overpayments(qs, refunds=False, results=False, sums=True)
-                qs = qs.filter(
-                    Q(~Q(status=Order.STATUS_CANCELED) & Q(pending_sum_t__lt=0))
-                    | Q(Q(status=Order.STATUS_CANCELED) & Q(pending_sum_rc__lt=0))
-                )
+                qs = Order.annotate_overpayments(qs, refunds=False, results=True, sums=False)
+                qs = qs.filter(is_overpaid=True)
             elif s == 'rc':
                 qs = qs.filter(
                     cancellation_requests__isnull=False
@@ -287,6 +339,18 @@ class OrderFilterForm(FilterForm):
                     Q(status__in=(Order.STATUS_EXPIRED, Order.STATUS_PENDING)) & Q(pending_sum_t__lte=0)
                     & Q(require_approval=False)
                 )
+            elif s == 'pendingnopayment':
+                qs = qs.exclude(
+                    Exists(
+                        OrderPayment.objects.filter(
+                            order=OuterRef('pk'),
+                            state__in=(OrderPayment.PAYMENT_STATE_CREATED, OrderPayment.PAYMENT_STATE_PENDING)
+                        )
+                    )
+                ).filter(
+                    status=Order.STATUS_PENDING,
+                    require_approval=False,
+                )
             elif s == 'partially_paid':
                 qs = Order.annotate_overpayments(qs, refunds=False, results=False, sums=True)
                 qs = qs.filter(
@@ -298,8 +362,8 @@ class OrderFilterForm(FilterForm):
             elif s == 'underpaid':
                 qs = Order.annotate_overpayments(qs, refunds=False, results=False, sums=True)
                 qs = qs.filter(
-                    status=Order.STATUS_PAID,
-                    pending_sum_t__gt=0
+                    Q(status=Order.STATUS_PAID, pending_sum_t__gt=0) |
+                    Q(status=Order.STATUS_CANCELED, pending_sum_rc__gt=0)
                 )
             elif s == 'cni':
                 i = Invoice.objects.filter(
@@ -323,6 +387,14 @@ class OrderFilterForm(FilterForm):
                     status=Order.STATUS_PENDING,
                     require_approval=False
                 )
+            elif s == 'custom_followup_at':
+                qs = qs.filter(
+                    custom_followup_at__isnull=False
+                )
+            elif s == 'custom_followup_due':
+                qs = qs.filter(
+                    custom_followup_at__lte=now().astimezone(get_current_timezone()).date()
+                )
             elif s == 'testmode':
                 qs = qs.filter(
                     testmode=True
@@ -336,9 +408,19 @@ class OrderFilterForm(FilterForm):
                 ).filter(
                     Q(status=Order.STATUS_PAID, has_pc=False) | Q(status=Order.STATUS_CANCELED)
                 )
+            elif s == 'cany':
+                s = OrderPosition.all.filter(
+                    order=OuterRef('pk'),
+                    canceled=True,
+                )
+                qs = qs.annotate(
+                    has_pc_c=Exists(s)
+                ).filter(
+                    Q(has_pc_c=True) | Q(status=Order.STATUS_CANCELED)
+                )
 
         if fdata.get('ordering'):
-            qs = qs.order_by(self.get_order_by())
+            qs = qs.order_by(*get_deterministic_ordering(Order, self.get_order_by()))
 
         if fdata.get('provider'):
             qs = qs.annotate(
@@ -414,16 +496,31 @@ class EventOrderFilterForm(OrderFilterForm):
         fdata = self.cleaned_data
         qs = super().filter_qs(qs)
 
+        # This is a little magic, but there's no option that does not confuse people and let's hope this confuses less
+        # people.
+        only_match_noncanceled_products = fdata.get('status') in (
+            Order.STATUS_PAID,
+            Order.STATUS_PAID + 'v',
+            Order.STATUS_PENDING,
+            Order.STATUS_PENDING + Order.STATUS_PAID,
+        )
+        if only_match_noncanceled_products:
+            canceled_filter = Q(all_positions__canceled=False)
+        elif fdata.get('status') in ('cp', 'cany'):
+            canceled_filter = Q(all_positions__canceled=True) | Q(status=Order.STATUS_CANCELED)
+        else:
+            canceled_filter = Q()
+
         item = fdata.get('item')
         if item:
             if '-' in item:
                 var = item.split('-')[1]
-                qs = qs.filter(all_positions__variation_id=var, all_positions__canceled=False).distinct()
+                qs = qs.filter(canceled_filter, all_positions__variation_id=var).distinct()
             else:
-                qs = qs.filter(all_positions__item_id=fdata.get('item'), all_positions__canceled=False).distinct()
+                qs = qs.filter(canceled_filter, all_positions__item_id=fdata.get('item')).distinct()
 
         if fdata.get('subevent'):
-            qs = qs.filter(all_positions__subevent=fdata.get('subevent'), all_positions__canceled=False).distinct()
+            qs = qs.filter(canceled_filter, all_positions__subevent=fdata.get('subevent')).distinct()
 
         if fdata.get('question') and fdata.get('answer') is not None:
             q = fdata.get('question')
@@ -435,7 +532,7 @@ class EventOrderFilterForm(OrderFilterForm):
                     file__isnull=False
                 )
                 qs = qs.annotate(has_answer=Exists(answers)).filter(has_answer=True)
-            elif q.type in (Question.TYPE_CHOICE, Question.TYPE_CHOICE_MULTIPLE):
+            elif q.type in (Question.TYPE_CHOICE, Question.TYPE_CHOICE_MULTIPLE) and fdata.get('answer'):
                 answers = QuestionAnswer.objects.filter(
                     question_id=q.pk,
                     orderposition__order_id=OuterRef('pk'),
@@ -490,7 +587,7 @@ class EventOrderExpertFilterForm(EventOrderFilterForm):
     )
     email = forms.CharField(
         required=False,
-        label=_('E-mail address')
+        label=_('Email address')
     )
     comment = forms.CharField(
         required=False,
@@ -504,7 +601,7 @@ class EventOrderExpertFilterForm(EventOrderFilterForm):
     email_known_to_work = forms.NullBooleanField(
         required=False,
         widget=FilterNullBooleanSelect,
-        label=_('E-mail address verified'),
+        label=_('Email address verified'),
     )
     total = forms.DecimalField(
         localize=True,
@@ -521,8 +618,20 @@ class EventOrderExpertFilterForm(EventOrderFilterForm):
         required=False,
         label=_('Maximal sum of payments and refunds'),
     )
-    sales_channel = forms.ChoiceField(
+    sales_channel = SafeModelChoiceField(
         label=_('Sales channel'),
+        required=False,
+        queryset=SalesChannel.objects.none(),
+        to_field_name="identifier",
+    )
+    has_checkin = forms.NullBooleanField(
+        required=False,
+        widget=FilterNullBooleanSelect,
+        label=_('At least one ticket with check-in'),
+    )
+    quota = SafeModelChoiceField(
+        queryset=Quota.objects.none(),
+        label=_('Affected quota'),
         required=False,
     )
 
@@ -536,9 +645,7 @@ class EventOrderExpertFilterForm(EventOrderFilterForm):
             del self.fields['subevents_from']
             del self.fields['subevents_to']
 
-        self.fields['sales_channel'].choices = [('', '')] + [
-            (k, v.verbose_name) for k, v in get_all_sales_channels().items()
-        ]
+        self.fields['sales_channel'].queryset = self.event.organizer.sales_channels.all()
 
         locale_names = dict(settings.LANGUAGES)
         self.fields['locale'].choices = [('', '')] + [(a, locale_names[a]) for a in self.event.settings.locales]
@@ -579,7 +686,7 @@ class EventOrderExpertFilterForm(EventOrderFilterForm):
         )
         self.fields['attendee_email'] = forms.CharField(
             required=False,
-            label=_('Attendee e-mail address')
+            label=_('Attendee email address')
         )
         self.fields['attendee_address_company'] = forms.CharField(
             required=False,
@@ -608,12 +715,83 @@ class EventOrderExpertFilterForm(EventOrderFilterForm):
             label=_('Ticket secret'),
             required=False
         )
+        self.fields['quota'].queryset = self.event.quotas.all()
+        self.fields['quota'].widget = Select2(
+            attrs={
+                'data-model-select2': 'generic',
+                'data-select2-url': reverse('control:event.items.quotas.select2', kwargs={
+                    'event': self.event.slug,
+                    'organizer': self.event.organizer.slug,
+                }),
+            }
+        )
+        self.fields['quota'].widget.choices = self.fields['quota'].choices
         for q in self.event.questions.all():
-            self.fields['question_{}'.format(q.pk)] = forms.CharField(
-                label=q.question,
-                required=False,
-                help_text=_('Exact matches only')
-            )
+            kwargs = {
+                "label": q.question,
+                "required": False,
+            }
+            fname = 'question_{}'.format(q.pk)
+            if q.type == Question.TYPE_NUMBER:
+                self.fields[fname] = forms.DecimalField(
+                    help_text=_('Exact matches only'),
+                    **kwargs,
+                )
+            elif q.type == Question.TYPE_BOOLEAN:
+                self.fields[fname] = forms.ChoiceField(
+                    choices=(
+                        ("", ""),
+                        ("True", _("Yes")),
+                        ("False", _("No")),
+                    ),
+                    **kwargs,
+                )
+            elif q.type in (Question.TYPE_CHOICE, Question.TYPE_CHOICE_MULTIPLE):
+                self.fields[fname] = forms.ModelChoiceField(
+                    queryset=q.options,
+                    widget=forms.Select,
+                    to_field_name='identifier',
+                    empty_label='',
+                    **kwargs,
+                )
+            elif q.type == Question.TYPE_COUNTRYCODE:
+                self.fields[fname] = CountryField(
+                    countries=CachedCountries,
+                    blank=True, null=True, blank_label=' ',
+                ).formfield(
+                    **kwargs,
+                    widget=forms.Select,
+                    empty_label=' ',
+                )
+            elif q.type == Question.TYPE_DATE:
+                self.fields[fname] = forms.DateField(
+                    widget=DatePickerWidget(),
+                    help_text=_('Exact matches only'),
+                    **kwargs,
+                )
+            elif q.type == Question.TYPE_TIME:
+                self.fields[fname] = forms.TimeField(
+                    widget=TimePickerWidget(without_seconds=True),
+                    help_text=_('Exact matches only'),
+                    **kwargs,
+                )
+            elif q.type == Question.TYPE_DATETIME:
+                self.fields[fname] = SplitDateTimeField(
+                    widget=SplitDateTimePickerWidget(
+                        time_format=get_format_without_seconds('TIME_INPUT_FORMATS'),
+                        min_date=q.valid_datetime_min,
+                        max_date=q.valid_datetime_max
+                    ),
+                    help_text=_('Exact matches only'),
+                    **kwargs,
+                )
+            elif q.type == Question.TYPE_FILE:
+                continue
+            else:
+                self.fields[fname] = forms.CharField(
+                    help_text=_('Exact matches only'),
+                    **kwargs,
+                )
 
     def filter_qs(self, qs):
         fdata = self.cleaned_data
@@ -640,11 +818,13 @@ class EventOrderExpertFilterForm(EventOrderFilterForm):
         if fdata.get('comment'):
             qs = qs.filter(comment__icontains=fdata.get('comment'))
         if fdata.get('sales_channel'):
-            qs = qs.filter(sales_channel=fdata.get('sales_channel'))
+            qs = qs.filter(sales_channel__identifier=fdata.get('sales_channel').identifier)
         if fdata.get('total'):
             qs = qs.filter(total=fdata.get('total'))
         if fdata.get('email_known_to_work') is not None:
             qs = qs.filter(email_known_to_work=fdata.get('email_known_to_work'))
+        if fdata.get('checkin_attention') is not None:
+            qs = qs.filter(checkin_attention=fdata.get('checkin_attention'))
         if fdata.get('locale'):
             qs = qs.filter(locale=fdata.get('locale'))
         if fdata.get('payment_sum_min') is not None:
@@ -689,17 +869,48 @@ class EventOrderExpertFilterForm(EventOrderFilterForm):
             qs = qs.filter(
                 all_positions__country=fdata.get('attendee_address_country')
             ).distinct()
+        if fdata.get('has_checkin') is not None:
+            qs = qs.annotate(
+                has_checkin=Exists(
+                    Checkin.all.filter(position__order_id=OuterRef('pk'))
+                )
+            ).filter(has_checkin=fdata['has_checkin'])
         if fdata.get('ticket_secret'):
             qs = qs.filter(
                 all_positions__secret__icontains=fdata.get('ticket_secret')
             ).distinct()
+        if fdata.get('quota'):
+            quota = fdata['quota']
+            qs = qs.filter(
+                Q(all_positions__item__in=quota.items.all(), all_positions__variation__isnull=True) |
+                Q(all_positions__variation__in=quota.variations.all())
+            ).distinct()
         for q in self.event.questions.all():
             if fdata.get(f'question_{q.pk}'):
-                answers = QuestionAnswer.objects.filter(
-                    question_id=q.pk,
-                    orderposition__order_id=OuterRef('pk'),
-                    answer__iexact=fdata.get(f'question_{q.pk}')
-                )
+                if q.type in (Question.TYPE_BOOLEAN, Question.TYPE_NUMBER):
+                    answers = QuestionAnswer.objects.filter(
+                        question_id=q.pk,
+                        orderposition__order_id=OuterRef('pk'),
+                        answer__exact=fdata.get(f'question_{q.pk}')
+                    )
+                elif q.type in (Question.TYPE_DATE, Question.TYPE_TIME, Question.TYPE_DATETIME):
+                    answers = QuestionAnswer.objects.filter(
+                        question_id=q.pk,
+                        orderposition__order_id=OuterRef('pk'),
+                        answer__exact=str(fdata.get(f'question_{q.pk}'))
+                    )
+                elif q.type in (Question.TYPE_CHOICE, Question.TYPE_CHOICE_MULTIPLE):
+                    answers = QuestionAnswer.objects.filter(
+                        question_id=q.pk,
+                        orderposition__order_id=OuterRef('pk'),
+                        options=fdata.get(f'question_{q.pk}')
+                    )
+                else:
+                    answers = QuestionAnswer.objects.filter(
+                        question_id=q.pk,
+                        orderposition__order_id=OuterRef('pk'),
+                        answer__iexact=fdata.get(f'question_{q.pk}')
+                    )
                 qs = qs.annotate(**{f'q_{q.pk}': Exists(answers)}).filter(**{f'q_{q.pk}': True})
 
         return qs
@@ -753,6 +964,12 @@ class OrderSearchFilterForm(OrderFilterForm):
                 )
             )
 
+    def use_query_hack(self):
+        return (
+            self.cleaned_data.get('query') or
+            self.cleaned_data.get('status') in ('overpaid', 'partially_paid', 'underpaid', 'pendingpaid')
+        )
+
     def filter_qs(self, qs):
         fdata = self.cleaned_data
         qs = super().filter_qs(qs)
@@ -793,8 +1010,348 @@ class OrderSearchFilterForm(OrderFilterForm):
         # We ignore superuser permissions here. This is intentional – we do not want to show super
         # users a form with all meta properties ever assigned.
         return EventMetaProperty.objects.filter(
-            organizer_id__in=self.request.user.teams.values_list('organizer', flat=True)
+            organizer_id__in=self.request.user.teams.values_list('organizer', flat=True),
+            filter_allowed=True,
         )
+
+
+class OrderPaymentSearchFilterForm(forms.Form):
+    orders = {'id': 'id', 'local_id': 'local_id', 'state': 'state', 'amount': 'amount', 'order': 'order',
+              'created': 'created', 'payment_date': 'payment_date', 'provider': 'provider', 'info': 'info',
+              'fee': 'fee'}
+
+    query = forms.CharField(
+        label=_('Search for…'),
+        widget=forms.TextInput(attrs={
+            'placeholder': _('Search for…'),
+        }),
+        required=False,
+    )
+    event = forms.ModelChoiceField(
+        label=_('Event'),
+        queryset=Event.objects.none(),
+        required=False,
+        widget=Select2(
+            attrs={
+                'data-model-select2': 'event',
+                'data-select2-url': reverse_lazy('control:events.typeahead'),
+                'data-placeholder': _('All events')
+            }
+        )
+    )
+    organizer = forms.ModelChoiceField(
+        label=_('Organizer'),
+        queryset=Organizer.objects.none(),
+        required=False,
+        empty_label=_('All organizers'),
+        widget=Select2(
+            attrs={
+                'data-model-select2': 'generic',
+                'data-select2-url': reverse_lazy('control:organizers.select2'),
+                'data-placeholder': _('All organizers')
+            }
+        ),
+    )
+    state = forms.ChoiceField(
+        label=_('Status'),
+        required=False,
+        choices=[('', _('All payments'))] + list(OrderPayment.PAYMENT_STATES),
+    )
+    provider = forms.ChoiceField(
+        label=_('Payment provider'),
+        choices=[
+            ('', _('All payment providers')),
+        ],
+        required=False,
+    )
+    created_from = forms.DateField(
+        label=_('Payment created from'),
+        required=False,
+        widget=DatePickerWidget,
+    )
+    created_until = forms.DateField(
+        label=_('Payment created until'),
+        required=False,
+        widget=DatePickerWidget,
+    )
+    completed_from = forms.DateField(
+        label=_('Paid from'),
+        required=False,
+        widget=DatePickerWidget,
+    )
+    completed_until = forms.DateField(
+        label=_('Paid until'),
+        required=False,
+        widget=DatePickerWidget,
+    )
+    amount = forms.CharField(
+        label=_('Amount'),
+        required=False,
+        widget=forms.NumberInput(attrs={
+            'placeholder': _('Amount'),
+        }),
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.request = kwargs.pop('request')
+        super().__init__(*args, **kwargs)
+
+        self.fields['ordering'] = forms.ChoiceField(
+            choices=sum([
+                [(a, a), ('-' + a, '-' + a)]
+                for a in self.orders.keys()
+            ], []),
+            required=False
+        )
+
+        if self.request.user.has_active_staff_session(self.request.session.session_key):
+            self.fields['organizer'].queryset = Organizer.objects.all()
+            self.fields['event'].queryset = Event.objects.all()
+
+        else:
+            self.fields['organizer'].queryset = Organizer.objects.filter(
+                pk__in=self.request.user.teams.values_list('organizer', flat=True)
+            )
+            self.fields['event'].queryset = self.request.user.get_events_with_permission('event.orders:read')
+
+        self.fields['provider'].choices += get_all_payment_providers()
+
+    def filter_qs(self, qs):
+        fdata = self.cleaned_data
+
+        if fdata.get('created_from'):
+            date_start = make_aware(datetime.combine(
+                fdata.get('created_from'),
+                time(hour=0, minute=0, second=0, microsecond=0)
+            ), get_current_timezone())
+            qs = qs.filter(created__gte=date_start)
+
+        if fdata.get('created_until'):
+            date_end = make_aware(datetime.combine(
+                fdata.get('created_until') + timedelta(days=1),
+                time(hour=0, minute=0, second=0, microsecond=0)
+            ), get_current_timezone())
+            qs = qs.filter(created__lt=date_end)
+
+        if fdata.get('completed_from'):
+            date_start = make_aware(datetime.combine(
+                fdata.get('completed_from'),
+                time(hour=0, minute=0, second=0, microsecond=0)
+            ), get_current_timezone())
+            qs = qs.filter(payment_date__gte=date_start)
+
+        if fdata.get('completed_until'):
+            date_end = make_aware(datetime.combine(
+                fdata.get('completed_until') + timedelta(days=1),
+                time(hour=0, minute=0, second=0, microsecond=0)
+            ), get_current_timezone())
+            qs = qs.filter(payment_date__lt=date_end)
+
+        if fdata.get('event'):
+            qs = qs.filter(order__event=fdata.get('event'))
+
+        if fdata.get('organizer'):
+            qs = qs.filter(order__event__organizer=fdata.get('organizer'))
+
+        if fdata.get('state'):
+            qs = qs.filter(state=fdata.get('state'))
+
+        if fdata.get('provider'):
+            qs = qs.filter(provider=fdata.get('provider'))
+
+        if fdata.get('query'):
+            u = fdata.get('query')
+
+            invoice_nos = {u, u.upper()}
+            if u.isdigit():
+                for i in range(2, 12):
+                    invoice_nos.add(u.zfill(i))
+
+            matching_invoices = Invoice.objects.filter(
+                Q(invoice_no__in=invoice_nos)
+                | Q(full_invoice_no__iexact=u)
+            ).values_list('order_id', flat=True)
+
+            matching_invoice_addresses = InvoiceAddress.objects.filter(
+                Q(
+                    Q(name_cached__icontains=u) | Q(company__icontains=u)
+                )
+            ).values_list('order_id', flat=True)
+
+            if "-" in u:
+                code = (Q(event__slug__icontains=u.rsplit("-", 1)[0])
+                        & Q(code__icontains=Order.normalize_code(u.rsplit("-", 1)[1])))
+            else:
+                code = Q(code__icontains=Order.normalize_code(u))
+
+            matching_orders = Order.objects.filter(
+                Q(
+                    code
+                    | Q(email__icontains=u)
+                    | Q(comment__icontains=u)
+                )
+            ).values_list('id', flat=True)
+
+            mainq = (
+                Q(order__id__in=matching_invoices)
+                | Q(order__id__in=matching_invoice_addresses)
+                | Q(order__id__in=matching_orders)
+            )
+
+            qs = qs.filter(mainq)
+
+        if fdata.get('amount'):
+            amount = fdata.get('amount')
+
+            def is_decimal(value):
+                result = True
+                parts = value.split('.', maxsplit=1)
+                for part in parts:
+                    result = result & part.isdecimal()
+                return result
+
+            if is_decimal(amount):
+                qs = qs.filter(amount=Decimal(amount))
+
+        if fdata.get('ordering'):
+            p = self.cleaned_data.get('ordering')
+            if p.startswith('-') and p not in self.orders:
+                qs = qs.order_by(*get_deterministic_ordering(OrderPayment, '-' + self.orders[p[1:]]))
+            else:
+                qs = qs.order_by(*get_deterministic_ordering(OrderPayment, self.orders[p]))
+        else:
+            qs = qs.order_by('-created', '-pk')
+
+        return qs
+
+
+class QuestionAnswerFilterForm(forms.Form):
+    STATUS_VARIANTS = [
+        ("", _("All orders")),
+        (Order.STATUS_PAID, _("Paid")),
+        (Order.STATUS_PAID + 'v', _("Paid or confirmed")),
+        (Order.STATUS_PENDING, _("Pending")),
+        (Order.STATUS_PENDING + Order.STATUS_PAID, _("Pending or paid")),
+        ("o", _("Pending (overdue)")),
+        (Order.STATUS_EXPIRED, _("Expired")),
+        (Order.STATUS_PENDING + Order.STATUS_EXPIRED, _("Pending or expired")),
+        (Order.STATUS_CANCELED, _("Canceled"))
+    ]
+
+    status = forms.ChoiceField(
+        choices=STATUS_VARIANTS,
+        required=False,
+        label=_("Order status"),
+    )
+    item = forms.ChoiceField(
+        choices=[],
+        required=False,
+        label=_("Products"),
+    )
+    subevent = forms.ModelChoiceField(
+        queryset=SubEvent.objects.none(),
+        required=False,
+        empty_label=pgettext_lazy('subevent', 'All dates'),
+        label=pgettext_lazy("subevent", "Date"),
+    )
+    date_range = DateFrameField(
+        required=False,
+        include_future_frames=True,
+        label=_('Event date'),
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.event = kwargs.pop('event')
+        super().__init__(*args, **kwargs)
+        self.initial['status'] = Order.STATUS_PENDING + Order.STATUS_PAID
+
+        choices = [('', _('All products'))]
+        for i in self.event.items.prefetch_related('variations').all():
+            variations = list(i.variations.all())
+            if variations:
+                choices.append((str(i.pk), _('{product} – Any variation').format(product=str(i))))
+                for v in variations:
+                    choices.append(('%d-%d' % (i.pk, v.pk), '%s – %s' % (str(i), v.value)))
+            else:
+                choices.append((str(i.pk), str(i)))
+        self.fields['item'].choices = choices
+
+        if self.event.has_subevents:
+            self.fields["subevent"].queryset = self.event.subevents.all()
+            self.fields['subevent'].widget = Select2(
+                attrs={
+                    'data-model-select2': 'event',
+                    'data-select2-url': reverse('control:event.subevents.select2', kwargs={
+                        'event': self.event.slug,
+                        'organizer': self.event.organizer.slug,
+                    }),
+                    'data-placeholder': pgettext_lazy('subevent', 'All dates')
+                }
+            )
+            self.fields['subevent'].widget.choices = self.fields['subevent'].choices
+        else:
+            del self.fields['subevent']
+
+    def clean(self):
+        cleaned_data = super().clean()
+        subevent = cleaned_data.get('subevent')
+        date_range = cleaned_data.get('date_range')
+
+        if subevent is not None and date_range is not None:
+            d_start, d_end = resolve_timeframe_to_datetime_start_inclusive_end_exclusive(now(), date_range, self.event.timezone)
+            if (
+                (d_start and not (d_start <= subevent.date_from)) or
+                (d_end and not (subevent.date_from < d_end))
+            ):
+                self.add_error('subevent', pgettext_lazy('subevent', "Date doesn't start in selected date range."))
+        return cleaned_data
+
+    def filter_qs(self, opqs):
+        fdata = self.cleaned_data
+
+        subevent = fdata.get('subevent', None)
+        date_range = fdata.get('date_range', None)
+
+        if subevent is not None:
+            opqs = opqs.filter(subevent=subevent)
+
+        if date_range is not None:
+            d_start, d_end = resolve_timeframe_to_datetime_start_inclusive_end_exclusive(now(), date_range, self.event.timezone)
+            if d_start:
+                opqs = opqs.filter(subevent__date_from__gte=d_start)
+            if d_end:
+                opqs = opqs.filter(subevent__date_from__lt=d_end)
+
+        s = fdata.get("status", Order.STATUS_PENDING + Order.STATUS_PAID)
+        if s != "":
+            if s == Order.STATUS_PENDING:
+                opqs = opqs.filter(order__status=Order.STATUS_PENDING,
+                                   order__expires__lt=now().replace(hour=0, minute=0, second=0))
+            elif s == Order.STATUS_PENDING + Order.STATUS_PAID:
+                opqs = opqs.filter(order__status__in=[Order.STATUS_PENDING, Order.STATUS_PAID])
+            elif s == Order.STATUS_PAID + 'v':
+                opqs = opqs.filter(
+                    Q(order__status=Order.STATUS_PAID) |
+                    Q(order__status=Order.STATUS_PENDING, order__valid_if_pending=True)
+                )
+            elif s == Order.STATUS_PENDING + Order.STATUS_EXPIRED:
+                opqs = opqs.filter(order__status__in=[Order.STATUS_PENDING, Order.STATUS_EXPIRED])
+            else:
+                opqs = opqs.filter(order__status=s)
+
+        if s not in (Order.STATUS_CANCELED, ""):
+            opqs = opqs.filter(canceled=False)
+        if fdata.get("item", "") != "":
+            i = fdata.get("item", "")
+            if '-' in i:
+                opqs = opqs.filter(
+                    item_id=i.split('-')[0],
+                    variation_id=i.split('-')[1],
+                )
+            else:
+                opqs = opqs.filter(item_id=i)
+
+        return opqs
 
 
 class SubEventFilterForm(FilterForm):
@@ -818,17 +1375,30 @@ class SubEventFilterForm(FilterForm):
     date_from = forms.DateField(
         label=_('Date from'),
         required=False,
-        widget=DatePickerWidget,
+        widget=DatePickerWidget({
+            'placeholder': _('Date from'),
+        }),
     )
     date_until = forms.DateField(
         label=_('Date until'),
         required=False,
-        widget=DatePickerWidget,
+        widget=DatePickerWidget({
+            'placeholder': _('Date until'),
+        }),
     )
-    weekday = forms.ChoiceField(
+    time_from = forms.TimeField(
+        label=_('Start time from'),
+        required=False,
+        widget=TimePickerWidget({}),
+    )
+    time_until = forms.TimeField(
+        label=_('Start time until'),
+        required=False,
+        widget=TimePickerWidget({}),
+    )
+    weekday = forms.MultipleChoiceField(
         label=_('Weekday'),
         choices=(
-            ('', _('All days')),
             ('2', _('Monday')),
             ('3', _('Tuesday')),
             ('4', _('Wednesday')),
@@ -837,21 +1407,35 @@ class SubEventFilterForm(FilterForm):
             ('7', _('Saturday')),
             ('1', _('Sunday')),
         ),
+        widget=forms.CheckboxSelectMultiple,
         required=False
     )
     query = forms.CharField(
         label=_('Event name'),
-        widget=forms.TextInput(attrs={
-            'placeholder': _('Event name'),
-            'autofocus': 'autofocus'
-        }),
+        widget=forms.TextInput(),
         required=False
     )
 
     def __init__(self, *args, **kwargs):
+        self.event = kwargs.pop('event')
         super().__init__(*args, **kwargs)
         self.fields['date_from'].widget = DatePickerWidget()
         self.fields['date_until'].widget = DatePickerWidget()
+        for p in self.meta_properties.all():
+            self.fields['meta_{}'.format(p.name)] = forms.CharField(
+                label=p.name,
+                required=False,
+                widget=forms.TextInput(
+                    attrs={
+                        'data-typeahead-url': reverse('control:event.subevents.meta.typeahead', kwargs={
+                            'organizer': self.event.organizer.slug,
+                            'event': self.event.slug
+                        }) + '?' + urlencode({
+                            'property': p.name,
+                        })
+                    }
+                )
+            )
 
     def filter_qs(self, qs):
         fdata = self.cleaned_data
@@ -885,12 +1469,12 @@ class SubEventFilterForm(FilterForm):
             )
 
         if fdata.get('weekday'):
-            qs = qs.annotate(wday=ExtractWeekDay('date_from')).filter(wday=fdata.get('weekday'))
+            qs = qs.annotate(wday=ExtractWeekDay('date_from')).filter(wday__in=fdata.get('weekday'))
 
         if fdata.get('query'):
             query = fdata.get('query')
             qs = qs.filter(
-                Q(name__icontains=i18ncomp(query)) | Q(location__icontains=query)
+                Q(name__icontains=i18ncomp(query)) | Q(location__icontains=query) | Q(comment__icontains=query)
             )
 
         if fdata.get('date_until'):
@@ -909,10 +1493,171 @@ class SubEventFilterForm(FilterForm):
             ), get_current_timezone())
             qs = qs.filter(date_from__gte=date_start)
 
+        if fdata.get('time_until'):
+            qs = qs.filter(date_from__time__lte=fdata.get('time_until'))
+        if fdata.get('time_from'):
+            qs = qs.filter(date_from__time__gte=fdata.get('time_from'))
+
+        filters_by_property_name = {}
+        for i, p in enumerate(self.meta_properties):
+            d = fdata.get('meta_{}'.format(p.name))
+            if d:
+                semv_with_value = SubEventMetaValue.objects.filter(
+                    subevent=OuterRef('pk'),
+                    property__pk=p.pk,
+                    value=d
+                )
+                semv_with_any_value = SubEventMetaValue.objects.filter(
+                    subevent=OuterRef('pk'),
+                    property__pk=p.pk,
+                )
+                qs = qs.annotate(**{'attr_{}'.format(i): Exists(semv_with_value)})
+                if p.name in filters_by_property_name:
+                    filters_by_property_name[p.name] |= Q(**{'attr_{}'.format(i): True})
+                else:
+                    filters_by_property_name[p.name] = Q(**{'attr_{}'.format(i): True})
+                default = self.event.meta_data[p.name]
+                if default == d:
+                    qs = qs.annotate(**{'attr_{}_any'.format(i): Exists(semv_with_any_value)})
+                    filters_by_property_name[p.name] |= Q(**{'attr_{}_any'.format(i): False})
+        for f in filters_by_property_name.values():
+            qs = qs.filter(f)
+
         if fdata.get('ordering'):
-            qs = qs.order_by(self.get_order_by())
+            qs = qs.order_by(*get_deterministic_ordering(SubEvent, self.get_order_by()))
         else:
-            qs = qs.order_by('-date_from')
+            qs = qs.order_by('-date_from', '-pk')
+
+        return qs
+
+    @cached_property
+    def meta_properties(self):
+        return self.event.organizer.meta_properties.filter(filter_allowed=True)
+
+
+class QuotaFilterForm(FilterForm):
+    orders = {
+        '-date': ('-subevent__date_from', 'name', 'pk'),
+        'date': ('subevent__date_from', '-name', '-pk'),
+        'size': ('size', 'name', 'pk'),
+        '-size': ('-size', '-name', '-pk'),
+        'name': ('name', 'pk'),
+        '-name': ('-name', '-pk'),
+    }
+    subevent = forms.ModelChoiceField(
+        label=pgettext_lazy('subevent', 'Date'),
+        queryset=SubEvent.objects.none(),
+        required=False,
+        empty_label=pgettext_lazy('subevent', 'All dates')
+    )
+    date_from = forms.DateField(
+        label=_('Date from'),
+        required=False,
+        widget=DatePickerWidget({
+            'placeholder': _('Date from'),
+        }),
+    )
+    date_until = forms.DateField(
+        label=_('Date until'),
+        required=False,
+        widget=DatePickerWidget({
+            'placeholder': _('Date until'),
+        }),
+    )
+    time_from = forms.TimeField(
+        label=_('Start time from'),
+        required=False,
+        widget=TimePickerWidget({}),
+    )
+    time_until = forms.TimeField(
+        label=_('Start time until'),
+        required=False,
+        widget=TimePickerWidget({}),
+    )
+    weekday = forms.MultipleChoiceField(
+        label=_('Weekday'),
+        choices=(
+            ('2', _('Monday')),
+            ('3', _('Tuesday')),
+            ('4', _('Wednesday')),
+            ('5', _('Thursday')),
+            ('6', _('Friday')),
+            ('7', _('Saturday')),
+            ('1', _('Sunday')),
+        ),
+        widget=forms.CheckboxSelectMultiple,
+        required=False
+    )
+    query = forms.CharField(
+        label=_('Quota name'),
+        widget=forms.TextInput(),
+        required=False
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.event = kwargs.pop('event')
+        super().__init__(*args, **kwargs)
+        if self.event.has_subevents:
+            self.fields['date_from'].widget = DatePickerWidget()
+            self.fields['date_until'].widget = DatePickerWidget()
+            self.fields['subevent'].queryset = self.event.subevents.all()
+            self.fields['subevent'].widget = Select2(
+                attrs={
+                    'data-model-select2': 'event',
+                    'data-select2-url': reverse('control:event.subevents.select2', kwargs={
+                        'event': self.event.slug,
+                        'organizer': self.event.organizer.slug,
+                    }),
+                    'data-placeholder': pgettext_lazy('subevent', 'All dates')
+                }
+            )
+            self.fields['subevent'].widget.choices = self.fields['subevent'].choices
+        else:
+            del self.fields['subevent']
+            del self.fields['date_from']
+            del self.fields['date_until']
+            del self.fields['time_from']
+            del self.fields['time_until']
+            del self.fields['weekday']
+
+    def filter_qs(self, qs):
+        fdata = self.cleaned_data
+
+        if fdata.get('weekday'):
+            qs = qs.annotate(wday=ExtractWeekDay('subevent__date_from')).filter(wday__in=fdata.get('weekday'))
+
+        if fdata.get('subevent'):
+            qs = qs.filter(subevent=fdata["subevent"])
+
+        if fdata.get('query'):
+            query = fdata.get('query')
+            qs = qs.filter(name__icontains=query)
+
+        if fdata.get('date_until'):
+            date_end = make_aware(datetime.combine(
+                fdata.get('date_until') + timedelta(days=1),
+                time(hour=0, minute=0, second=0, microsecond=0)
+            ), get_current_timezone())
+            qs = qs.filter(
+                Q(subevent__date_to__isnull=True, subevent__date_from__lt=date_end) |
+                Q(subevent__date_to__isnull=False, subevent__date_to__lt=date_end)
+            )
+        if fdata.get('date_from'):
+            date_start = make_aware(datetime.combine(
+                fdata.get('date_from'),
+                time(hour=0, minute=0, second=0, microsecond=0)
+            ), get_current_timezone())
+            qs = qs.filter(subevent__date_from__gte=date_start)
+
+        if fdata.get('time_until'):
+            qs = qs.filter(subevent__date_from__time__lte=fdata.get('time_until'))
+        if fdata.get('time_from'):
+            qs = qs.filter(subevent__date_from__time__gte=fdata.get('time_from'))
+
+        if fdata.get('ordering'):
+            qs = qs.order_by(*get_deterministic_ordering(Quota, self.get_order_by()))
+        else:
+            qs = qs.order_by('-subevent__date_from', 'name', 'pk')
 
         return qs
 
@@ -926,7 +1671,6 @@ class OrganizerFilterForm(FilterForm):
         label=_('Organizer name'),
         widget=forms.TextInput(attrs={
             'placeholder': _('Organizer name'),
-            'autofocus': 'autofocus'
         }),
         required=False
     )
@@ -955,6 +1699,8 @@ class GiftCardFilterForm(FilterForm):
         'issuance': 'issuance',
         'expires': F('expires').asc(nulls_last=True),
         '-expires': F('expires').desc(nulls_first=True),
+        'last_tx': F('last_tx').asc(nulls_first=True),
+        '-last_tx': F('last_tx').desc(nulls_last=True),
         'secret': 'secret',
         'value': 'cached_value',
     }
@@ -968,7 +1714,7 @@ class GiftCardFilterForm(FilterForm):
         required=False
     )
     state = forms.ChoiceField(
-        label=_('Empty'),
+        label=_('Status'),
         choices=(
             ('', _('All')),
             ('empty', _('Empty')),
@@ -982,7 +1728,6 @@ class GiftCardFilterForm(FilterForm):
         label=_('Search query'),
         widget=forms.TextInput(attrs={
             'placeholder': _('Search query'),
-            'autofocus': 'autofocus'
         }),
         required=False
     )
@@ -1000,6 +1745,7 @@ class GiftCardFilterForm(FilterForm):
                 Q(secret__icontains=query)
                 | Q(transactions__text__icontains=query)
                 | Q(transactions__order__code__icontains=query)
+                | Q(owner_ticket__order__code__icontains=query)
             )
         if fdata.get('testmode') == 'yes':
             qs = qs.filter(testmode=True)
@@ -1018,6 +1764,184 @@ class GiftCardFilterForm(FilterForm):
             qs = qs.order_by(self.get_order_by())
         else:
             qs = qs.order_by('-issuance')
+
+        return qs.distinct()
+
+
+class CustomerFilterForm(FilterForm):
+    orders = {
+        'email': 'email',
+        'identifier': 'identifier',
+        'name': 'name_cached',
+        'external_identifier': 'external_identifier',
+    }
+    query = forms.CharField(
+        label=_('Search query'),
+        widget=forms.TextInput(attrs={
+            'placeholder': _('Search query'),
+        }),
+        required=False
+    )
+    status = forms.ChoiceField(
+        label=_('Status'),
+        required=False,
+        choices=(
+            ('', _('All')),
+            ('active', _('active')),
+            ('disabled', _('disabled')),
+            ('unverified', _('not yet activated')),
+        )
+    )
+    memberships = forms.ChoiceField(
+        label=_('Memberships'),
+        required=False,
+        choices=(
+            ('', _('All')),
+            ('no', _('Has no memberships')),
+            ('any', _('Has any membership')),
+            ('valid', _('Has valid membership')),
+        )
+    )
+
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('request')
+        super().__init__(*args, **kwargs)
+
+    def filter_qs(self, qs):
+        fdata = self.cleaned_data
+
+        if fdata.get('query'):
+            query = fdata.get('query')
+            qs = qs.filter(
+                Q(email__icontains=query)
+                | Q(name_cached__icontains=query)
+                | Q(identifier__istartswith=query)
+                | Q(external_identifier__icontains=query)
+                | Q(notes__icontains=query)
+            )
+
+        if fdata.get('status') == 'active':
+            qs = qs.filter(is_active=True, is_verified=True)
+        elif fdata.get('status') == 'disabled':
+            qs = qs.filter(is_active=False)
+        elif fdata.get('status') == 'unverified':
+            qs = qs.filter(is_verified=False)
+
+        if fdata.get('memberships') == 'no':
+            qs = qs.filter(memberships__isnull=True)
+        elif fdata.get('memberships') == 'any':
+            qs = qs.filter(memberships__isnull=False)
+        elif fdata.get('memberships') == 'valid':
+            qs = qs.filter(memberships__date_start__lt=now(), memberships__date_end__gt=now(), memberships__canceled=False)
+
+        if fdata.get('ordering'):
+            qs = qs.order_by(self.get_order_by())
+        else:
+            qs = qs.order_by('-email')
+
+        return qs.distinct()
+
+
+class ReusableMediaFilterForm(FilterForm):
+    orders = {
+        'type': 'type',
+        'identifier': 'identifier',
+    }
+    query = forms.CharField(
+        label=_('Search query'),
+        widget=forms.TextInput(attrs={
+            'placeholder': _('Search query'),
+        }),
+        required=False
+    )
+    status = forms.ChoiceField(
+        label=_('Status'),
+        required=False,
+        choices=(
+            ('', _('All')),
+            ('active', _('active')),
+            ('disabled', _('disabled')),
+            ('expired', _('expired')),
+        )
+    )
+
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('request')
+        super().__init__(*args, **kwargs)
+
+    def filter_qs(self, qs):
+        fdata = self.cleaned_data
+
+        if fdata.get('query'):
+            query = fdata.get('query')
+            qs = qs.filter(
+                Q(identifier__icontains=query)
+                | Q(customer__identifier__icontains=query)
+                | Q(customer__external_identifier__istartswith=query)
+                | Q(linked_orderpositions__order__code__icontains=query)
+                | Q(linked_giftcard__secret__icontains=query)
+            )
+
+        if fdata.get('status') == 'active':
+            qs = qs.filter(Q(expires__gt=now()) | Q(expires__isnull=False), active=True)
+        elif fdata.get('status') == 'disabled':
+            qs = qs.filter(active=False)
+        elif fdata.get('status') == 'expired':
+            qs = qs.filter(expires__lte=now())
+
+        if fdata.get('ordering'):
+            qs = qs.order_by(self.get_order_by())
+        else:
+            qs = qs.order_by("identifier", "type", "organizer")
+
+        return qs.distinct()
+
+
+class TeamFilterForm(FilterForm):
+    orders = {
+        'name': 'name',
+    }
+    query = forms.CharField(
+        label=_('Search query'),
+        widget=forms.TextInput(attrs={
+            'placeholder': _('Search query'),
+        }),
+        required=False
+    )
+
+    def __init__(self, *args, **kwargs):
+        kwargs.pop('request')
+        super().__init__(*args, **kwargs)
+
+    def filter_qs(self, qs):
+        fdata = self.cleaned_data
+
+        if fdata.get('query'):
+            query = fdata.get('query')
+            qs = qs.filter(
+                Q(Exists(
+                    Team.members.through.objects.filter(
+                        Q(user__email__icontains=query) | Q(user__fullname__icontains=query),
+                        team_id=OuterRef('pk'),
+                    )
+                ))
+                | Q(Exists(
+                    TeamInvite.objects.filter(
+                        email__icontains=query,
+                        team_id=OuterRef('pk'),
+                    )
+                ))
+                | Q(Exists(
+                    TeamAPIToken.objects.filter(
+                        name__icontains=query,
+                        team_id=OuterRef('pk'),
+                    )
+                ))
+                | Q(name__icontains=query)
+            )
+
+        if fdata.get('ordering'):
+            qs = qs.order_by(*get_deterministic_ordering(Team, self.get_order_by()))
 
         return qs.distinct()
 
@@ -1060,11 +1984,22 @@ class EventFilterForm(FilterForm):
     )
     query = forms.CharField(
         label=_('Event name'),
-        widget=forms.TextInput(attrs={
-            'placeholder': _('Event name'),
-            'autofocus': 'autofocus'
-        }),
+        widget=forms.TextInput(),
         required=False
+    )
+    date_from = forms.DateField(
+        label=_('Date from'),
+        required=False,
+        widget=DatePickerWidget({
+            'placeholder': _('Date from'),
+        }),
+    )
+    date_until = forms.DateField(
+        label=_('Date until'),
+        required=False,
+        widget=DatePickerWidget({
+            'placeholder': _('Date until'),
+        }),
     )
 
     def __init__(self, *args, **kwargs):
@@ -1147,6 +2082,22 @@ class EventFilterForm(FilterForm):
                 Q(name__icontains=i18ncomp(query)) | Q(slug__icontains=query)
             )
 
+        if fdata.get('date_until'):
+            date_end = make_aware(datetime.combine(
+                fdata.get('date_until') + timedelta(days=1),
+                time(hour=0, minute=0, second=0, microsecond=0)
+            ), get_current_timezone())
+            qs = qs.filter(
+                Q(date_to__isnull=True, date_from__lt=date_end) |
+                Q(date_to__isnull=False, date_to__lt=date_end)
+            )
+        if fdata.get('date_from'):
+            date_start = make_aware(datetime.combine(
+                fdata.get('date_from'),
+                time(hour=0, minute=0, second=0, microsecond=0)
+            ), get_current_timezone())
+            qs = qs.filter(date_from__gte=date_start)
+
         filters_by_property_name = {}
         for i, p in enumerate(self.meta_properties):
             d = fdata.get('meta_{}'.format(p.name))
@@ -1172,36 +2123,37 @@ class EventFilterForm(FilterForm):
             qs = qs.filter(f)
 
         if fdata.get('ordering'):
-            qs = qs.order_by(self.get_order_by())
+            qs = qs.order_by(*get_deterministic_ordering(Event, self.get_order_by()))
 
         return qs
 
     @cached_property
     def meta_properties(self):
         if self.organizer:
-            return self.organizer.meta_properties.all()
+            return self.organizer.meta_properties.filter(filter_allowed=True)
         else:
             # We ignore superuser permissions here. This is intentional – we do not want to show super
             # users a form with all meta properties ever assigned.
             return EventMetaProperty.objects.filter(
-                organizer_id__in=self.request.user.teams.values_list('organizer', flat=True)
+                organizer_id__in=self.request.user.teams.values_list('organizer', flat=True),
+                filter_allowed=True,
             )
 
 
-class CheckInFilterForm(FilterForm):
+class CheckinListAttendeeFilterForm(FilterForm):
     orders = {
         'code': ('order__code', 'item__name'),
         '-code': ('-order__code', '-item__name'),
         'email': ('order__email', 'item__name'),
         '-email': ('-order__email', '-item__name'),
-        'status': (FixedOrderBy(F('last_entry'), nulls_first=True, descending=True), 'order__code'),
-        '-status': (FixedOrderBy(F('last_entry'), nulls_last=True), '-order__code'),
-        'timestamp': (FixedOrderBy(F('last_entry'), nulls_first=True), 'order__code'),
-        '-timestamp': (FixedOrderBy(F('last_entry'), nulls_last=True, descending=True), '-order__code'),
+        'status': (OrderBy(F('last_entry'), nulls_first=True, descending=True), 'order__code'),
+        '-status': (OrderBy(F('last_entry'), nulls_last=True), '-order__code'),
+        'timestamp': (OrderBy(F('last_entry'), nulls_first=True), 'order__code'),
+        '-timestamp': (OrderBy(F('last_entry'), nulls_last=True, descending=True), '-order__code'),
         'item': ('item__name', 'variation__value', 'order__code'),
         '-item': ('-item__name', '-variation__value', '-order__code'),
-        'seat': ('seat__sorting_rank', 'seat__guid'),
-        '-seat': ('-seat__sorting_rank', '-seat__guid'),
+        'seat': ('seat__sorting_rank', 'seat__seat_guid'),
+        '-seat': ('-seat__sorting_rank', '-seat__seat_guid'),
         'date': ('subevent__date_from', 'subevent__id', 'order__code'),
         '-date': ('-subevent__date_from', 'subevent__id', '-order__code'),
         'name': {'_order': F('display_name').asc(nulls_first=True),
@@ -1214,7 +2166,6 @@ class CheckInFilterForm(FilterForm):
         label=_('Search attendee…'),
         widget=forms.TextInput(attrs={
             'placeholder': _('Search attendee…'),
-            'autofocus': 'autofocus'
         }),
         required=False
     )
@@ -1222,9 +2173,9 @@ class CheckInFilterForm(FilterForm):
         label=_('Check-in status'),
         choices=(
             ('', _('All attendees')),
-            ('3', pgettext_lazy('checkin state', 'Checked in but left')),
-            ('2', pgettext_lazy('checkin state', 'Present')),
             ('1', _('Checked in')),
+            ('2', pgettext_lazy('checkin state', 'Present')),
+            ('3', pgettext_lazy('checkin state', 'Checked in but left')),
             ('0', _('Not checked in')),
         ),
         required=False,
@@ -1235,6 +2186,24 @@ class CheckInFilterForm(FilterForm):
         required=False,
         empty_label=_('All products')
     )
+    subevent = forms.ModelChoiceField(
+        label=pgettext_lazy('subevent', 'Date'),
+        queryset=SubEvent.objects.none(),
+        required=False,
+        empty_label=pgettext_lazy('subevent', 'All dates')
+    )
+    subevent_from = forms.SplitDateTimeField(
+        widget=SplitDateTimePickerWidget(attrs={
+        }),
+        label=pgettext_lazy('subevent', 'Date start from'),
+        required=False,
+    )
+    subevent_until = forms.SplitDateTimeField(
+        widget=SplitDateTimePickerWidget(attrs={
+        }),
+        label=pgettext_lazy('subevent', 'Date start until'),
+        required=False,
+    )
 
     def __init__(self, *args, **kwargs):
         self.event = kwargs.pop('event')
@@ -1244,6 +2213,24 @@ class CheckInFilterForm(FilterForm):
             self.fields['item'].queryset = self.event.items.all()
         else:
             self.fields['item'].queryset = self.list.limit_products.all()
+
+        if self.event.has_subevents:
+            self.fields['subevent'].queryset = self.event.subevents.all()
+            self.fields['subevent'].widget = Select2(
+                attrs={
+                    'data-model-select2': 'event',
+                    'data-select2-url': reverse('control:event.subevents.select2', kwargs={
+                        'event': self.event.slug,
+                        'organizer': self.event.organizer.slug,
+                    }),
+                    'data-placeholder': pgettext_lazy('subevent', 'All dates')
+                }
+            )
+            self.fields['subevent'].widget.choices = self.fields['subevent'].choices
+        else:
+            del self.fields['subevent']
+            del self.fields['subevent_from']
+            del self.fields['subevent_until']
 
     def filter_qs(self, qs):
         fdata = self.cleaned_data
@@ -1267,9 +2254,7 @@ class CheckInFilterForm(FilterForm):
             if s == '1':
                 qs = qs.filter(last_entry__isnull=False)
             elif s == '2':
-                qs = qs.filter(last_entry__isnull=False).filter(
-                    Q(last_exit__isnull=True) | Q(last_exit__lt=F('last_entry'))
-                )
+                qs = self.list._filter_positions_inside(qs)
             elif s == '3':
                 qs = qs.filter(last_entry__isnull=False).filter(
                     Q(last_exit__isnull=False) & Q(last_exit__gte=F('last_entry'))
@@ -1282,14 +2267,22 @@ class CheckInFilterForm(FilterForm):
             if isinstance(ob, dict):
                 ob = dict(ob)
                 o = ob.pop('_order')
-                qs = qs.annotate(**ob).order_by(o)
+                qs = qs.annotate(**ob).order_by(*get_deterministic_ordering(OrderPosition, [o]))
             elif isinstance(ob, (list, tuple)):
-                qs = qs.order_by(*ob)
+                qs = qs.order_by(*get_deterministic_ordering(OrderPosition, ob))
             else:
-                qs = qs.order_by(ob)
+                qs = qs.order_by(*get_deterministic_ordering(OrderPosition, [ob]))
 
         if fdata.get('item'):
             qs = qs.filter(item=fdata.get('item'))
+
+        if fdata.get('subevent'):
+            qs = qs.filter(subevent_id=fdata.get('subevent').pk)
+
+        if fdata.get('subevent_from'):
+            qs = qs.filter(subevent__date_from__gte=fdata.get('subevent_from'))
+        if fdata.get('subevent_until'):
+            qs = qs.filter(subevent__date_from__lte=fdata.get('subevent_until'))
 
         return qs
 
@@ -1321,7 +2314,6 @@ class UserFilterForm(FilterForm):
         label=_('Search query'),
         widget=forms.TextInput(attrs={
             'placeholder': _('Search query'),
-            'autofocus': 'autofocus'
         }),
         required=False
     )
@@ -1366,7 +2358,7 @@ class VoucherFilterForm(FilterForm):
             'item__category__position',
             'item__category',
             'item__position',
-            'item__variation__position',
+            'variation__position',
             'quota__name',
         ),
         'subevent': 'subevent__date_from',
@@ -1376,7 +2368,7 @@ class VoucherFilterForm(FilterForm):
             '-item__category__position',
             '-item__category',
             '-item__position',
-            '-item__variation__position',
+            '-variation__position',
             '-quota__name',
         )
     }
@@ -1413,7 +2405,6 @@ class VoucherFilterForm(FilterForm):
         label=_('Search voucher'),
         widget=forms.TextInput(attrs={
             'placeholder': _('Search voucher'),
-            'autofocus': 'autofocus'
         }),
         required=False
     )
@@ -1452,11 +2443,11 @@ class VoucherFilterForm(FilterForm):
         for i in self.event.items.prefetch_related('variations').all():
             variations = list(i.variations.all())
             if variations:
-                choices.append((str(i.pk), _('{product} – Any variation').format(product=i.name)))
+                choices.append((str(i.pk), _('{product} – Any variation').format(product=str(i))))
                 for v in variations:
-                    choices.append(('%d-%d' % (i.pk, v.pk), '%s – %s' % (i.name, v.value)))
+                    choices.append(('%d-%d' % (i.pk, v.pk), '%s – %s' % (str(i), v.value)))
             else:
-                choices.append((str(i.pk), i.name))
+                choices.append((str(i.pk), str(i)))
         for q in self.event.quotas.all():
             choices.append(('q-%d' % q.pk, _('Any product in quota "{quota}"').format(quota=q)))
         self.fields['itemvar'].choices = choices
@@ -1473,7 +2464,7 @@ class VoucherFilterForm(FilterForm):
             if s == '<>':
                 qs = qs.filter(Q(tag__isnull=True) | Q(tag=''))
             elif s[0] == '"' and s[-1] == '"':
-                qs = qs.filter(tag__iexact=s[1:-1])
+                qs = qs.filter(tag__exact=s[1:-1])
             else:
                 qs = qs.filter(tag__icontains=s)
 
@@ -1498,7 +2489,8 @@ class VoucherFilterForm(FilterForm):
                 qs = qs.filter(Q(valid_until__isnull=False) & Q(valid_until__lt=now())).filter(redeemed=0)
             elif s == 'c':
                 checkins = Checkin.objects.filter(
-                    position__voucher=OuterRef('pk')
+                    position__voucher=OuterRef('pk'),
+                    list__consider_tickets_used=True,
                 )
                 qs = qs.annotate(has_checkin=Exists(checkins)).filter(
                     redeemed__gt=0, has_checkin=True
@@ -1521,11 +2513,11 @@ class VoucherFilterForm(FilterForm):
             if isinstance(ob, dict):
                 ob = dict(ob)
                 o = ob.pop('_order')
-                qs = qs.annotate(**ob).order_by(o)
+                qs = qs.annotate(**ob).order_by(*get_deterministic_ordering(Voucher, o))
             elif isinstance(ob, (list, tuple)):
-                qs = qs.order_by(*ob)
+                qs = qs.order_by(*get_deterministic_ordering(Voucher, ob))
             else:
-                qs = qs.order_by(ob)
+                qs = qs.order_by(*get_deterministic_ordering(Voucher, ob))
 
         return qs
 
@@ -1608,9 +2600,7 @@ class RefundFilterForm(FilterForm):
                                       OrderRefund.REFUND_STATE_EXTERNAL])
 
         if fdata.get('ordering'):
-            qs = qs.order_by(self.get_order_by())
-        else:
-            qs = qs.order_by('-created')
+            qs = qs.order_by(*get_deterministic_ordering(OrderRefund, self.get_order_by()))
         return qs
 
 
@@ -1660,3 +2650,449 @@ class OverviewFilterForm(FilterForm):
             self.fields['subevent'].widget.choices = self.fields['subevent'].choices
         elif 'subevent':
             del self.fields['subevent']
+
+
+class CheckinFilterForm(FilterForm):
+    status = forms.ChoiceField(
+        label=_('Status'),
+        choices=[
+            ('', _('All check-ins')),
+            ('successful', _('Successful check-ins')),
+            ('unsuccessful', _('Unsuccessful check-ins')),
+        ] + list(Checkin.REASONS),
+        required=False
+    )
+    type = forms.ChoiceField(
+        label=_('Scan type'),
+        choices=[
+            ('', _('All directions')),
+        ] + list(Checkin.CHECKIN_TYPES),
+        required=False
+    )
+    itemvar = forms.ChoiceField(
+        label=_("Product"),
+        required=False
+    )
+    device = SafeModelChoiceField(
+        label=_('Device'),
+        empty_label=_('All devices'),
+        queryset=Device.objects.none(),
+        required=False
+    )
+    gate = SafeModelChoiceField(
+        label=_('Gate'),
+        empty_label=_('All gates'),
+        queryset=Gate.objects.none(),
+        required=False
+    )
+    checkin_list = SafeModelChoiceField(queryset=CheckinList.objects.none(), required=False)  # overridden later
+    datetime_from = forms.SplitDateTimeField(
+        widget=SplitDateTimePickerWidget(attrs={
+        }),
+        label=pgettext_lazy('filter', 'Start date'),
+        required=False,
+    )
+    datetime_until = forms.SplitDateTimeField(
+        widget=SplitDateTimePickerWidget(attrs={
+        }),
+        label=pgettext_lazy('filter', 'End date'),
+        required=False,
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.event = kwargs.pop('event')
+        super().__init__(*args, **kwargs)
+
+        self.fields['device'].queryset = self.event.organizer.devices.all().order_by('device_id')
+        self.fields['device'].widget = Select2(
+            attrs={
+                'data-model-select2': 'generic',
+                'data-select2-url': reverse('control:organizer.devices.select2', kwargs={
+                    'organizer': self.event.organizer.slug,
+                }),
+                'data-placeholder': _('All devices'),
+            }
+        )
+        self.fields['device'].widget.choices = self.fields['device'].choices
+        self.fields['device'].label = _('Device')
+
+        self.fields['gate'].queryset = self.event.organizer.gates.all()
+        self.fields['gate'].widget = Select2(
+            attrs={
+                'data-model-select2': 'generic',
+                'data-select2-url': reverse('control:organizer.gates.select2', kwargs={
+                    'organizer': self.event.organizer.slug,
+                }),
+                'data-placeholder': _('All gates'),
+            }
+        )
+        self.fields['gate'].widget.choices = self.fields['gate'].choices
+        self.fields['gate'].label = _('Gate')
+
+        self.fields['checkin_list'].queryset = self.event.checkin_lists.all()
+        self.fields['checkin_list'].widget = Select2(
+            attrs={
+                'data-model-select2': 'generic',
+                'data-select2-url': reverse('control:event.orders.checkinlists.select2', kwargs={
+                    'event': self.event.slug,
+                    'organizer': self.event.organizer.slug,
+                }),
+                'data-placeholder': _('All check-in lists'),
+            }
+        )
+        self.fields['checkin_list'].widget.choices = self.fields['checkin_list'].choices
+        self.fields['checkin_list'].label = _('Check-in list')
+
+        choices = [('', _('All products'))]
+        for i in self.event.items.prefetch_related('variations').all():
+            variations = list(i.variations.all())
+            if variations:
+                choices.append((str(i.pk), _('{product} – Any variation').format(product=str(i))))
+                for v in variations:
+                    choices.append(('%d-%d' % (i.pk, v.pk), '%s – %s' % (str(i), v.value)))
+            else:
+                choices.append((str(i.pk), str(i)))
+        self.fields['itemvar'].choices = choices
+
+        self.fields['itemvar'].choices = choices
+        self.fields['itemvar'].widget = Select2ItemVarQuota(
+            attrs={
+                'data-model-select2': 'generic',
+                'data-select2-url': reverse('control:event.items.itemvar.select2', kwargs={
+                    'event': self.event.slug,
+                    'organizer': self.event.organizer.slug,
+                }),
+                'data-placeholder': _('All products')
+            }
+        )
+        self.fields['itemvar'].required = False
+        self.fields['itemvar'].widget.choices = self.fields['itemvar'].choices
+
+    def filter_qs(self, qs):
+        fdata = self.cleaned_data
+
+        if fdata.get('status'):
+            s = fdata.get('status')
+            if s == 'successful':
+                qs = qs.filter(successful=True)
+            elif s == 'unsuccessful':
+                qs = qs.filter(successful=False)
+            elif s:
+                qs = qs.filter(successful=False, error_reason=s)
+
+        if fdata.get('type'):
+            qs = qs.filter(type=fdata.get('type'))
+
+        if fdata.get('itemvar'):
+            if '-' in fdata.get('itemvar'):
+                qs = qs.alias(
+                    item_id=Coalesce('raw_item_id', 'position__item_id'),
+                    variation_id=Coalesce('raw_variation_id', 'position__variation_id'),
+                ).filter(
+                    item_id=fdata.get('itemvar').split('-')[0],
+                    variation_id=fdata.get('itemvar').split('-')[1]
+                )
+            else:
+                qs = qs.alias(
+                    item_id=Coalesce('raw_item_id', 'position__item_id'),
+                ).filter(item_id=fdata.get('itemvar'))
+
+        if fdata.get('device'):
+            qs = qs.filter(device_id=fdata.get('device').pk)
+
+        if fdata.get('gate'):
+            qs = qs.filter(gate_id=fdata.get('gate').pk)
+
+        if fdata.get('checkin_list'):
+            qs = qs.filter(list_id=fdata.get('checkin_list').pk)
+
+        if fdata.get('datetime_from'):
+            qs = qs.filter(datetime__gte=fdata.get('datetime_from'))
+
+        if fdata.get('datetime_until'):
+            qs = qs.filter(datetime__lte=fdata.get('datetime_until'))
+
+        return qs
+
+
+class CheckinListFilterForm(FilterForm):
+    orders = {
+        "name": ("name", "subevent__date_from", "pk"),
+        "-name": ("-name", "-subevent__date_from", "-pk"),
+        "subevent": ("subevent__date_from", "name", "pk"),
+        "-subevent": ("-subevent__date_from", "-name", "-pk"),
+    }
+    subevent = forms.ModelChoiceField(
+        label=pgettext_lazy('subevent', 'Date'),
+        queryset=SubEvent.objects.none(),
+        required=False,
+        empty_label=pgettext_lazy('subevent', 'All dates')
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.event = kwargs.pop("event")
+        super().__init__(*args, **kwargs)
+        if self.event.has_subevents:
+            self.fields['subevent'].queryset = self.event.subevents.all()
+            self.fields['subevent'].widget = Select2(
+                attrs={
+                    'data-model-select2': 'event',
+                    'data-select2-url': reverse('control:event.subevents.select2', kwargs={
+                        'event': self.event.slug,
+                        'organizer': self.event.organizer.slug,
+                    }),
+                    'data-placeholder': pgettext_lazy('subevent', 'All dates')
+                }
+            )
+            self.fields['subevent'].widget.choices = self.fields['subevent'].choices
+        elif 'subevent':
+            del self.fields['subevent']
+
+    def filter_qs(self, qs):
+        fdata = self.cleaned_data
+
+        if fdata.get('subevent'):
+            qs = qs.filter(subevent=fdata.get('subevent'))
+
+        if fdata.get("ordering"):
+            ob = self.orders[fdata.get('ordering')]
+            if isinstance(ob, dict):
+                ob = dict(ob)
+                o = ob.pop('_order')
+                qs = qs.annotate(**ob).order_by(*get_deterministic_ordering(OrderPosition, [o]))
+            elif isinstance(ob, (list, tuple)):
+                qs = qs.order_by(*get_deterministic_ordering(OrderPosition, ob))
+            else:
+                qs = qs.order_by(*get_deterministic_ordering(OrderPosition, [ob]))
+        else:
+            qs = qs.order_by("subevent__date_from", "name", "pk")
+
+        return qs.distinct()
+
+
+class DeviceFilterForm(FilterForm):
+    orders = {
+        'name': Upper('name'),
+        '-name': Upper('name').desc(),
+        'device_id': 'device_id',
+        'initialized': F('initialized').asc(nulls_last=True),
+        '-initialized': F('initialized').desc(nulls_first=True),
+    }
+    query = forms.CharField(
+        label=_('Search query'),
+        widget=forms.TextInput(attrs={
+            'placeholder': _('Search query'),
+        }),
+        required=False
+    )
+    gate = forms.ModelChoiceField(
+        queryset=Gate.objects.none(),
+        label=_('Gate'),
+        empty_label=_('All gates'),
+        required=False,
+    )
+    software_brand = forms.ChoiceField(
+        label=_('Software'),
+        choices=[
+            ('', _('All')),
+        ],
+        required=False,
+    )
+    state = forms.ChoiceField(
+        label=_('Device status'),
+        choices=[
+            ('all', _('All devices')),
+            ('active', _('Active devices')),
+            ('revoked', _('Revoked devices'))
+        ],
+        required=False
+    )
+
+    def __init__(self, *args, **kwargs):
+        request = kwargs.pop('request')
+        super().__init__(*args, **kwargs)
+        self.fields['gate'].queryset = request.organizer.gates.all()
+        self.fields['software_brand'].choices = [
+            ('', _('All')),
+        ] + [
+            (f['software_brand'], f['software_brand']) for f in
+            request.organizer.devices.order_by().values('software_brand').annotate(c=Count('*'))
+            if f['software_brand']
+        ]
+
+    def filter_qs(self, qs):
+        fdata = self.cleaned_data
+
+        if fdata.get('query'):
+            query = fdata.get('query')
+            qs = qs.filter(
+                Q(name__icontains=query)
+                | Q(unique_serial__icontains=query)
+                | Q(hardware_brand__icontains=query)
+                | Q(hardware_model__icontains=query)
+                | Q(software_brand__icontains=query)
+            )
+
+        if fdata.get('gate'):
+            qs = qs.filter(gate=fdata['gate'])
+
+        if fdata.get('software_brand'):
+            qs = qs.filter(software_brand=fdata['software_brand'])
+
+        if fdata.get('state') == 'active':
+            qs = qs.filter(revoked=False)
+        elif fdata.get('state') == 'revoked':
+            qs = qs.filter(revoked=True)
+
+        if fdata.get('ordering'):
+            qs = qs.order_by(self.get_order_by())
+        else:
+            qs = qs.order_by('-device_id')
+
+        return qs
+
+
+class OutgoingMailFilterForm(FilterForm):
+    orders = {
+        'date': 'created',
+        '-date': '-created',
+    }
+    query = forms.CharField(
+        label=_('Search email address or subject'),
+        widget=forms.TextInput(attrs={
+            'placeholder': _('Search email address or subject'),
+        }),
+        required=False
+    )
+    event = forms.ModelChoiceField(
+        queryset=Event.objects.none(),
+        label=_('Event'),
+        empty_label=_('All events'),
+        required=False,
+    )
+    status = forms.ChoiceField(
+        label=_('Status'),
+        choices=[
+            ('', _('All')),
+            *OutgoingMail.STATUS_CHOICES,
+        ],
+        required=False
+    )
+
+    def __init__(self, *args, **kwargs):
+        request = kwargs.pop('request')
+        super().__init__(*args, **kwargs)
+        self.fields['event'].queryset = request.organizer.events.all()
+
+    def filter_qs(self, qs):
+        fdata = self.cleaned_data
+
+        if fdata.get('query'):
+            query = fdata.get('query')
+            qs = qs.filter(
+                Q(to__containsstring=query.lower())
+                | Q(cc__containsstring=query.lower())
+                | Q(bcc__containsstring=query.lower())
+                | Q(subject__icontains=query)
+            )
+
+        if fdata.get('event'):
+            qs = qs.filter(event=fdata['event'])
+
+        if fdata.get('status'):
+            qs = qs.filter(status=fdata['status'])
+
+        if fdata.get('ordering'):
+            qs = qs.order_by(self.get_order_by())
+        else:
+            qs = qs.order_by("-created", "-pk")
+
+        return qs
+
+
+class LogFilterForm(FilterForm):
+    source = forms.ChoiceField(
+        label=_('Source'),
+        choices=[
+            ('', _('All sources')),
+            ('team', _('Team actions')),
+            ('customer', _('Customer actions')),
+            ('device', _('Device actions')),
+        ],
+        required=False
+    )
+    device = SafeModelChoiceField(
+        label=_('Device'),
+        empty_label=_('All devices'),
+        queryset=Device.objects.none(),
+        required=False
+    )
+    user_email = forms.EmailField(
+        label=_('User email'),
+        widget=forms.EmailInput(
+            attrs={"placeholder": _('All users')}
+        ),
+        required=False
+    )
+    action_type = forms.CharField(
+        widget=forms.HiddenInput,
+        required=False,
+    )
+    content_type = forms.ModelChoiceField(
+        queryset=ContentType.objects.all(),
+        widget=forms.HiddenInput,
+        required=False,
+    )
+    object = forms.IntegerField(
+        widget=forms.HiddenInput,
+        required=False
+    )
+
+    def __init__(self, *args, **kwargs):
+        self.organizer = kwargs.pop('organizer')
+        super().__init__(*args, **kwargs)
+
+        self.fields['device'].queryset = self.organizer.devices.all().order_by('device_id')
+        self.fields['device'].widget = Select2(
+            attrs={
+                'data-model-select2': 'generic',
+                'data-select2-url': reverse('control:organizer.devices.select2', kwargs={
+                    'organizer': self.organizer.slug,
+                }),
+                'data-placeholder': _('All devices'),
+            }
+        )
+        self.fields['device'].widget.choices = self.fields['device'].choices
+        self.fields['device'].label = _('Device')
+
+    def filter_qs(self, qs):
+        fdata = self.cleaned_data
+        if fdata.get('source') == 'team':
+            qs = qs.filter(user__isnull=False)
+        elif fdata.get('source') == 'device':
+            qs = qs.filter(device__isnull=False)
+        elif fdata.get('source') == 'customer':
+            qs = qs.filter(user__isnull=True, device__isnull=True)
+
+        if fdata.get('device'):
+            qs = qs.filter(device_id=fdata['device'].pk)
+
+        if fdata.get('action_type'):
+            qs = qs.filter(action_type__in=fdata['action_type'].split(','))
+
+        if fdata.get('user_email'):
+            try:
+                user = User.objects.get(email=fdata['user_email'].lower())
+                qs = qs.filter(user=user)
+            except User.DoesNotExist:
+                # Do not actively leak info that this user does not exist. Yes, this will likely have a
+                # timing attack possibility, but with the magic that database query planners do,
+                # it's probably impossible to avoid that.
+                qs = qs.none()
+
+        if fdata.get('content_type'):
+            qs = qs.filter(content_type=fdata.get('content_type'))
+
+            if fdata.get('object'):
+                qs = qs.filter(object_id=fdata.get('object'))
+        return qs

@@ -3,6 +3,7 @@
 {% load i18n %}
 {% load static %}
 {% load compress %}
+{% load escapejson %}
 {% block content %}
     <form class="form-signin" action="" method="post" id="webauthn-form">
         {% csrf_token %}
@@ -11,10 +12,10 @@
             {% trans "You configured your account to require authentication with a second medium, e.g. your phone. Please enter your verification code here:" %}
         </p>
         <div class="form-group">
-            <input class="form-control" name="token" placeholder="{% trans "Token" %}"
+            <input class="form-control" name="token" placeholder="{% trans "Token" %}" autocomplete="one-time-code"
                     type="text" required="required" autofocus="autofocus" id="webauthn-response">
         </div>
-        <div class="sr-only alert alert-danger" id="webauthn-error">
+        <div class="alert alert-danger hidden" id="webauthn-error">
             {% trans "WebAuthn failed. Check that the correct authentication device is correctly plugged in." %}
         </div>
         {% if jsondata %}
@@ -30,12 +31,11 @@
     </form>
     {% if jsondata %}
         <script type="text/json" id="webauthn-login">
-            {{ jsondata|safe }}
-
+            {{ jsondata|escapejson }}
         </script>
     {% endif %}
     {% compress js %}
-        <script type="text/javascript" src="{% static "jquery/js/jquery-2.1.1.min.js" %}"></script>
+        <script type="text/javascript" src="{% static "jquery/js/jquery-3.6.4.min.js" %}"></script>
         <script type="text/javascript" src="{% static "pretixcontrol/js/base64js.js" %}"></script>
         <script type="text/javascript" src="{% static "pretixcontrol/js/ui/webauthn.js" %}"></script>
     {% endcompress %}

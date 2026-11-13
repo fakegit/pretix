@@ -17,10 +17,12 @@ bic
 BIC
 boolean
 booleans
+bugfix
 cancelled
 casted
 Ceph
 checkbox
+checkins
 checksum
 config
 contenttypes
@@ -64,6 +66,7 @@ iterable
 Jimdo
 jwt
 JWT
+JWTs
 libpretixprint
 libsass
 linters
@@ -76,6 +79,7 @@ mixin
 mixins
 multi
 multidomain
+multiplicator
 namespace
 namespaced
 namespaces
@@ -85,12 +89,15 @@ nginx
 nodejs
 NotificationType
 npm
+OIDC
 ons
+OpenID
 optimizations
 overpayment
 param
 passphrase
 percental
+personalization
 pluggable
 positionid
 pre
@@ -100,6 +107,7 @@ prepending
 preprocessor
 presale
 pretix
+pretixLEAD
 pretixSCAN
 pretixdroid
 pretixPOS
@@ -129,6 +137,7 @@ serializer
 serializers
 sexualized
 SQL
+SSO
 startup
 stdout
 stylesheet
@@ -155,6 +164,8 @@ untrusted
 uptime
 username
 url
+URI
+URIs
 validator
 versa
 versioning

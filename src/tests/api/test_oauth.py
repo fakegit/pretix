@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -34,9 +34,11 @@
 
 import base64
 import json
+import time
 from urllib.parse import quote
 
 import pytest
+from django.utils.crypto import get_random_string
 
 from pretix.api.models import (
     OAuthAccessToken, OAuthApplication, OAuthGrant, OAuthRefreshToken,
@@ -51,8 +53,13 @@ def organizer():
 
 @pytest.fixture
 def admin_team(organizer):
-    return Team.objects.create(organizer=organizer, can_change_teams=True, name='Admin team', all_events=True,
-                               can_create_events=True)
+    return Team.objects.create(
+        organizer=organizer,
+        name='Admin team',
+        all_events=True,
+        all_event_permissions=True,
+        all_organizer_permissions=True,
+    )
 
 
 @pytest.fixture
@@ -63,13 +70,31 @@ def admin_user(admin_team):
 
 
 @pytest.fixture
-def application():
-    return OAuthApplication.objects.create(
+def app_developer():
+    return User.objects.create_user('app-developer@example.org', 'app-developer')
+
+
+@pytest.fixture
+def client2():
+    # We need a second test client instance to log in as the app developer user
+    from django.test import Client
+    return Client()
+
+
+@pytest.fixture
+def application(app_developer):
+    secret = get_random_string(32)
+    a = OAuthApplication.objects.create(
         name="pretalx",
         redirect_uris="https://pretalx.com",
         client_type='confidential',
-        authorization_grant_type='authorization-code'
+        client_secret=secret,
+        authorization_grant_type='authorization-code',
+        user=app_developer,
     )
+    a._cached_secret = secret
+    a.save()
+    return a
 
 
 @pytest.mark.django_db
@@ -82,8 +107,80 @@ def test_authorize_require_login(client, application: OAuthApplication):
 
 
 @pytest.mark.django_db
+def test_authorize_require_login_after_absolute_timeout(client, admin_user, application: OAuthApplication):
+    client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_long_session'] = False
+    session['pretix_auth_login_time'] = int(time.time()) - 3600 * 12 - 60
+    session.save()
+
+    resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s' % (
+        application.client_id, quote('https://example.org')
+    ))
+    assert resp.status_code == 302
+    assert resp['Location'].startswith('/control/login')
+
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
+    resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s' % (
+        application.client_id, quote(application.redirect_uris)
+    ))
+    assert resp.status_code == 302
+
+
+@pytest.mark.django_db
+def test_authorize_require_recent_auth(client, admin_user, application: OAuthApplication):
+    client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_long_session'] = True
+    session['pretix_auth_login_time'] = int(time.time()) - 3600 - 60
+    session['pretix_auth_last_used'] = int(time.time())
+    session.save()
+
+    resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s' % (
+        application.client_id, quote('https://example.org')
+    ))
+    assert resp.status_code == 302
+    assert resp['Location'].startswith('/control/reauth')
+
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
+    resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s' % (
+        application.client_id, quote(application.redirect_uris)
+    ))
+    assert resp.status_code == 302
+
+
+@pytest.mark.django_db
+def test_authorize_require_login_after_relative_timeout(client, admin_user, application: OAuthApplication):
+    client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_long_session'] = False
+    session['pretix_auth_login_time'] = int(time.time()) - 3600 * 3 - 60
+    session.save()
+
+    resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s' % (
+        application.client_id, quote('https://example.org')
+    ))
+    assert resp.status_code == 302
+    assert resp['Location'].startswith('/control/reauth')
+
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
+    resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s' % (
+        application.client_id, quote(application.redirect_uris)
+    ))
+    assert resp.status_code == 302
+
+
+@pytest.mark.django_db
 def test_authorize_invalid_redirect_uri(client, admin_user, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s' % (
         application.client_id, quote('https://example.org')
     ))
@@ -93,6 +190,9 @@ def test_authorize_invalid_redirect_uri(client, admin_user, application: OAuthAp
 @pytest.mark.django_db
 def test_authorize_missing_response_type(client, admin_user, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -103,6 +203,9 @@ def test_authorize_missing_response_type(client, admin_user, application: OAuthA
 @pytest.mark.django_db
 def test_authorize_require_organizer(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -122,6 +225,9 @@ def test_authorize_require_organizer(client, admin_user, organizer, application:
 @pytest.mark.django_db
 def test_authorize_denied(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -140,6 +246,9 @@ def test_authorize_denied(client, admin_user, organizer, application: OAuthAppli
 @pytest.mark.django_db
 def test_authorize_disallow_response_token(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=token' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -150,6 +259,9 @@ def test_authorize_disallow_response_token(client, admin_user, organizer, applic
 @pytest.mark.django_db
 def test_authorize_read_scope(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -174,6 +286,9 @@ def test_authorize_read_scope(client, admin_user, organizer, application: OAuthA
 @pytest.mark.django_db
 def test_authorize_state(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&state=asdadf' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -194,6 +309,9 @@ def test_authorize_state(client, admin_user, organizer, application: OAuthApplic
 @pytest.mark.django_db
 def test_authorize_default_scope(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -219,6 +337,9 @@ def test_authorize_default_scope(client, admin_user, organizer, application: OAu
 @pytest.mark.django_db
 def test_token_from_code_without_auth(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -246,6 +367,9 @@ def test_token_from_code_without_auth(client, admin_user, organizer, application
 @pytest.mark.django_db
 def test_token_from_code(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -267,7 +391,7 @@ def test_token_from_code(client, admin_user, organizer, application: OAuthApplic
         'redirect_uri': application.redirect_uris,
         'grant_type': 'authorization_code',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     assert data['expires_in'] == 86400
@@ -281,10 +405,13 @@ def test_token_from_code(client, admin_user, organizer, application: OAuthApplic
 @pytest.mark.django_db
 def test_use_token_for_access_one_organizer(client, admin_user, organizer, application: OAuthApplication):
     o2 = Organizer.objects.create(name='A', slug='a')
-    t2 = Team.objects.create(organizer=o2, can_change_teams=True, name='Admin team', all_events=True)
+    t2 = Team.objects.create(organizer=o2, all_organizer_permissions=True, name='Admin team', all_events=True)
     t2.members.add(admin_user)
 
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -306,14 +433,16 @@ def test_use_token_for_access_one_organizer(client, admin_user, organizer, appli
         'redirect_uri': application.redirect_uris,
         'grant_type': 'authorization_code',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     access_token = data['access_token']
     resp = client.get('/api/v1/organizers/', HTTP_AUTHORIZATION='Bearer %s' % access_token)
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
-    assert data == {'count': 1, 'next': None, 'previous': None, 'results': [{'name': 'Dummy', 'slug': 'dummy'}]}
+    assert data == {'count': 1, 'next': None, 'previous': None, 'results': [
+        {'name': 'Dummy', 'slug': 'dummy', 'public_url': 'http://example.com/dummy/', 'plugins': []}
+    ]}
     resp = client.get('/api/v1/organizers/dummy/events/', HTTP_AUTHORIZATION='Bearer %s' % access_token)
     assert resp.status_code == 200
     resp = client.get('/api/v1/organizers/a/events/', HTTP_AUTHORIZATION='Bearer %s' % access_token)
@@ -323,10 +452,19 @@ def test_use_token_for_access_one_organizer(client, admin_user, organizer, appli
 @pytest.mark.django_db
 def test_use_token_for_access_two_organizers(client, admin_user, organizer, application: OAuthApplication):
     o2 = Organizer.objects.create(name='A', slug='a')
-    t2 = Team.objects.create(organizer=o2, can_change_teams=True, name='Admin team', all_events=True)
+    t2 = Team.objects.create(
+        organizer=o2,
+        all_event_permissions=True,
+        all_organizer_permissions=True,
+        name='Admin team',
+        all_events=True
+    )
     t2.members.add(admin_user)
 
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -348,7 +486,7 @@ def test_use_token_for_access_two_organizers(client, admin_user, organizer, appl
         'redirect_uri': application.redirect_uris,
         'grant_type': 'authorization_code',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     access_token = data['access_token']
@@ -356,8 +494,8 @@ def test_use_token_for_access_two_organizers(client, admin_user, organizer, appl
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     assert data == {'count': 2, 'next': None, 'previous': None, 'results': [
-        {'name': 'A', 'slug': 'a'},
-        {'name': 'Dummy', 'slug': 'dummy'},
+        {'name': 'A', 'slug': 'a', 'public_url': 'http://example.com/a/', 'plugins': []},
+        {'name': 'Dummy', 'slug': 'dummy', 'public_url': 'http://example.com/dummy/', 'plugins': []},
     ]}
     resp = client.get('/api/v1/organizers/dummy/events/', HTTP_AUTHORIZATION='Bearer %s' % access_token)
     assert resp.status_code == 200
@@ -368,6 +506,9 @@ def test_use_token_for_access_two_organizers(client, admin_user, organizer, appl
 @pytest.mark.django_db
 def test_token_refresh(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -389,7 +530,7 @@ def test_token_refresh(client, admin_user, organizer, application: OAuthApplicat
         'redirect_uri': application.redirect_uris,
         'grant_type': 'authorization_code',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     refresh_token = data['refresh_token']
@@ -398,7 +539,7 @@ def test_token_refresh(client, admin_user, organizer, application: OAuthApplicat
         'refresh_token': refresh_token,
         'grant_type': 'refresh_token',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     assert not OAuthAccessToken.objects.filter(token=access_token).exists()  # old token revoked
     data = json.loads(resp.content.decode())
@@ -410,6 +551,9 @@ def test_token_refresh(client, admin_user, organizer, application: OAuthApplicat
 @pytest.mark.django_db
 def test_allow_write(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -431,7 +575,7 @@ def test_allow_write(client, admin_user, organizer, application: OAuthApplicatio
         'redirect_uri': application.redirect_uris,
         'grant_type': 'authorization_code',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     access_token = data['access_token']
@@ -442,6 +586,9 @@ def test_allow_write(client, admin_user, organizer, application: OAuthApplicatio
 @pytest.mark.django_db
 def test_allow_read_only(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -463,7 +610,7 @@ def test_allow_read_only(client, admin_user, organizer, application: OAuthApplic
         'redirect_uri': application.redirect_uris,
         'grant_type': 'authorization_code',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     access_token = data['access_token']
@@ -474,6 +621,9 @@ def test_allow_read_only(client, admin_user, organizer, application: OAuthApplic
 @pytest.mark.django_db
 def test_token_revoke_refresh_token(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -495,7 +645,7 @@ def test_token_revoke_refresh_token(client, admin_user, organizer, application: 
         'redirect_uri': application.redirect_uris,
         'grant_type': 'authorization_code',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     refresh_token = data['refresh_token']
@@ -503,7 +653,7 @@ def test_token_revoke_refresh_token(client, admin_user, organizer, application: 
     resp = client.post('/api/v1/oauth/revoke_token', data={
         'token': refresh_token,
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     assert not OAuthAccessToken.objects.get(token=access_token).is_valid()
     assert not OAuthRefreshToken.objects.filter(token=refresh_token, revoked__isnull=True).exists()
@@ -511,13 +661,16 @@ def test_token_revoke_refresh_token(client, admin_user, organizer, application: 
         'refresh_token': refresh_token,
         'grant_type': 'refresh_token',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 400
 
 
 @pytest.mark.django_db
 def test_token_revoke_access_token(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -539,7 +692,7 @@ def test_token_revoke_access_token(client, admin_user, organizer, application: O
         'redirect_uri': application.redirect_uris,
         'grant_type': 'authorization_code',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     refresh_token = data['refresh_token']
@@ -547,7 +700,7 @@ def test_token_revoke_access_token(client, admin_user, organizer, application: O
     resp = client.post('/api/v1/oauth/revoke_token', data={
         'token': access_token,
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     assert not OAuthAccessToken.objects.get(token=access_token).is_valid()  # old token revoked
 
@@ -555,7 +708,7 @@ def test_token_revoke_access_token(client, admin_user, organizer, application: O
         'refresh_token': refresh_token,
         'grant_type': 'refresh_token',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     access_token = data['access_token']
@@ -564,8 +717,11 @@ def test_token_revoke_access_token(client, admin_user, organizer, application: O
 
 
 @pytest.mark.django_db
-def test_user_revoke(client, admin_user, organizer, application: OAuthApplication):
+def test_token_app_disabled(client, client2, admin_user, organizer, application: OAuthApplication, app_developer):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -587,7 +743,48 @@ def test_user_revoke(client, admin_user, organizer, application: OAuthApplicatio
         'redirect_uri': application.redirect_uris,
         'grant_type': 'authorization_code',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
+    assert resp.status_code == 200
+    data = json.loads(resp.content.decode())
+    access_token = data['access_token']
+    resp = client.get('/api/v1/organizers/dummy/events/', HTTP_AUTHORIZATION='Bearer %s' % access_token)
+    assert resp.status_code == 200
+
+    client2.login(email='app-developer@example.org', password='app-developer')
+    client2.post(f'/control/settings/oauth/apps/{application.pk}/disable', {})
+
+    resp = client.get('/api/v1/organizers/dummy/events/', HTTP_AUTHORIZATION='Bearer %s' % access_token)
+    assert resp.status_code == 401
+
+
+@pytest.mark.django_db
+def test_user_revoke(client, admin_user, organizer, application: OAuthApplication):
+    client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
+    resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code' % (
+        application.client_id, quote(application.redirect_uris)
+    ))
+    assert resp.status_code == 200
+    resp = client.post('/api/v1/oauth/authorize', data={
+        'organizers': str(organizer.pk),
+        'redirect_uri': application.redirect_uris,
+        'scope': 'read write',
+        'client_id': application.client_id,
+        'response_type': 'code',
+        'allow': 'Authorize',
+    })
+    assert resp.status_code == 302
+    assert resp['Location'].startswith('https://pretalx.com?code=')
+    code = resp['Location'].split("=")[1]
+    client.logout()
+    resp = client.post('/api/v1/oauth/token', data={
+        'code': code,
+        'redirect_uri': application.redirect_uris,
+        'grant_type': 'authorization_code',
+    }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     refresh_token = data['refresh_token']
@@ -595,6 +792,9 @@ def test_user_revoke(client, admin_user, organizer, application: OAuthApplicatio
 
     at = OAuthAccessToken.objects.get(token=access_token)
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.post('/control/settings/oauth/authorized/{}/revoke'.format(at.pk), data={
     })
     assert resp.status_code == 302
@@ -606,13 +806,16 @@ def test_user_revoke(client, admin_user, organizer, application: OAuthApplicatio
         'refresh_token': refresh_token,
         'grant_type': 'refresh_token',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 400
 
 
 @pytest.mark.django_db
 def test_allow_profile_only(client, admin_user, organizer, application: OAuthApplication):
     client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
     resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=profile' % (
         application.client_id, quote(application.redirect_uris)
     ))
@@ -634,7 +837,7 @@ def test_allow_profile_only(client, admin_user, organizer, application: OAuthApp
         'redirect_uri': application.redirect_uris,
         'grant_type': 'authorization_code',
     }, HTTP_AUTHORIZATION='Basic ' + base64.b64encode(
-        ('%s:%s' % (application.client_id, application.client_secret)).encode()).decode())
+        ('%s:%s' % (application.client_id, application._cached_secret)).encode()).decode())
     assert resp.status_code == 200
     data = json.loads(resp.content.decode())
     access_token = data['access_token']
@@ -642,3 +845,21 @@ def test_allow_profile_only(client, admin_user, organizer, application: OAuthApp
     assert resp.status_code == 403
     resp = client.get('/api/v1/me', HTTP_AUTHORIZATION='Bearer %s' % access_token)
     assert resp.status_code == 200
+
+
+@pytest.mark.django_db
+def test_reject_other_response_types(client, admin_user, organizer, application: OAuthApplication):
+    client.login(email='dummy@dummy.dummy', password='dummy')
+    session = client.session
+    session['pretix_auth_login_time'] = int(time.time())
+    session.save()
+    resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code+id_token' % (
+        application.client_id, quote(application.redirect_uris)
+    ))
+    assert resp.status_code == 302
+    assert 'error=unauthorized_client' in resp['Location']
+    resp = client.get('/api/v1/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=id_token' % (
+        application.client_id, quote(application.redirect_uris)
+    ))
+    assert resp.status_code == 302
+    assert 'error=unsupported_response_type' in resp['Location']

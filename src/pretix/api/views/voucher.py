@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,27 +19,28 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
-import contextlib
 
 from django.db import transaction
 from django.db.models import F, Q
 from django.utils.timezone import now
 from django_filters.rest_framework import (
-    BooleanFilter, DjangoFilterBackend, FilterSet,
+    BooleanFilter, CharFilter, DjangoFilterBackend, FilterSet,
 )
 from django_scopes import scopes_disabled
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
-from rest_framework.filters import OrderingFilter
 from rest_framework.response import Response
 
+from pretix.api.pagination import TotalOrderingFilter
 from pretix.api.serializers.voucher import VoucherSerializer
 from pretix.base.models import Voucher
 
 with scopes_disabled():
     class VoucherFilter(FilterSet):
         active = BooleanFilter(method='filter_active')
+        code = CharFilter(lookup_expr='iexact')
+        search = CharFilter(method='search_qs')
 
         class Meta:
             model = Voucher
@@ -54,44 +55,31 @@ with scopes_disabled():
                 return queryset.filter(Q(redeemed__gte=F('max_usages')) |
                                        (Q(valid_until__isnull=False) & Q(valid_until__lte=now())))
 
+        def search_qs(self, qs, name, value):
+            return qs.filter(Q(code__icontains=value) | Q(tag__icontains=value) | Q(comment__icontains=value))
+
 
 class VoucherViewSet(viewsets.ModelViewSet):
     serializer_class = VoucherSerializer
     queryset = Voucher.objects.none()
-    filter_backends = (DjangoFilterBackend, OrderingFilter)
+    filter_backends = (DjangoFilterBackend, TotalOrderingFilter)
     ordering = ('id',)
     ordering_fields = ('id', 'code', 'max_usages', 'valid_until', 'value')
     filterset_class = VoucherFilter
-    permission = 'can_view_vouchers'
-    write_permission = 'can_change_vouchers'
+    permission = 'event.vouchers:read'
+    write_permission = 'event.vouchers:write'
 
+    @scopes_disabled()  # we have an event check here, and we can save some performance on subqueries
     def get_queryset(self):
-        return self.request.event.vouchers.select_related('seat').all()
+        return Voucher.annotate_budget_used(
+            self.request.event.vouchers
+        ).select_related(
+            'item', 'quota', 'seat', 'variation'
+        )
 
-    def _predict_quota_check(self, data, instance):
-        # This method predicts if Voucher.clean_quota_needs_checking
-        # *migh* later require a quota check. It is only approximate
-        # and returns True a little too often. The point is to avoid
-        # locks when we know we won't need them.
-        if 'allow_ignore_quota' in data and data.get('allow_ignore_quota'):
-            return False
-        if instance and 'allow_ignore_quota' not in data and instance.allow_ignore_quota:
-            return False
-
-        if 'block_quota' in data and not data.get('block_quota'):
-            return False
-        if instance and 'block_quota' not in data and not instance.block_quota:
-            return False
-
-        return True
-
+    @transaction.atomic()
     def create(self, request, *args, **kwargs):
-        if self._predict_quota_check(request.data, None):
-            lockfn = request.event.lock
-        else:
-            lockfn = contextlib.suppress  # noop context manager
-        with lockfn():
-            return super().create(request, *args, **kwargs)
+        return super().create(request, *args, **kwargs)
 
     def perform_create(self, serializer):
         serializer.save(event=self.request.event)
@@ -107,13 +95,9 @@ class VoucherViewSet(viewsets.ModelViewSet):
         ctx['event'] = self.request.event
         return ctx
 
+    @transaction.atomic()
     def update(self, request, *args, **kwargs):
-        if self._predict_quota_check(request.data, self.get_object()):
-            lockfn = request.event.lock
-        else:
-            lockfn = contextlib.suppress  # noop context manager
-        with lockfn():
-            return super().update(request, *args, **kwargs)
+        return super().update(request, *args, **kwargs)
 
     def perform_update(self, serializer):
         serializer.save(event=self.request.event)
@@ -139,22 +123,18 @@ class VoucherViewSet(viewsets.ModelViewSet):
             super().perform_destroy(instance)
 
     @action(detail=False, methods=['POST'])
+    @transaction.atomic()
     def batch_create(self, request, *args, **kwargs):
-        if any(self._predict_quota_check(d, None) for d in request.data):
-            lockfn = request.event.lock
-        else:
-            lockfn = contextlib.suppress  # noop context manager
-        with lockfn():
-            serializer = self.get_serializer(data=request.data, many=True)
-            serializer.is_valid(raise_exception=True)
-            with transaction.atomic():
-                serializer.save(event=self.request.event)
-                for i, v in enumerate(serializer.instance):
-                    v.log_action(
-                        'pretix.voucher.added',
-                        user=self.request.user,
-                        auth=self.request.auth,
-                        data=self.request.data[i]
-                    )
+        serializer = self.get_serializer(data=request.data, many=True)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            serializer.save(event=self.request.event)
+            for i, v in enumerate(serializer.instance):
+                v.log_action(
+                    'pretix.voucher.added',
+                    user=self.request.user,
+                    auth=self.request.auth,
+                    data=self.request.data[i]
+                )
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)

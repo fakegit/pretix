@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -24,6 +24,7 @@ from rest_framework import viewsets
 from pretix.api.serializers.i18n import I18nAwareModelSerializer
 from pretix.api.serializers.order import CompatibleJSONField
 
+from ...multidomain.utils import static_absolute
 from .models import BadgeItem, BadgeLayout
 
 
@@ -46,6 +47,12 @@ class BadgeLayoutSerializer(I18nAwareModelSerializer):
     class Meta:
         model = BadgeLayout
         fields = ('id', 'name', 'default', 'layout', 'background', 'item_assignments')
+
+    def to_representation(self, instance):
+        d = super().to_representation(instance)
+        if not d['background']:
+            d['background'] = static_absolute(instance.event, "pretixplugins/badges/badge_default_a6l.pdf")
+        return d
 
 
 class BadgeLayoutViewSet(viewsets.ReadOnlyModelViewSet):

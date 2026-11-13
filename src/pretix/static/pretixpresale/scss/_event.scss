@@ -1,12 +1,10 @@
+.addons legend {
+    border-bottom: none;
+}
 .product-row {
-    .addons &:first-child {
-        border-top: 2px solid $table-border-color;
-    }
-    .addons &:last-child {
-        border-bottom: 2px solid $table-border-color;
-    }
-
-    &:last-child {
+    .addons & {
+        margin-left: -15px;
+        margin-right: -15px;
     }
     p  {
         margin-bottom: 0;
@@ -24,15 +22,12 @@
     .availability-box {
         text-align: center;
 
-        &.gone {
-            color: $alert-danger-text;
+        &.gone, .gone {
+            color: $brand-danger;
         }
-        &.unavailable {
+        &.unavailable, .unavailable {
             color: $alert-warning-text;
         }
-    }
-    .item-checkbox-label {
-        display: block;
     }
 
     .product-description.with-picture {
@@ -58,7 +53,7 @@
     &.variation label {
         font-weight: normal;
     }
-    h4 {
+    h4, .h4 {
         font-size: inherit;
         margin: 0;
         line-height: inherit;
@@ -67,7 +62,7 @@
             font-weight: bold;
         }
     }
-    h5 {
+    h5, .h5 {
         font-size: inherit;
         font-weight: inherit;
         margin: 0;
@@ -78,7 +73,7 @@
         display: block;
     }
     .price ins {
-        color: $brand-success;
+        color: $alert-success-text;
         font-size: 18px;
         font-weight: bold;
         text-decoration: none;
@@ -97,10 +92,19 @@
     }
 
     &.headline, &.simple {
-        border-top: 2px solid transparent;
+        border-top: 1px solid transparent;
         &::before {
-            border-top: 2px solid $table-border-color;
+            border-top: 1px solid $table-border-color;
         }
+    }
+}
+
+.product-appendix-row {
+    border-top: 1px solid $table-border-color;
+    border-bottom: 1px solid $table-border-color;
+    padding: 1.25*$line-height-computed 0;
+    & > :last-child {
+        margin-bottom: 0;
     }
 }
 
@@ -111,15 +115,18 @@ article.item-with-variations {
 
 article.item-with-variations:last-child, .product-row:last-child {
     position: relative;
-    border-bottom: 2px solid transparent;
+    border-bottom: 1px solid transparent;
     &::after {
         position: absolute;
         bottom: 0;
         left: 15px;
         width: calc(100% - 30px);
         content: '';
-        border-bottom: 2px solid $table-border-color;
+        border-bottom: 1px solid $table-border-color;
     }
+}
+article.item-with-variations .product-row:last-child:after {
+    display: none;
 }
 
 .radio .variation-description {
@@ -138,12 +145,22 @@ article.item-with-variations:last-child, .product-row:last-child {
     display: none;
 }
 
+.panel-body:not(:has(*)) {
+  padding: 0;
+}
+
+.panel-body > *:last-child,
 .panel-body address:last-child {
     margin-bottom: 0;
 }
 
+.panel > hr {
+    margin: 0;
+    border-top: 1px solid $table-border-color;
+}
+
 .product-row {
-    padding: 10px 0;
+    padding: 1.25*$line-height-computed 0;
 
     .count form {
         display: inline;
@@ -160,6 +177,21 @@ article.item-with-variations:last-child, .product-row:last-child {
     &.total {
         border-top: 1px solid $table-border-color;
     }
+    &.variation>div:first-child {
+        position: relative;
+        padding-inline-start: calc(15px + 1.3em);
+    }
+    &.variation h5:before {
+        content: "";
+        display: block;
+        width: .65em;
+        height: 6px;
+        position: absolute;
+        left: 16px;
+        top: 0.35em;
+        border-width: 0 0 1px 1px;
+        border-style: solid;
+    }
 }
 .panel-contact dl {
     margin-bottom: 0;
@@ -170,7 +202,7 @@ article.item-with-variations:last-child, .product-row:last-child {
 .checkout-button-row {
     padding-top: 15px;
 }
-section.front-page {
+div.front-page {
     margin-top: 30px;
 }
 .offline-banner {
@@ -180,7 +212,7 @@ section.front-page {
     padding: 5px;
     text-align: center;
 
-    a {
+    a, .btn-link {
         text-decoration: underline;
         color: white;
     }
@@ -197,35 +229,47 @@ section.front-page {
         margin-bottom: 15px;
     }
 }
-
-.subevent-list {
-    background-color: white;
-
-    form {
-        padding: 10px 0;
-    }
-
-    .row {
-        margin: 0;
-    }
-    a.subevent-row {
-        display: block;
-        color: $text-color;
-        padding: 3px 0;
-    }
-    a.subevent-row:nth-child(2n) {
-        background-color: $gray-lighter;
-    }
-    a.subevent-row:hover {
-        text-decoration: none;
-        background-color: darken($gray-lighter, 10%);
-    }
-    .subevent-row .row > div {
-        padding: 5px;
-        min-height: 35px; /* label height */
-        vertical-align: middle;
+@media (min-width: $screen-sm-min) {
+    .col-xs-6.availability-box,
+    .col-xs-6.price:has(.input-group-price) {
+        margin-top: -6px;
+        margin-bottom: -6px;
     }
 }
+
+@media (max-width: $screen-xs-max) {
+    .product-description p:last-child {
+        margin-bottom: 15px;
+    }
+    .product-row .price {
+        text-align: left;
+    }
+    .product-row.variation .price {
+        padding-inline-start: calc(1.3em + 15px);
+    }
+}
+
+.calendar-nav, .calendar-nav > li {
+    list-style: none;
+    margin: 0;
+    padding: 0
+}
+.calendar-nav > li {
+    padding: 0 0 10px;
+}
+.calendar-nav {
+    display: flex;
+    align-items: end;
+}
+.calendar-nav > li {
+    width: 60%;
+}
+.calendar-nav > li:first-child,
+.calendar-nav > li:last-child {
+    width: 20%;
+}
+
+
 .subevent-toggle {
     display: none;
 }
@@ -241,7 +285,7 @@ h2.subevent-head {
         background: $brand-success;
     }
     .slider-handle {
-        @include slider_background-image($brand-success, darken($brand-success, 5%), mix($brand-success, darken($brand-success, 5%)));
+        @include slider_background-image($brand-success, var(--pretix-brand-success-darken-5), $brand-success);
     }
 
     .slider-tick-container {
@@ -269,8 +313,19 @@ h2.subevent-head {
     margin-bottom: 20px;
 }
 .info-download {
-    margin-top: 15px;
+    margin-top: 0;
+    margin-bottom: 30px;
+    .download-btn-form + .download-btn-form {
+        margin-left: .5em;
+    }
+    button {
+        margin-top: .5em;
+    }
 }
+.lead + .info-download {
+    margin-top: -15px;
+}
+
 .refund-gift-card-code {
     font-size: 24px;
     font-family: $font-family-monospace;

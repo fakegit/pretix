@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -62,27 +62,27 @@ class NamespacedCache:
             prefix = int(time.time())
             self.cache.set(self.prefixkey, prefix)
 
-    def set(self, key: str, value: str, timeout: int=300):
+    def set(self, key: str, value: any, timeout: int=300):
         return self.cache.set(self._prefix_key(key), value, timeout)
 
-    def get(self, key: str) -> str:
+    def get(self, key: str) -> any:
         return self.cache.get(self._prefix_key(key, known_prefix=self._last_prefix))
 
-    def get_or_set(self, key: str, default: Callable, timeout=300) -> str:
+    def get_or_set(self, key: str, default: Callable, timeout=300) -> any:
         return self.cache.get_or_set(
             self._prefix_key(key, known_prefix=self._last_prefix),
             default=default,
             timeout=timeout
         )
 
-    def get_many(self, keys: List[str]) -> Dict[str, str]:
+    def get_many(self, keys: List[str]) -> Dict[str, any]:
         values = self.cache.get_many([self._prefix_key(key) for key in keys])
         newvalues = {}
         for k, v in values.items():
             newvalues[self._strip_prefix(k)] = v
         return newvalues
 
-    def set_many(self, values: Dict[str, str], timeout=300):
+    def set_many(self, values: Dict[str, any], timeout=300):
         newvalues = {}
         for k, v in values.items():
             newvalues[self._prefix_key(k)] = v

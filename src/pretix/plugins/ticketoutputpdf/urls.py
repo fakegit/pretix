@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -19,30 +19,33 @@
 # You should have received a copy of the GNU Affero General Public License along with this program.  If not, see
 # <https://www.gnu.org/licenses/>.
 #
-from django.conf.urls import url
+from django.urls import re_path
 
 from pretix.api.urls import event_router
 from pretix.plugins.ticketoutputpdf.api import (
-    TicketLayoutItemViewSet, TicketLayoutViewSet,
+    TicketLayoutItemViewSet, TicketLayoutViewSet, TicketRendererViewSet,
 )
 from pretix.plugins.ticketoutputpdf.views import (
     LayoutCreate, LayoutDelete, LayoutEditorView, LayoutGetDefault,
-    LayoutListView, LayoutSetDefault,
+    LayoutListView, LayoutSetDefault, OrderPrintDo,
 )
 
 urlpatterns = [
-    url(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/$',
-        LayoutListView.as_view(), name='index'),
-    url(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/add$',
-        LayoutCreate.as_view(), name='add'),
-    url(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/(?P<layout>\d+)/default$',
-        LayoutSetDefault.as_view(), name='default'),
-    url(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/default$',
-        LayoutGetDefault.as_view(), name='getdefault'),
-    url(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/(?P<layout>\d+)/delete$',
-        LayoutDelete.as_view(), name='delete'),
-    url(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/(?P<layout>\d+)/editor',
-        LayoutEditorView.as_view(), name='edit'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/print$',
+            OrderPrintDo.as_view(), name='print'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/$',
+            LayoutListView.as_view(), name='index'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/add$',
+            LayoutCreate.as_view(), name='add'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/(?P<layout>\d+)/default$',
+            LayoutSetDefault.as_view(), name='default'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/default$',
+            LayoutGetDefault.as_view(), name='getdefault'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/(?P<layout>\d+)/delete$',
+            LayoutDelete.as_view(), name='delete'),
+    re_path(r'^control/event/(?P<organizer>[^/]+)/(?P<event>[^/]+)/pdfoutput/(?P<layout>\d+)/editor',
+            LayoutEditorView.as_view(), name='edit'),
 ]
 event_router.register('ticketlayouts', TicketLayoutViewSet)
 event_router.register('ticketlayoutitems', TicketLayoutItemViewSet)
+event_router.register('ticketpdfrenderer', TicketRendererViewSet, basename='ticketpdfrenderer')

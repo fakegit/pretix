@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -32,12 +32,6 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
 
-"""
-Django tries to be helpful by suggesting to run "makemigrations" in red font on every "migrate"
-run when there are things we have no migrations for. Usually, this is intended, and running
-"makemigrations" can really screw up the environment of a user, so we want to prevent novice
-users from doing that by going really dirty and filtering it from the output.
-"""
 import sys
 
 from django.core.management.base import OutputWrapper
@@ -45,9 +39,15 @@ from django.core.management.commands.migrate import Command as Parent
 
 
 class OutputFilter(OutputWrapper):
+    """
+    Django tries to be helpful by suggesting to run "makemigrations" in red font on every "migrate"
+    run when there are things we have no migrations for. Usually, this is intended, and running
+    "makemigrations" can really screw up the environment of a user, so we want to prevent novice
+    users from doing that by going really dirty and filtering it from the output.
+    """
     banlist = (
-        "Your models have changes that are not yet reflected",
-        "Run 'manage.py makemigrations' to make new "
+        "have changes that are not yet reflected",
+        "re-run 'manage.py migrate'"
     )
 
     def write(self, msg, style_func=None, ending=None):

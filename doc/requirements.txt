@@ -1,10 +1,9 @@
--r ../src/requirements.txt
-sphinx==2.3.*
-sphinx-rtd-theme
-sphinxcontrib-httpdomain
-sphinxcontrib-images
-sphinxcontrib-spelling==4.*
-sphinxemoji
-pygments-markdown-lexer
-# See https://github.com/rfk/pyenchant/pull/130
-git+https://github.com/raphaelm/pyenchant.git@patch-1#egg=pyenchant
+-e ../
+sphinx==9.0.*
+sphinx-rtd-theme~=3.1.0
+sphinxcontrib-httpdomain~=2.1.0
+sphinxcontrib-images~=1.0.1
+sphinxcontrib-jquery~=4.1
+sphinxcontrib-spelling~=8.0.2
+sphinxemoji~=0.3.2
+pyenchant==3.3.*

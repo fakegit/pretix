@@ -28,12 +28,19 @@ closed                                boolean                    Whether the quo
                                                                  field).
 release_after_exit                    boolean                    Whether the quota regains capacity as soon as some tickets
                                                                  have been scanned at an exit.
+ignore_for_event_availability         boolean                    Whether the quota is ignored when calculating the event's
+                                                                 availability of tickets.
+available                             boolean                    Whether this quota is available. Only returned if ``with_availability=true``
+                                                                 is set on the request. Do not rely on this value for critical operations, it may be
+                                                                 slightly out of date.
+available_number                      integer                    Number of available tickets. Only returned if ``with_availability=true``
+                                                                 is set on the request. Do not rely on this value for critical operations, it may be
+                                                                 slightly out of date. ``null`` means unlimited.
 ===================================== ========================== =======================================================
 
-.. versionchanged:: 3.10
+.. versionchanged:: 2025.7
 
-   The attribute ``release_after_exit`` has been added.
-
+    The attribute ``ignore_for_event_availability`` has been added.
 
 Endpoints
 ---------
@@ -71,7 +78,8 @@ Endpoints
             "variations": [1, 4, 5, 7],
             "subevent": null,
             "close_when_sold_out": false,
-            "closed": false
+            "closed": false,
+            "ignore_for_event_availability": false
           }
         ]
       }
@@ -79,7 +87,10 @@ Endpoints
    :query integer page: The page number in case of a multi-page result set, default is 1
    :query string ordering: Manually set the ordering of results. Valid fields to be used are ``id`` and ``position``.
                            Default: ``position``
-   :query integer subevent: Only return quotas of the sub-event with the given ID
+   :query integer subevent: Only return quotas of the sub-event with the given ID.
+   :query integer subevent__in: Only return quotas of sub-events with one of the given IDs (comma-separated).
+   :query integer items__in: Only return quotas that include a product with one of the given IDs (comma-separated).
+   :query string with_availability: Set to ``true`` to get availability information. Can lead to increased answer times.
    :param organizer: The ``slug`` field of the organizer to fetch
    :param event: The ``slug`` field of the event to fetch
    :statuscode 200: no error
@@ -114,12 +125,14 @@ Endpoints
         "variations": [1, 4, 5, 7],
         "subevent": null,
         "close_when_sold_out": false,
-        "closed": false
+        "closed": false,
+        "ignore_for_event_availability": false
       }
 
    :param organizer: The ``slug`` field of the organizer to fetch
    :param event: The ``slug`` field of the event to fetch
    :param id: The ``id`` field of the quota to fetch
+   :query string with_availability: Set to ``true`` to get availability information. Can lead to increased answer times.
    :statuscode 200: no error
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer/event does not exist **or** you have no permission to view this resource.
@@ -144,7 +157,8 @@ Endpoints
         "variations": [1, 4, 5, 7],
         "subevent": null,
         "close_when_sold_out": false,
-        "closed": false
+        "closed": false,
+        "ignore_for_event_availability": false
       }
 
    **Example response**:
@@ -163,7 +177,8 @@ Endpoints
         "variations": [1, 4, 5, 7],
         "subevent": null,
         "close_when_sold_out": false,
-        "closed": false
+        "closed": false,
+        "ignore_for_event_availability": false
       }
 
    :param organizer: The ``slug`` field of the organizer of the event/item to create a quota for
@@ -218,7 +233,8 @@ Endpoints
         ],
         "subevent": null,
         "close_when_sold_out": false,
-        "closed": false
+        "closed": false,
+        "ignore_for_event_availability": false
       }
 
    :param organizer: The ``slug`` field of the organizer to modify

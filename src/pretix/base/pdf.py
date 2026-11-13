@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -35,26 +35,35 @@
 import copy
 import hashlib
 import itertools
+import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
+import unicodedata
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from functools import partial
 from io import BytesIO
 
-from arabic_reshaper import ArabicReshaper
-from bidi.algorithm import get_display
+import pypdf
+import pypdf.generic
+import reportlab.rl_config
+from bidi import get_display
 from django.conf import settings
 from django.contrib.staticfiles import finders
+from django.core.exceptions import ValidationError
+from django.db.models import Exists, Max, Min, OuterRef
+from django.db.models.fields.files import FieldFile
 from django.dispatch import receiver
+from django.utils.deconstruct import deconstructible
 from django.utils.formats import date_format
 from django.utils.html import conditional_escape
 from django.utils.timezone import now
-from django.utils.translation import gettext_lazy as _
-from PyPDF2 import PdfFileReader
-from pytz import timezone
+from django.utils.translation import gettext_lazy as _, pgettext
+from i18nfield.strings import LazyI18nString
+from pypdf import PdfReader, PdfWriter
 from reportlab.graphics import renderPDF
 from reportlab.graphics.barcode.qr import QrCodeWidget
 from reportlab.graphics.shapes import Drawing
@@ -62,22 +71,27 @@ from reportlab.lib.colors import Color
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
-from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.pdfmetrics import getAscentDescent
-from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen.canvas import Canvas
 from reportlab.platypus import Paragraph
 
 from pretix.base.i18n import language
-from pretix.base.invoice import ThumbnailingImageReader
-from pretix.base.models import Order, OrderPosition, Question
+from pretix.base.models import Checkin, Event, Order, OrderPosition, Question
+from pretix.base.services.placeholders import PlaceholderContext
 from pretix.base.settings import PERSON_NAME_SCHEMES
 from pretix.base.signals import layout_image_variables, layout_text_variables
 from pretix.base.templatetags.money import money_filter
 from pretix.base.templatetags.phone_format import phone_format
+from pretix.helpers.daterange import datetimerange
+from pretix.helpers.reportlab import (
+    ThumbnailingImageReader, register_ttf_font_if_new, reshaper,
+)
 from pretix.presale.style import get_fonts
 
 logger = logging.getLogger(__name__)
+
+if not settings.DEBUG:
+    reportlab.rl_config.shapeChecking = 0
 
 
 DEFAULT_VARIABLES = OrderedDict((
@@ -96,7 +110,15 @@ DEFAULT_VARIABLES = OrderedDict((
     ("positionid", {
         "label": _("Order position number"),
         "editor_sample": "1",
-        "evaluate": lambda orderposition, order, event: str(orderposition.positionid)
+        "evaluate": lambda orderposition, order, event: str(orderposition.positionid),
+        # There is no performance gain in using evaluate_bulk here, but we want to make sure it is used somewhere
+        # in core to make sure we notice if the implementation of the API breaks.
+        "evaluate_bulk": lambda orderpositions: [str(p.positionid) for p in orderpositions],
+    }),
+    ("order_positionid", {
+        "label": _("Order code and position number"),
+        "editor_sample": "A1B2C-1",
+        "evaluate": lambda orderposition, order, event: f"{orderposition.order.code}-{orderposition.positionid}"
     }),
     ("item", {
         "label": _("Product name"),
@@ -140,8 +162,17 @@ DEFAULT_VARIABLES = OrderedDict((
         "editor_sample": _("123.45 EUR"),
         "evaluate": lambda op, order, event: money_filter(op.price, event.currency)
     }),
+    ("price_with_bundled", {
+        "label": _("Price including bundled products"),
+        "editor_sample": _("123.45 EUR"),
+        "evaluate": lambda op, order, event: money_filter(op.price + sum(
+            p.price
+            for p in op.addons.all()
+            if not p.canceled and p.is_bundled
+        ), event.currency)
+    }),
     ("price_with_addons", {
-        "label": _("Price including add-ons"),
+        "label": _("Price including add-ons and bundled products"),
         "editor_sample": _("123.45 EUR"),
         "evaluate": lambda op, order, event: money_filter(op.price + sum(
             p.price
@@ -196,6 +227,11 @@ DEFAULT_VARIABLES = OrderedDict((
         "editor_sample": 'foo@bar.com',
         "evaluate": lambda op, order, ev: op.attendee_email or (op.addon_to.attendee_email if op.addon_to else '')
     }),
+    ("pseudonymization_id", {
+        "label": _("Pseudonymization ID (lead scanning)"),
+        "editor_sample": "GG89JUJDTA",
+        "evaluate": lambda orderposition, order, event: orderposition.pseudonymization_id,
+    }),
     ("event_name", {
         "label": _("Event name"),
         "editor_sample": _("Sample event name"),
@@ -220,7 +256,7 @@ DEFAULT_VARIABLES = OrderedDict((
         "label": _("Event begin date and time"),
         "editor_sample": _("2017-05-31 20:00"),
         "evaluate": lambda op, order, ev: date_format(
-            ev.date_from.astimezone(timezone(ev.settings.timezone)),
+            ev.date_from.astimezone(ev.timezone),
             "SHORT_DATETIME_FORMAT"
         ) if ev.date_from else ""
     }),
@@ -228,7 +264,7 @@ DEFAULT_VARIABLES = OrderedDict((
         "label": _("Event begin date"),
         "editor_sample": _("2017-05-31"),
         "evaluate": lambda op, order, ev: date_format(
-            ev.date_from.astimezone(timezone(ev.settings.timezone)),
+            ev.date_from.astimezone(ev.timezone),
             "SHORT_DATE_FORMAT"
         ) if ev.date_from else ""
     }),
@@ -237,11 +273,16 @@ DEFAULT_VARIABLES = OrderedDict((
         "editor_sample": _("20:00"),
         "evaluate": lambda op, order, ev: ev.get_time_from_display()
     }),
+    ("event_begin_weekday", {
+        "label": _("Event begin weekday"),
+        "editor_sample": _("Friday"),
+        "evaluate": lambda op, order, ev: ev.get_weekday_from_display()
+    }),
     ("event_end", {
         "label": _("Event end date and time"),
         "editor_sample": _("2017-05-31 22:00"),
         "evaluate": lambda op, order, ev: date_format(
-            ev.date_to.astimezone(timezone(ev.settings.timezone)),
+            ev.date_to.astimezone(ev.timezone),
             "SHORT_DATETIME_FORMAT"
         ) if ev.date_to else ""
     }),
@@ -249,7 +290,7 @@ DEFAULT_VARIABLES = OrderedDict((
         "label": _("Event end date"),
         "editor_sample": _("2017-05-31"),
         "evaluate": lambda op, order, ev: date_format(
-            ev.date_to.astimezone(timezone(ev.settings.timezone)),
+            ev.date_to.astimezone(ev.timezone),
             "SHORT_DATE_FORMAT"
         ) if ev.date_to else ""
     }),
@@ -257,15 +298,20 @@ DEFAULT_VARIABLES = OrderedDict((
         "label": _("Event end time"),
         "editor_sample": _("22:00"),
         "evaluate": lambda op, order, ev: date_format(
-            ev.date_to.astimezone(timezone(ev.settings.timezone)),
+            ev.date_to.astimezone(ev.timezone),
             "TIME_FORMAT"
         ) if ev.date_to else ""
+    }),
+    ("event_end_weekday", {
+        "label": _("Event end weekday"),
+        "editor_sample": _("Friday"),
+        "evaluate": lambda op, order, ev: ev.get_weekday_to_display()
     }),
     ("event_admission", {
         "label": _("Event admission date and time"),
         "editor_sample": _("2017-05-31 19:00"),
         "evaluate": lambda op, order, ev: date_format(
-            ev.date_admission.astimezone(timezone(ev.settings.timezone)),
+            ev.date_admission.astimezone(ev.timezone),
             "SHORT_DATETIME_FORMAT"
         ) if ev.date_admission else ""
     }),
@@ -273,7 +319,7 @@ DEFAULT_VARIABLES = OrderedDict((
         "label": _("Event admission time"),
         "editor_sample": _("19:00"),
         "evaluate": lambda op, order, ev: date_format(
-            ev.date_admission.astimezone(timezone(ev.settings.timezone)),
+            ev.date_admission.astimezone(ev.timezone),
             "TIME_FORMAT"
         ) if ev.date_admission else ""
     }),
@@ -285,7 +331,7 @@ DEFAULT_VARIABLES = OrderedDict((
     ("telephone", {
         "label": _("Phone number"),
         "editor_sample": "+01 1234 567890",
-        "evaluate": lambda op, order, ev: phone_format(order.phone)
+        "evaluate": lambda op, order, ev: phone_format(order.phone, html=False)
     }),
     ("email", {
         "label": _("Email"),
@@ -327,16 +373,23 @@ DEFAULT_VARIABLES = OrderedDict((
         "editor_sample": _("Atlantis"),
         "evaluate": lambda op, order, ev: str(getattr(order.invoice_address.country, 'name', '')) if getattr(order, 'invoice_address', None) else ''
     }),
+    ("invoice_custom_field", {
+        "label": _("Invoice custom recipient field"),
+        "editor_sample": _("Custom recipient field"),
+        "evaluate": lambda op, order, ev: order.invoice_address.custom_field if getattr(order, 'invoice_address', None) else ''
+    }),
     ("addons", {
         "label": _("List of Add-Ons"),
-        "editor_sample": _("Add-on 1\nAdd-on 2"),
+        "editor_sample": _("Add-on 1\n2x Add-on 2"),
         "evaluate": lambda op, order, ev: "\n".join([
-            '{} - {}'.format(p.item, p.variation) if p.variation else str(p.item)
-            for p in (
-                op.addons.all() if 'addons' in getattr(op, '_prefetched_objects_cache', {})
-                else op.addons.select_related('item', 'variation')
-            )
-            if not p.canceled
+            str(p) for p in generate_compressed_addon_list(op, order, ev)
+        ])
+    }),
+    ("checked_in_addons", {
+        "label": _("List of Checked-In Add-Ons"),
+        "editor_sample": _("Add-on 1\n2x Add-on 2"),
+        "evaluate": lambda op, order, ev: "\n".join([
+            str(p) for p in generate_compressed_addon_list(op, order, ev, only_checked_in=True)
         ])
     }),
     ("organizer", {
@@ -349,16 +402,12 @@ DEFAULT_VARIABLES = OrderedDict((
         "editor_sample": _("Event organizer info text"),
         "evaluate": lambda op, order, ev: str(order.event.settings.organizer_info_text)
     }),
-    ("event_info_text", {
-        "label": _("Event info text"),
-        "editor_sample": _("Event info text"),
-        "evaluate": lambda op, order, ev: str(order.event.settings.event_info_text)
-    }),
+    ("event_info_text", {}),  # Placeholder to "reserve" position, defined later in `get_variables`
     ("now_date", {
         "label": _("Printing date"),
         "editor_sample": _("2017-05-31"),
         "evaluate": lambda op, order, ev: date_format(
-            now().astimezone(timezone(ev.settings.timezone)),
+            now().astimezone(ev.timezone),
             "SHORT_DATE_FORMAT"
         )
     }),
@@ -366,7 +415,7 @@ DEFAULT_VARIABLES = OrderedDict((
         "label": _("Printing date and time"),
         "editor_sample": _("2017-05-31 19:00"),
         "evaluate": lambda op, order, ev: date_format(
-            now().astimezone(timezone(ev.settings.timezone)),
+            now().astimezone(ev.timezone),
             "SHORT_DATETIME_FORMAT"
         )
     }),
@@ -374,31 +423,130 @@ DEFAULT_VARIABLES = OrderedDict((
         "label": _("Printing time"),
         "editor_sample": _("19:00"),
         "evaluate": lambda op, order, ev: date_format(
-            now().astimezone(timezone(ev.settings.timezone)),
+            now().astimezone(ev.timezone),
             "TIME_FORMAT"
-        ) if ev.date_admission else ""
+        )
+    }),
+    ("purchase_date", {
+        "label": _("Purchase date"),
+        "editor_sample": _("2017-05-31"),
+        "evaluate": lambda op, order, ev: date_format(
+            order.datetime.astimezone(ev.timezone),
+            "SHORT_DATE_FORMAT"
+        )
+    }),
+    ("purchase_datetime", {
+        "label": _("Purchase date and time"),
+        "editor_sample": _("2017-05-31 19:00"),
+        "evaluate": lambda op, order, ev: date_format(
+            order.datetime.astimezone(ev.timezone),
+            "SHORT_DATETIME_FORMAT"
+        )
+    }),
+    ("purchase_time", {
+        "label": _("Purchase time"),
+        "editor_sample": _("19:00"),
+        "evaluate": lambda op, order, ev: date_format(
+            order.datetime.astimezone(ev.timezone),
+            "TIME_FORMAT"
+        )
+    }),
+    ("valid_from_date", {
+        "label": _("Validity start date"),
+        "editor_sample": _("2017-05-31"),
+        "evaluate": lambda op, order, ev: date_format(
+            op.valid_from.astimezone(ev.timezone),
+            "SHORT_DATE_FORMAT"
+        ) if op.valid_from else ""
+    }),
+    ("valid_from_datetime", {
+        "label": _("Validity start date and time"),
+        "editor_sample": _("2017-05-31 19:00"),
+        "evaluate": lambda op, order, ev: date_format(
+            op.valid_from.astimezone(ev.timezone),
+            "SHORT_DATETIME_FORMAT"
+        ) if op.valid_from else ""
+    }),
+    ("valid_from_time", {
+        "label": _("Validity start time"),
+        "editor_sample": _("19:00"),
+        "evaluate": lambda op, order, ev: date_format(
+            op.valid_from.astimezone(ev.timezone),
+            "TIME_FORMAT"
+        ) if op.valid_from else ""
+    }),
+    ("valid_until_date", {
+        "label": _("Validity end date"),
+        "editor_sample": _("2017-05-31"),
+        "evaluate": lambda op, order, ev: date_format(
+            op.valid_until.astimezone(ev.timezone),
+            "SHORT_DATE_FORMAT"
+        ) if op.valid_until else ""
+    }),
+    ("valid_until_datetime", {
+        "label": _("Validity end date and time"),
+        "editor_sample": _("2017-05-31 19:00"),
+        "evaluate": lambda op, order, ev: date_format(
+            op.valid_until.astimezone(ev.timezone),
+            "SHORT_DATETIME_FORMAT"
+        ) if op.valid_until else ""
+    }),
+    ("valid_until_time", {
+        "label": _("Validity end time"),
+        "editor_sample": _("19:00"),
+        "evaluate": lambda op, order, ev: date_format(
+            op.valid_until.astimezone(ev.timezone),
+            "TIME_FORMAT"
+        ) if op.valid_until else ""
+    }),
+    ("program_times", {
+        "label": _("Program times"),
+        "editor_sample": _(
+            "2017-05-31 10:00 – 12:00, Room 1\n2017-05-31 14:00 – 16:00, Room 2\n2017-05-31 14:00 – 2017-06-01 14:00, Building A"),
+        "evaluate": lambda op, order, ev: get_program_times(op, ev)
+    }),
+    ("medium_identifier", {
+        "label": _("Reusable Medium ID"),
+        "editor_sample": "ABC1234DEF4567",
+        "evaluate": lambda op, order, ev: op.linked_media.all()[0].identifier if op.linked_media.all() else "",
     }),
     ("seat", {
         "label": _("Seat: Full name"),
         "editor_sample": _("Ground floor, Row 3, Seat 4"),
-        "evaluate": lambda op, order, ev: str(op.seat if op.seat else
+        "evaluate": lambda op, order, ev: str(get_seat(op) if get_seat(op) else
                                               _('General admission') if ev.seating_plan_id is not None else "")
     }),
     ("seat_zone", {
         "label": _("Seat: zone"),
         "editor_sample": _("Ground floor"),
-        "evaluate": lambda op, order, ev: str(op.seat.zone_name if op.seat else
+        "evaluate": lambda op, order, ev: str(get_seat(op).zone_name if get_seat(op) else
                                               _('General admission') if ev.seating_plan_id is not None else "")
     }),
     ("seat_row", {
         "label": _("Seat: row"),
         "editor_sample": "3",
-        "evaluate": lambda op, order, ev: str(op.seat.row_name if op.seat else "")
+        "evaluate": lambda op, order, ev: str(get_seat(op).row_name if get_seat(op) else "")
     }),
     ("seat_number", {
         "label": _("Seat: seat number"),
         "editor_sample": 4,
-        "evaluate": lambda op, order, ev: str(op.seat.seat_number if op.seat else "")
+        "evaluate": lambda op, order, ev: str(get_seat(op).seat_number if get_seat(op) else "")
+    }),
+    ("first_scan", {
+        "label": _("Date and time of first scan"),
+        "editor_sample": _("2017-05-31 19:00"),
+        "evaluate": lambda op, order, ev: get_first_scan(op)
+    }),
+    ("giftcard_issuance_date", {
+
+        "label": _("Gift card: Issuance date"),
+        "editor_sample": _("2017-05-31"),
+        "evaluate": lambda op, order, ev: get_giftcard_issuance(op, ev)
+    }),
+    ("giftcard_expiry_date", {
+        "label": _("Gift card: Expiration date"),
+        "editor_sample": _("2017-05-31"),
+        "evaluate": lambda op, order, ev: get_giftcard_expiry(op, ev)
     }),
 ))
 DEFAULT_IMAGES = OrderedDict([])
@@ -423,9 +571,9 @@ def images_from_questions(sender, *args, **kwargs):
             except IndexError:
                 pass
         else:
-            a = op.answers.filter(question_id=question_id).first()
+            a = op.answers.filter(question_id=question_id).first() or a
 
-        if not a or not a.file or not any(a.file.name.lower().endswith(e) for e in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff")):
+        if not a or not a.file or not any(a.file.name.lower().endswith(e) for e in settings.FILE_UPLOAD_EXTENSIONS_QUESTION_IMAGE):
             return None
         else:
             if etag:
@@ -463,33 +611,48 @@ def variables_from_questions(sender, *args, **kwargs):
             except IndexError:
                 pass
         else:
-            a = op.answers.filter(question_id=question_id).first()
+            a = op.answers.filter(question_id=question_id).first() or a
 
         if not a:
             return ""
         else:
-            return str(a)
+            return a.to_string_i18n()
 
     d = {}
     for q in sender.questions.all():
         if q.type == Question.TYPE_FILE:
             continue
+        d['question_{}'.format(q.identifier)] = {
+            'label': _('Question: {question}').format(question=q.question),
+            'editor_sample': _('<Answer: {question}>').format(question=q.question),
+            'evaluate': partial(get_answer, question_id=q.pk),
+            'migrate_from': 'question_{}'.format(q.pk)
+        }
         d['question_{}'.format(q.pk)] = {
             'label': _('Question: {question}').format(question=q.question),
             'editor_sample': _('<Answer: {question}>').format(question=q.question),
-            'evaluate': partial(get_answer, question_id=q.pk)
+            'evaluate': partial(get_answer, question_id=q.pk),
+            'hidden': True,
         }
     return d
 
 
 def _get_attendee_name_part(key, op, order, ev):
+    name_parts = op.attendee_name_parts or (op.addon_to.attendee_name_parts if op.addon_to else {})
     if isinstance(key, tuple):
-        return ' '.join(p for p in [_get_attendee_name_part(c[0], op, order, ev) for c in key] if p)
-    return op.attendee_name_parts.get(key, '')
+        parts = [_get_attendee_name_part(c[0], op, order, ev) for c in key if not (c[0] == 'salutation' and name_parts.get(c[0], '') == "Mx")]
+        return ' '.join(p for p in parts if p)
+    value = name_parts.get(key, '')
+    if key == 'salutation':
+        return pgettext('person_name_salutation', value)
+    return value
 
 
 def _get_ia_name_part(key, op, order, ev):
-    return order.invoice_address.name_parts.get(key, '') if getattr(order, 'invoice_address', None) else ''
+    value = order.invoice_address.name_parts.get(key, '') if getattr(order, 'invoice_address', None) else ''
+    if key == 'salutation' and value:
+        return pgettext('person_name_salutation', value)
+    return value
 
 
 def get_images(event):
@@ -504,7 +667,23 @@ def get_images(event):
 def get_variables(event):
     v = copy.copy(DEFAULT_VARIABLES)
 
+    templating_context = PlaceholderContext(event=event)
+    v['event_info_text'] = {
+        "label": _("Event info text"),
+        "editor_sample": _("Event info text"),
+        "evaluate": lambda op, order, ev:
+            templating_context.format(str(order.event.settings.event_info_text))
+    }
+
     scheme = PERSON_NAME_SCHEMES[event.settings.name_scheme]
+
+    concatenation_for_salutation = scheme.get("concatenation_for_salutation", scheme["concatenation"])
+    v['attendee_name_for_salutation'] = {
+        'label': _("Attendee name for salutation"),
+        'editor_sample': _("Mr Doe"),
+        'evaluate': lambda op, order, ev: concatenation_for_salutation(op.attendee_name_parts or (op.addon_to.attendee_name_parts if op.addon_to else {}))
+    }
+
     for key, label, weight in scheme['fields']:
         v['attendee_name_%s' % key] = {
             'label': _("Attendee name: {part}").format(part=label),
@@ -522,6 +701,12 @@ def get_variables(event):
     v['invoice_name']['editor_sample'] = scheme['concatenation'](scheme['sample'])
     v['attendee_name']['editor_sample'] = scheme['concatenation'](scheme['sample'])
 
+    v['invoice_name_for_salutation'] = {
+        'label': _("Invoice address name for salutation"),
+        'editor_sample': _("Mr Doe"),
+        'evaluate': lambda op, order, ev: concatenation_for_salutation(order.invoice_address.name_parts if getattr(order, 'invoice_address', None) else {})
+    }
+
     for key, label, weight in scheme['fields']:
         v['invoice_name_%s' % key] = {
             'label': _("Invoice address name: {part}").format(part=label),
@@ -535,6 +720,99 @@ def get_variables(event):
     return v
 
 
+def get_giftcard_expiry(op: OrderPosition, ev):
+    if not op.item.issue_giftcard:
+        return ""  # performance optimization
+    m = op.issued_gift_cards.aggregate(m=Min('expires'))['m']
+    if not m:
+        return ""
+    return date_format(m.astimezone(ev.timezone), "SHORT_DATE_FORMAT")
+
+
+def get_giftcard_issuance(op: OrderPosition, ev):
+    if not op.item.issue_giftcard:
+        return ""  # performance optimization
+    m = op.issued_gift_cards.aggregate(m=Max('issuance'))['m']
+    if not m:
+        return ""
+    return date_format(m.astimezone(ev.timezone), "SHORT_DATE_FORMAT")
+
+
+def get_first_scan(op: OrderPosition):
+    scans = list(op.checkins.all())
+
+    if scans:
+        return date_format(
+            list(op.checkins.all())[-1].datetime.astimezone(op.order.event.timezone),
+            "SHORT_DATETIME_FORMAT"
+        )
+    return ""
+
+
+def get_seat(op: OrderPosition):
+    if op.seat_id:
+        return op.seat
+    if op.addon_to_id:
+        return op.addon_to.seat
+    return None
+
+
+def get_program_times(op: OrderPosition, ev: Event):
+    ptstr = []
+    for pt in op.item.program_times.all():
+        ptstr.append([
+            datetimerange(
+                pt.start.astimezone(ev.timezone),
+                pt.end.astimezone(ev.timezone),
+                as_html=False
+            ),
+            (', ' + ', '.join(
+                l.strip() for l in str(pt.location).splitlines() if l.strip())
+             ) if str(pt.location).strip() else ''
+        ])
+    return '\n'.join(''.join(l) for l in ptstr)
+
+
+def generate_compressed_addon_list(op, order, event, only_checked_in=False):
+    itemcount = defaultdict(int)
+    addon_qs = (
+        op.addons.all() if 'addons' in getattr(op, '_prefetched_objects_cache', {})
+        else op.addons.select_related('item', 'variation')
+    )
+    if only_checked_in:
+        addon_qs = addon_qs.filter(Exists(Checkin.objects.filter(position=OuterRef('pk'))), canceled=False)
+    addons = [p for p in addon_qs if not p.canceled]
+
+    for pos in addons:
+        itemcount[pos.item, pos.variation] += 1
+
+    addonlist = []
+    for (item, variation), count in itemcount.items():
+        if variation:
+            if count > 1:
+                addonlist.append('{}x {} - {}'.format(count, item.name, variation.value))
+            else:
+                addonlist.append('{} - {}'.format(item.name, variation.value))
+        else:
+            if count > 1:
+                addonlist.append('{}x {}'.format(count, item.name))
+            else:
+                addonlist.append(item.name)
+    return addonlist
+
+
+def get_sizebox(page: pypdf.PageObject):
+    mediabox = page.mediabox
+    cropbox = page.cropbox
+
+    return pypdf.generic.RectangleObject((
+        max(mediabox[0], cropbox[0]),
+        max(mediabox[1], cropbox[1]),
+        min(mediabox[2], cropbox[2]),
+        min(mediabox[3], cropbox[3]),
+    ))
+
+
 class Renderer:
 
     def __init__(self, event, layout, background_file):
@@ -545,26 +823,31 @@ class Renderer:
         self.event = event
         if self.background_file:
             self.bg_bytes = self.background_file.read()
-            self.bg_pdf = PdfFileReader(BytesIO(self.bg_bytes), strict=False)
+            self.bg_pdf = PdfReader(BytesIO(self.bg_bytes), strict=False)
         else:
             self.bg_bytes = None
             self.bg_pdf = None
+        self.event_fonts = list(get_fonts(event, pdf_support_required=True).keys()) + ['Open Sans']
 
     @classmethod
-    def _register_fonts(cls):
-        pdfmetrics.registerFont(TTFont('Open Sans', finders.find('fonts/OpenSans-Regular.ttf')))
-        pdfmetrics.registerFont(TTFont('Open Sans I', finders.find('fonts/OpenSans-Italic.ttf')))
-        pdfmetrics.registerFont(TTFont('Open Sans B', finders.find('fonts/OpenSans-Bold.ttf')))
-        pdfmetrics.registerFont(TTFont('Open Sans B I', finders.find('fonts/OpenSans-BoldItalic.ttf')))
+    def _register_fonts(cls, event: Event = None):
+        if hasattr(cls, '_fonts_registered'):
+            return
+        register_ttf_font_if_new('Open Sans', finders.find('fonts/OpenSans-Regular.ttf'))
+        register_ttf_font_if_new('Open Sans I', finders.find('fonts/OpenSans-Italic.ttf'))
+        register_ttf_font_if_new('Open Sans B', finders.find('fonts/OpenSans-Bold.ttf'))
+        register_ttf_font_if_new('Open Sans B I', finders.find('fonts/OpenSans-BoldItalic.ttf'))
 
-        for family, styles in get_fonts().items():
-            pdfmetrics.registerFont(TTFont(family, finders.find(styles['regular']['truetype'])))
+        for family, styles in get_fonts(event, pdf_support_required=True).items():
+            register_ttf_font_if_new(family, finders.find(styles['regular']['truetype']))
             if 'italic' in styles:
-                pdfmetrics.registerFont(TTFont(family + ' I', finders.find(styles['italic']['truetype'])))
+                register_ttf_font_if_new(family + ' I', finders.find(styles['italic']['truetype']))
             if 'bold' in styles:
-                pdfmetrics.registerFont(TTFont(family + ' B', finders.find(styles['bold']['truetype'])))
+                register_ttf_font_if_new(family + ' B', finders.find(styles['bold']['truetype']))
             if 'bolditalic' in styles:
-                pdfmetrics.registerFont(TTFont(family + ' B I', finders.find(styles['bolditalic']['truetype'])))
+                register_ttf_font_if_new(family + ' B I', finders.find(styles['bolditalic']['truetype']))
+
+        cls._fonts_registered = True
 
     def _draw_poweredby(self, canvas: Canvas, op: OrderPosition, o: dict):
         content = o.get('content', 'dark')
@@ -584,12 +867,17 @@ class Renderer:
                          preserveAspectRatio=True, anchor='n',
                          mask='auto')
 
-    def _draw_barcodearea(self, canvas: Canvas, op: OrderPosition, o: dict):
+    def _draw_barcodearea(self, canvas: Canvas, op: OrderPosition, order: Order, o: dict):
         content = o.get('content', 'secret')
         if content == 'secret':
+            # do not use get_text_content because it uses a shortened version of secret
+            # and does not deal with our default value here properly
             content = op.secret
-        elif content == 'pseudonymization_id':
-            content = op.pseudonymization_id
+        else:
+            content = self._get_text_content(op, order, o).strip()
+
+        if len(content) == 0:
+            return
 
         level = 'H'
         if len(content) > 32:
@@ -600,12 +888,28 @@ class Renderer:
         kwargs = {}
         if o.get('nowhitespace', False):
             kwargs['barBorder'] = 0
+
+        if o.get('color'):
+            kwargs['barFillColor'] = Color(o['color'][0] / 255, o['color'][1] / 255, o['color'][2] / 255)
+
         qrw = QrCodeWidget(content, barLevel=level, barHeight=reqs, barWidth=reqs, **kwargs)
         d = Drawing(reqs, reqs)
         d.add(qrw)
         qr_x = float(o['left']) * mm
         qr_y = float(o['bottom']) * mm
         renderPDF.draw(d, canvas, qr_x, qr_y)
+
+        # Add QR content + PDF issuer as a hidden string (fully transparent & very very small)
+        # This helps automated processing of the PDF file by 3rd parties, e.g. when checking tickets for resale
+        data = {
+            "issuer": settings.SITE_URL,
+            o.get('content', 'secret'): content
+        }
+        canvas.saveState()
+        canvas.setFont('Open Sans', .01)
+        canvas.setFillColorRGB(0, 0, 0, 0)
+        canvas.drawString(0 * mm, 0 * mm, json.dumps(data, sort_keys=True))
+        canvas.restoreState()
 
     def _get_ev(self, op, order):
         return op.subevent or order.event
@@ -616,20 +920,54 @@ class Renderer:
                 return self._get_text_content(op, order, o, True)
 
         ev = self._get_ev(op, order)
+
         if not o['content']:
             return '(error)'
-        if o['content'] == 'other':
-            return o['text']
+
+        if o['content'] == 'other' or o['content'] == 'other_i18n':
+            if o['content'] == 'other_i18n':
+                text = str(LazyI18nString(o.get('text_i18n', {})))
+            else:
+                text = o.get('text', '')
+
+            def replace(x):
+                if x.group(1).startswith('itemmeta:'):
+                    if op.variation_id:
+                        return op.variation.meta_data.get(x.group(1)[9:]) or ''
+                    return op.item.meta_data.get(x.group(1)[9:]) or ''
+                elif x.group(1).startswith('meta:'):
+                    return ev.meta_data.get(x.group(1)[5:]) or ''
+                elif x.group(1) not in self.variables:
+                    return x.group(0)
+                if x.group(1) == 'secret':
+                    # Do not use shortened version
+                    return op.secret
+
+                try:
+                    return self.variables[x.group(1)]['evaluate'](op, order, ev)
+                except:
+                    logger.exception('Failed to process variable.')
+                    return '(error)'
+
+            # We do not use str.format like in emails so we (a) can evaluate lazily and (b) can re-implement this
+            # 1:1 on other platforms that render PDFs through our API (libpretixprint)
+            return re.sub(r'\{([-a-zA-Z0-9:_]+)\}', replace, text)
+
         elif o['content'].startswith('itemmeta:'):
+            if op.variation_id:
+                return op.variation.meta_data.get(o['content'][9:]) or ''
             return op.item.meta_data.get(o['content'][9:]) or ''
+
         elif o['content'].startswith('meta:'):
             return ev.meta_data.get(o['content'][5:]) or ''
+
         elif o['content'] in self.variables:
             try:
                 return self.variables[o['content']]['evaluate'](op, order, ev)
             except:
                 logger.exception('Failed to process variable.')
                 return '(error)'
+
         return ''
 
     def _draw_imagearea(self, canvas: Canvas, op: OrderPosition, order: Order, o: dict):
@@ -644,22 +982,37 @@ class Renderer:
                 image_file = None
 
         if image_file:
-            ir = ThumbnailingImageReader(image_file)
             try:
+                ir = ThumbnailingImageReader(image_file)
                 ir.resize(float(o['width']) * mm, float(o['height']) * mm, 300)
+                canvas.drawImage(
+                    image=ir,
+                    x=float(o['left']) * mm,
+                    y=float(o['bottom']) * mm,
+                    width=float(o['width']) * mm,
+                    height=float(o['height']) * mm,
+                    preserveAspectRatio=True,
+                    anchor='c',  # centered in frame
+                    mask='auto'
+                )
+                if isinstance(image_file, FieldFile):
+                    # ThumbnailingImageReader "closes" the file, so it's no use to use the same file pointer
+                    # in case we need it again. For FieldFile, fortunately, there is an easy way to make the file
+                    # refresh itself when it is used next.
+                    del image_file.file
             except:
-                logger.exception("Can not resize image")
-                pass
-            canvas.drawImage(
-                image=ir,
-                x=float(o['left']) * mm,
-                y=float(o['bottom']) * mm,
-                width=float(o['width']) * mm,
-                height=float(o['height']) * mm,
-                preserveAspectRatio=True,
-                anchor='c',  # centered in frame
-                mask='auto'
-            )
+                logger.exception("Can not load or resize image")
+                canvas.saveState()
+                canvas.setFillColorRGB(.8, .8, .8, alpha=1)
+                canvas.rect(
+                    x=float(o['left']) * mm,
+                    y=float(o['bottom']) * mm,
+                    width=float(o['width']) * mm,
+                    height=float(o['height']) * mm,
+                    stroke=0,
+                    fill=1,
+                )
+                canvas.restoreState()
         else:
             canvas.saveState()
             canvas.setFillColorRGB(.8, .8, .8, alpha=1)
@@ -673,106 +1026,230 @@ class Renderer:
             )
             canvas.restoreState()
 
-    def _draw_textarea(self, canvas: Canvas, op: OrderPosition, order: Order, o: dict):
+    def _text_paragraph(self, op: OrderPosition, order: Order, o: dict, legacy_lineheight=False, override_fontsize=None):
         font = o['fontfamily']
+
+        # Since pdfmetrics.registerFont is global, we want to make sure that no one tries to sneak in a font, they
+        # should not have access to.
+        if font not in self.event_fonts:
+            logger.warning(f'Unauthorized use of font "{font}"')
+            font = 'Open Sans'
+
         if o['bold']:
             font += ' B'
         if o['italic']:
             font += ' I'
+
+        fontsize = override_fontsize if override_fontsize is not None else float(o['fontsize'])
+        try:
+            ad = getAscentDescent(font, fontsize)
+        except KeyError:  # font not known, fall back
+            logger.warning(f'Use of unknown font "{font}"')
+            font = 'Open Sans'
+            ad = getAscentDescent(font, fontsize)
 
         align_map = {
             'left': TA_LEFT,
             'center': TA_CENTER,
             'right': TA_RIGHT
         }
+        # lineheight display differs from browser canvas. This calc is just empirical values to get
+        # reportlab render similarly to browser canvas.
+        # for backwards compatability use „uncorrected“ lineheight of 1.0 instead of 1.15
+        lineheight = float(o['lineheight']) * 1.15 if not legacy_lineheight or 'lineheight' in o else 1.0
         style = ParagraphStyle(
             name=uuid.uuid4().hex,
             fontName=font,
-            fontSize=float(o['fontsize']),
-            leading=float(o['fontsize']),
-            autoLeading="max",
+            fontSize=fontsize,
+            leading=lineheight * fontsize,
+            # for backwards compatability use autoLeading if no lineheight is given
+            autoLeading='off' if not legacy_lineheight or 'lineheight' in o else 'max',
             textColor=Color(o['color'][0] / 255, o['color'][1] / 255, o['color'][2] / 255),
-            alignment=align_map[o['align']]
+            alignment=align_map[o['align']],
+            splitLongWords=o.get('splitlongwords', True),
         )
+        # add an almost-invisible space &hairsp; after hyphens as word-wrap in ReportLab only works on space chars
         text = conditional_escape(
             self._get_text_content(op, order, o) or "",
-        ).replace("\n", "<br/>\n")
+        ).replace("\n", "<br/>\n").replace("-", "-&hairsp;")
+
+        # reportlab does not support unicode combination characters
+        # It's important we do this before we use ArabicReshaper
+        text = unicodedata.normalize("NFC", text)
 
         # reportlab does not support RTL, ligature-heavy scripts like Arabic. Therefore, we use ArabicReshaper
         # to resolve all ligatures and python-bidi to switch RTL texts.
-        configuration = {
-            'delete_harakat': True,
-            'support_ligatures': False,
-        }
-        reshaper = ArabicReshaper(configuration=configuration)
         try:
             text = "<br/>".join(get_display(reshaper.reshape(l)) for l in text.split("<br/>"))
         except:
             logger.exception('Reshaping/Bidi fixes failed on string {}'.format(repr(text)))
 
-        p = Paragraph(text, style=style)
+        p = Paragraph(text, style=style)  # not using AutoEscapeParagraph is safe as we escape above
+        return p, ad, lineheight
+
+    def _draw_textcontainer(self, canvas: Canvas, op: OrderPosition, order: Order, o: dict):
+        fontsize = float(o['fontsize'])
+        height = float(o['height']) * mm
+        width = float(o['width']) * mm
+        for _i in range(25):  # try adapting the font size at most 25 times
+            p, ad, lineheight = self._text_paragraph(op, order, o, override_fontsize=fontsize)
+            w, h = p.wrapOn(canvas, width, 1000 * mm)
+            widths = p.getActualLineWidths0()
+            if not widths:
+                break
+            actual_w = max(widths)
+            if not o.get('autoresize', False) or (h <= height and actual_w <= width) or fontsize <= 1.0:
+                break
+            if h > height:  # we can do larger steps for height
+                fontsize -= max(1.0, fontsize * .1)
+            else:
+                fontsize -= max(.25, fontsize * .025)
+
+        canvas.saveState()
+        # The ascent/descent offsets here are not really proven to be correct, they're just empirical values to get
+        # reportlab render similarly to browser canvas.
+        canvas.translate(float(o['left']) * mm, float(o['bottom']) * mm + height)
+        canvas.rotate(o.get('rotation', 0) * -1)
+        if o.get('verticalalign', 'top') == 'top':
+            p.drawOn(canvas, 0, - h)
+        elif o.get('verticalalign', 'top') == 'middle':
+            p.drawOn(canvas, 0, (-height - h) / 2)
+        elif o.get('verticalalign', 'top') == 'bottom':
+            p.drawOn(canvas, 0, -height)
+        canvas.restoreState()
+
+    def _draw_textarea(self, canvas: Canvas, op: OrderPosition, order: Order, o: dict):
+        p, ad, lineheight = self._text_paragraph(op, order, o, legacy_lineheight=True)
         w, h = p.wrapOn(canvas, float(o['width']) * mm, 1000 * mm)
         # p_size = p.wrap(float(o['width']) * mm, 1000 * mm)
-        ad = getAscentDescent(font, float(o['fontsize']))
         canvas.saveState()
         # The ascent/descent offsets here are not really proven to be correct, they're just empirical values to get
         # reportlab render similarly to browser canvas.
         if o.get('downward', False):
             canvas.translate(float(o['left']) * mm, float(o['bottom']) * mm)
             canvas.rotate(o.get('rotation', 0) * -1)
-            p.drawOn(canvas, 0, -h - ad[1] / 2)
+            p.drawOn(canvas, 0, -h - ad[1] / 2.5)
         else:
+            if lineheight != 1.0:
+                # lineheight adds to ascent/descent offsets, just empirical values again to get
+                # reportlab to render similarly to browser canvas
+                ad = (
+                    ad[0],
+                    ad[1] + (lineheight - 1.0) * float(o['fontsize']) * 1.05
+                )
             canvas.translate(float(o['left']) * mm, float(o['bottom']) * mm + h)
             canvas.rotate(o.get('rotation', 0) * -1)
             p.drawOn(canvas, 0, -h - ad[1])
         canvas.restoreState()
 
-    def draw_page(self, canvas: Canvas, order: Order, op: OrderPosition, show_page=True):
-        for o in self.layout:
-            if o['type'] == "barcodearea":
-                self._draw_barcodearea(canvas, op, o)
-            elif o['type'] == "imagearea":
-                self._draw_imagearea(canvas, op, order, o)
-            elif o['type'] == "textarea":
-                self._draw_textarea(canvas, op, order, o)
-            elif o['type'] == "poweredby":
-                self._draw_poweredby(canvas, op, o)
-            if self.bg_pdf:
-                canvas.setPageSize((self.bg_pdf.getPage(0).mediaBox[2], self.bg_pdf.getPage(0).mediaBox[3]))
-        if show_page:
-            canvas.showPage()
+    def draw_page(self, canvas: Canvas, order: Order, op: OrderPosition, show_page=True, only_page=None):
+        page_count = len(self.bg_pdf.pages)
+
+        if not only_page and not show_page:
+            raise ValueError("only_page=None and show_page=False cannot be combined")
+
+        for page in range(page_count):
+            if only_page and only_page != page + 1:
+                continue
+            for o in self.layout:
+                if o.get('page', 1) != page + 1:
+                    continue
+                if o['type'] == "barcodearea":
+                    self._draw_barcodearea(canvas, op, order, o)
+                elif o['type'] == "imagearea":
+                    self._draw_imagearea(canvas, op, order, o)
+                elif o['type'] == "textcontainer":
+                    self._draw_textcontainer(canvas, op, order, o)
+                elif o['type'] == "textarea":
+                    self._draw_textarea(canvas, op, order, o)
+                elif o['type'] == "poweredby":
+                    self._draw_poweredby(canvas, op, o)
+                if self.bg_pdf:
+                    first_page = self.bg_pdf.pages[0]
+                    sizebox = get_sizebox(first_page)
+                    page_size = (sizebox.width, sizebox.height)
+                    if first_page.rotation in (90, 270):
+                        # swap dimensions due to pdf being rotated
+                        page_size = page_size[::-1]
+                    canvas.setPageSize(page_size)
+            if show_page:
+                canvas.showPage()
 
     def render_background(self, buffer, title=_('Ticket')):
+        buffer.seek(0)
+        fg_pdf = PdfReader(buffer)
+
         if settings.PDFTK:
-            buffer.seek(0)
             with tempfile.TemporaryDirectory() as d:
-                with open(os.path.join(d, 'back.pdf'), 'wb') as f:
-                    f.write(self.bg_bytes)
-                with open(os.path.join(d, 'front.pdf'), 'wb') as f:
+                fg_filename = os.path.join(d, 'fg.pdf')
+                bg_filename = os.path.join(d, 'bg.pdf')
+                out_filename = os.path.join(d, 'out.pdf')
+
+                buffer.seek(0)
+                with open(fg_filename, 'wb') as f:
                     f.write(buffer.read())
-                subprocess.run([
-                    settings.PDFTK,
-                    os.path.join(d, 'front.pdf'),
-                    'background',
-                    os.path.join(d, 'back.pdf'),
-                    'output',
-                    os.path.join(d, 'out.pdf'),
-                    'compress'
-                ], check=True)
-                with open(os.path.join(d, 'out.pdf'), 'rb') as f:
+                # pdf_header is a string like "%pdf-X.X"
+                if float(self.bg_pdf.pdf_header[5:]) > float(fg_pdf.pdf_header[5:]):
+                    # To fix issues with pdftk and background-PDF using pdf-version greater
+                    # than foreground-PDF, we stamp front onto back instead.
+                    # Just changing PDF-version in fg.pdf to match the version of
+                    # bg.pdf as we do with pypdf, does not work with pdftk.
+                    #
+                    # Make sure that bg.pdf matches the number of pages of fg.pdf
+                    # note: self.bg_pdf is a PdfReader(), not a PdfWriter()
+                    fg_num_pages = fg_pdf.get_num_pages()
+                    bg_num_pages = self.bg_pdf.get_num_pages()
+                    bg_pdf_to_merge = PdfWriter()
+                    bg_pdf_to_merge.append(
+                        self.bg_pdf,
+                        pages=(0, min(bg_num_pages, fg_num_pages)),
+                        import_outline=False,
+                        excluded_fields=("/Annots", "/B")
+                    )
+                    if fg_num_pages > bg_num_pages:
+                        # repeat last page in bg_pdf to match fg_pdf
+                        bg_pdf_to_merge.append(
+                            bg_pdf_to_merge,
+                            pages=[bg_num_pages - 1] * (fg_num_pages - bg_num_pages),
+                            import_outline=False,
+                            excluded_fields=("/Annots", "/B")
+                        )
+
+                    bg_pdf_to_merge.write(bg_filename)
+
+                    pdftk_cmd = [
+                        settings.PDFTK,
+                        bg_filename,
+                        'multistamp',
+                        fg_filename
+                    ]
+
+                else:
+                    with open(bg_filename, 'wb') as f:
+                        f.write(self.bg_bytes)
+                    pdftk_cmd = [
+                        settings.PDFTK,
+                        fg_filename,
+                        'multibackground',
+                        bg_filename
+                    ]
+
+                pdftk_cmd.extend(('output', out_filename, 'compress'))
+                subprocess.run(pdftk_cmd, check=True)
+                with open(out_filename, 'rb') as f:
                     return BytesIO(f.read())
         else:
-            from PyPDF2 import PdfFileReader, PdfFileWriter
-            buffer.seek(0)
-            new_pdf = PdfFileReader(buffer)
-            output = PdfFileWriter()
+            output = PdfWriter()
 
-            for page in new_pdf.pages:
-                bg_page = copy.copy(self.bg_pdf.getPage(0))
-                bg_page.mergePage(page)
-                output.addPage(bg_page)
+            for i, page in enumerate(fg_pdf.pages):
+                bg_page = self.bg_pdf.pages[i]
+                _merge_with_correct_page_media_box(output, page, bg_page)
 
-            output.addMetadata({
+            # pdf_header is a string like "%pdf-X.X"
+            if float(self.bg_pdf.pdf_header[5:]) > float(fg_pdf.pdf_header[5:]):
+                output.pdf_header = self.bg_pdf.pdf_header
+
+            output.add_metadata({
                 '/Title': str(title),
                 '/Creator': 'pretix',
             })
@@ -780,3 +1257,105 @@ class Renderer:
             output.write(outbuffer)
             outbuffer.seek(0)
             return outbuffer
+
+
+def merge_background(fg_pdf: PdfWriter, bg_pdf: PdfWriter, out_file, compress):
+    if settings.PDFTK:
+        with tempfile.TemporaryDirectory() as d:
+            fg_filename = os.path.join(d, 'fg.pdf')
+            bg_filename = os.path.join(d, 'bg.pdf')
+
+            # pdf_header is a string like "%pdf-X.X"
+            if float(bg_pdf.pdf_header[5:]) > float(fg_pdf.pdf_header[5:]):
+                # To fix issues with pdftk and background-PDF using pdf-version greater
+                # than foreground-PDF, we stamp front onto back instead.
+                # Just changing PDF-version in fg.pdf to match the version of
+                # bg.pdf as we do with pypdf, does not work with pdftk.
+
+                # Make sure that bg.pdf matches the number of pages of fg.pdf
+                fg_num_pages = fg_pdf.get_num_pages()
+                bg_num_pages = bg_pdf.get_num_pages()
+                if fg_num_pages > bg_num_pages:
+                    # repeat last page in bg_pdf to match fg_pdf
+                    bg_pdf.append(
+                        bg_pdf,
+                        pages=[bg_num_pages - 1] * (fg_num_pages - bg_num_pages),
+                        import_outline=False,
+                        excluded_fields=("/Annots", "/B")
+                    )
+
+                bg_pdf.write(bg_filename)
+
+                pdftk_cmd = [
+                    settings.PDFTK,
+                    bg_filename,
+                    'multistamp',
+                    fg_filename,
+                ]
+            else:
+                pdftk_cmd = [
+                    settings.PDFTK,
+                    fg_filename,
+                    'multibackground',
+                    bg_filename
+                ]
+
+            pdftk_cmd.extend(('output', '-'))
+            if compress:
+                pdftk_cmd.append('compress')
+
+            fg_pdf.write(fg_filename)
+            bg_pdf.write(bg_filename)
+            subprocess.run(pdftk_cmd, check=True, stdout=out_file)
+    else:
+        output = PdfWriter()
+        for i, page in enumerate(fg_pdf.pages):
+            bg_page = bg_pdf.pages[i]
+            _merge_with_correct_page_media_box(output, page, bg_page)
+
+        # pdf_header is a string like "%pdf-X.X"
+        output.pdf_header = (
+            bg_pdf.pdf_header
+            if float(bg_pdf.pdf_header[5:]) > float(fg_pdf.pdf_header[5:])
+            else fg_pdf.pdf_header
+        )
+        output.write(out_file)
+
+
+def _merge_with_correct_page_media_box(output: pypdf.PdfWriter, fg_page: pypdf.PageObject, bg_page: pypdf.PageObject):
+    """
+    Adds fg_page to output, merging bg_page behind it.
+
+    If bg_page has a non-zero mergebox/cropbox or is rotated via /Rotate, a transformation is applied to fix this."""
+    trsf = pypdf.Transformation()
+    if bg_page.rotation != 0:
+        trsf = trsf.rotate(-bg_page.rotation)
+
+    mb = get_sizebox(bg_page)
+    pt1 = trsf.apply_on(mb.lower_left)
+    pt2 = trsf.apply_on(mb.upper_right)
+    trsf = trsf.translate(-min(pt1[0], pt2[0]), -min(pt1[1], pt2[1]))
+
+    fg_page = output.add_page(fg_page)
+    fg_page.merge_transformed_page(bg_page, trsf, over=False, expand=False)
+
+
+@deconstructible
+class PdfLayoutValidator:
+    def __call__(self, value):
+        import jsonschema
+
+        if not isinstance(value, dict):
+            try:
+                val = json.loads(value)
+            except ValueError:
+                raise ValidationError(_('Your layout file is not a valid JSON file.'))
+        else:
+            val = value
+        with open(finders.find('schema/pdf-layout.schema.json'), 'r') as f:
+            schema = json.loads(f.read())
+        try:
+            jsonschema.validate(val, schema)
+        except jsonschema.ValidationError as e:
+            e = str(e).replace('%', '%%')
+            raise ValidationError(_('Your layout file is not a valid layout. Error message: {}').format(e))

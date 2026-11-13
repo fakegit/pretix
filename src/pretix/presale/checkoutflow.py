@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -31,53 +31,79 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the Apache License 2.0 is
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
-
+import copy
 import inspect
+import uuid
 from collections import defaultdict
+from datetime import time
 from decimal import Decimal
 
+from django import forms
 from django.conf import settings
 from django.contrib import messages
-from django.core.exceptions import ValidationError
+from django.core.cache import caches
+from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.core.signing import BadSignature, loads
 from django.core.validators import EmailValidator
+from django.db import models
+from django.db.models import Count, F, Q, Sum
+from django.db.models.functions import Cast
 from django.http import HttpResponseNotAllowed, JsonResponse
 from django.shortcuts import redirect
 from django.utils import translation
 from django.utils.functional import cached_property
+from django.utils.html import conditional_escape
+from django.utils.timezone import now
 from django.utils.translation import (
     get_language, gettext_lazy as _, pgettext_lazy,
 )
 from django.views.generic.base import TemplateResponseMixin
 from django_scopes import scopes_disabled
 
-from pretix.base.models import Order
-from pretix.base.models.orders import InvoiceAddress, OrderPayment
+from pretix.base.models import Customer, Membership, Order
+from pretix.base.models.items import Question
+from pretix.base.models.orders import (
+    InvoiceAddress, OrderPayment, QuestionAnswer,
+)
 from pretix.base.models.tax import TaxedPrice, TaxRule
 from pretix.base.services.cart import (
-    CartError, error_messages, get_fees, set_cart_addons, update_tax_rates,
+    CartError, CartManager, add_payment_to_cart, error_messages, get_fees,
+    set_cart_addons,
 )
+from pretix.base.services.cross_selling import CrossSellingService
+from pretix.base.services.memberships import validate_memberships_in_order
 from pretix.base.services.orders import perform_order
+from pretix.base.services.payment import compute_payment_deadline
+from pretix.base.services.pricing import get_price
+from pretix.base.services.tasks import EventTask
+from pretix.base.settings import PERSON_NAME_SCHEMES
 from pretix.base.signals import validate_cart_addons
+from pretix.base.templatetags.money import money_filter
+from pretix.base.templatetags.phone_format import phone_format
 from pretix.base.templatetags.rich_text import rich_text_snippet
+from pretix.base.timemachine import time_machine_now
 from pretix.base.views.tasks import AsyncAction
+from pretix.celery_app import app
+from pretix.helpers.http import redirect_to_url
 from pretix.multidomain.urlreverse import eventreverse
 from pretix.presale.forms.checkout import (
-    ContactForm, InvoiceAddressForm, InvoiceNameForm,
+    ContactForm, InvoiceAddressForm, InvoiceNameForm, MembershipForm,
 )
+from pretix.presale.forms.customer import AuthenticationForm, RegistrationForm
+from pretix.presale.productlist import prepare_item_list_for_shop
 from pretix.presale.signals import (
     checkout_all_optional, checkout_confirm_messages, checkout_flow_steps,
     contact_form_fields, contact_form_fields_overrides,
-    order_meta_from_request, question_form_fields,
+    order_api_meta_from_request, order_meta_from_request, question_form_fields,
     question_form_fields_overrides,
 )
-from pretix.presale.views import (
-    CartMixin, get_cart, get_cart_is_free, get_cart_total,
-)
+from pretix.presale.utils import customer_login
+from pretix.presale.views import CartMixin, get_cart, get_cart_is_free
 from pretix.presale.views.cart import (
-    cart_session, create_empty_cart_id, get_or_create_cart_id,
+    _items_from_post_data, cart_session, create_empty_cart_id,
+    get_or_create_cart_id,
 )
-from pretix.presale.views.event import get_grouped_items
-from pretix.presale.views.questions import QuestionsViewMixin
+from pretix.presale.views.questions import CartQuestionsViewMixin
 
 
 class BaseCheckoutFlowStep:
@@ -138,7 +164,7 @@ class BaseCheckoutFlowStep:
                 kwargs['cart_namespace'] = request.resolver_match.kwargs['cart_namespace']
             return eventreverse(self.request.event, 'presale:event.index', kwargs=kwargs)
         else:
-            return prev.get_step_url(request)
+            return prev.get_step_url(request) + '?dir=prev'
 
     def get_next_url(self, request):
         n = self.get_next_applicable(request)
@@ -222,6 +248,241 @@ class TemplateFlowStep(TemplateResponseMixin, BaseCheckoutFlowStep):
         raise NotImplementedError()
 
 
+class CustomerStep(CartMixin, TemplateFlowStep):
+    priority = 45
+    identifier = "customer"
+    template_name = "pretixpresale/event/checkout_customer.html"
+    label = pgettext_lazy('checkoutflow', 'Customer account')
+    icon = 'user'
+
+    def is_applicable(self, request):
+        return request.organizer.settings.customer_accounts and request.sales_channel.type_instance.customer_accounts_supported
+
+    @cached_property
+    def login_form(self):
+        f = AuthenticationForm(
+            data=(
+                self.request.POST
+                if self.request.method == "POST" and self.request.POST.get('customer_mode') == 'login'
+                else None
+            ),
+            prefix='login',
+            request=self.request.event,
+        )
+        for field in f.fields.values():
+            field._show_required = field.required
+            field.required = False
+            field.widget.is_required = False
+        return f
+
+    @cached_property
+    def signup_allowed(self):
+        return not any(
+            p.item.require_membership or
+            (p.variation and p.variation.require_membership)
+            for p in self.positions
+        ) and self.request.event.settings.customer_accounts_native
+
+    @cached_property
+    def guest_allowed(self):
+        return not any(
+            p.item.require_membership or
+            (p.variation and p.variation.require_membership) or
+            p.item.grant_membership_type_id
+            for p in self.positions
+        )
+
+    @cached_property
+    def register_form(self):
+        f = RegistrationForm(
+            data=(
+                self.request.POST
+                if self.request.method == "POST" and self.request.POST.get('customer_mode') == 'register'
+                else None
+            ),
+            prefix='register',
+            request=self.request,
+            standalone=False,
+        )
+        for field in f.fields.values():
+            field._show_required = field.required
+            field.required = False
+            field.widget.is_required = False
+        return f
+
+    def _handle_sso_login(self):
+        value = self.request.POST['login-sso-data']
+        try:
+            data = loads(value, salt=f'customer_sso_popup_{self.request.organizer.pk}', max_age=120)
+        except BadSignature:
+            return False
+        try:
+            customer = self.request.organizer.customers.get(pk=data['customer'], provider__isnull=False)
+        except Customer.DoesNotExist:
+            return False
+        self.cart_session['customer_mode'] = 'login'
+        self.cart_session['customer'] = customer.pk
+        self.cart_session['customer_cart_tied_to_login'] = True
+        customer_login(self.request, customer)
+        return True
+
+    def post(self, request):
+        self.request = request
+
+        if request.POST.get("customer_mode") == 'login':
+            if self.cart_session.get('customer'):
+                return redirect_to_url(self.get_next_url(request))
+            elif request.customer:
+                self.cart_session['customer_mode'] = 'login'
+                self.cart_session['customer'] = request.customer.pk
+                self.cart_session['customer_cart_tied_to_login'] = True
+                return redirect_to_url(self.get_next_url(request))
+            elif self.request.POST.get("login-sso-data"):
+                if not self._handle_sso_login():
+                    messages.error(request, _('We failed to process your authentication request, please try again.'))
+                    return self.render()
+                return redirect_to_url(self.get_next_url(request))
+            elif self.event.settings.customer_accounts_native and self.login_form.is_valid():
+                customer_login(self.request, self.login_form.get_customer())
+                self.cart_session['customer_mode'] = 'login'
+                self.cart_session['customer'] = self.login_form.get_customer().pk
+                self.cart_session['customer_cart_tied_to_login'] = True
+                return redirect_to_url(self.get_next_url(request))
+            else:
+                return self.render()
+        elif request.POST.get("customer_mode") == 'register' and self.signup_allowed:
+            if self.register_form.is_valid():
+                customer = self.register_form.create()
+                self.cart_session['customer_mode'] = 'login'
+                self.cart_session['customer'] = customer.pk
+                self.cart_session['customer_cart_tied_to_login'] = False
+                return redirect_to_url(self.get_next_url(request))
+            else:
+                return self.render()
+        elif request.POST.get("customer_mode") == 'guest' and self.guest_allowed:
+            self.cart_session['customer'] = None
+            self.cart_session['customer_mode'] = 'guest'
+            return redirect_to_url(self.get_next_url(request))
+        else:
+            return self.render()
+
+    def is_completed(self, request, warn=False):
+        self.request = request
+        if self.guest_allowed:
+            return 'customer_mode' in self.cart_session
+        else:
+            return self.cart_session.get('customer_mode') == 'login'
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['cart'] = self.get_cart()
+        ctx['cart_session'] = self.cart_session
+        ctx['login_form'] = self.login_form
+        ctx['register_form'] = self.register_form
+        ctx['selected'] = self.request.POST.get(
+            'customer_mode',
+            self.cart_session.get('customer_mode', 'login' if self.request.customer else '')
+        )
+        ctx['guest_allowed'] = self.guest_allowed
+        ctx['signup_allowed'] = self.signup_allowed
+
+        if 'customer' in self.cart_session:
+            try:
+                ctx['customer'] = self.request.organizer.customers.get(pk=self.cart_session.get('customer', -1))
+            except Customer.DoesNotExist:
+                self.cart_session['customer'] = None
+                self.cart_session['customer_mode'] = None
+        elif self.request.customer:
+            ctx['customer'] = self.request.customer
+
+        return ctx
+
+
+class MembershipStep(CartMixin, TemplateFlowStep):
+    priority = 47
+    identifier = "membership"
+    template_name = "pretixpresale/event/checkout_membership.html"
+    label = pgettext_lazy('checkoutflow', 'Membership')
+    icon = 'id-card'
+
+    def is_applicable(self, request):
+        self.request = request
+        return bool(self.applicable_positions)
+
+    @cached_property
+    def applicable_positions(self):
+        return [
+            p for p in self.positions
+            if p.item.require_membership or (p.variation and p.variation.require_membership)
+        ]
+
+    @cached_property
+    def forms(self):
+        forms = []
+
+        if self.cart_customer:
+            memberships = list(self.cart_customer.memberships.with_usages().filter(
+                Q(Q(membership_type__max_usages__isnull=True) | Q(usages__lt=F('membership_type__max_usages'))),
+                canceled=False
+            ).select_related('membership_type'))
+        else:
+            # Only possible to reach if you have a product that requries membership but customer accoutns have been
+            # disabled entirely
+            memberships = Membership.objects.none()
+
+        for p in self.applicable_positions:
+            form = MembershipForm(
+                event=self.request.event,
+                memberships=memberships,
+                position=p,
+                prefix=f"membership-{p.id}",
+                initial={
+                    'membership': str(p.used_membership_id)
+                },
+                data=self.request.POST if self.request.method == "POST" else None,
+            )
+            forms.append(form)
+
+        return forms
+
+    def post(self, request):
+        self.request = request
+
+        for f in self.forms:
+            if not f.is_valid():
+                messages.error(request, _('Your cart includes a product that requires an active membership to be selected.'))
+                return self.render()
+
+            f.position.used_membership = f.cleaned_data['membership']
+
+        try:
+            validate_memberships_in_order(self.cart_customer, self.positions, self.request.event, lock=False, testmode=self.request.event.testmode,
+                                          valid_from_not_chosen=True)
+        except ValidationError as e:
+            messages.error(self.request, e.message)
+            return self.render()
+        else:
+            for f in self.forms:
+                f.position.save(update_fields=['used_membership'])
+
+        return redirect_to_url(self.get_next_url(request))
+
+    def is_completed(self, request, warn=False):
+        self.request = request
+        ok = all([p.used_membership_id for p in self.applicable_positions])
+        if not ok and warn:
+            messages.error(request, _('Your cart includes a product that requires an active membership to be selected.'))
+        return ok
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['cart'] = self.get_cart()
+        ctx['cart_session'] = self.cart_session
+        ctx['forms'] = self.forms
+
+        return ctx
+
+
 class AddOnsStep(CartMixin, AsyncAction, TemplateFlowStep):
     priority = 40
     identifier = "addons"
@@ -232,9 +493,31 @@ class AddOnsStep(CartMixin, AsyncAction, TemplateFlowStep):
     label = pgettext_lazy('checkoutflow', 'Add-on products')
     icon = 'puzzle-piece'
 
+    def _check_is_applicable(self, request):
+        self.request = request
+
+        # check whether addons are applicable
+        if get_cart(request).filter(item__addons__isnull=False).exists():
+            return True
+
+        # don't re-check whether cross-selling is applicable if we're already past the AddOnsStep
+        cur_step_identifier = request.resolver_match.kwargs.get('step')
+        is_past_this_step = any(step.identifier == cur_step_identifier for step in request._checkout_flow[request._checkout_flow.index(self) + 1:])
+        if is_past_this_step:
+            applicable = self.cart_session.get('_checkoutflow_addons_applicable', None)
+            if applicable is not None:
+                return applicable
+
+        # check whether cross-selling is applicable
+        applicable = self.cross_selling_is_applicable
+        self.cart_session['_checkoutflow_addons_applicable'] = applicable
+        return applicable
+
     def is_applicable(self, request):
         if not hasattr(request, '_checkoutflow_addons_applicable'):
-            request._checkoutflow_addons_applicable = get_cart(request).filter(item__addons__isnull=False).exists()
+            cur_step_identifier = request.resolver_match.kwargs.get('step')
+            request._checkoutflow_addons_applicable = self._check_is_applicable(request) or cur_step_identifier == self.identifier
+
         return request._checkoutflow_addons_applicable
 
     def is_completed(self, request, warn=False):
@@ -252,6 +535,48 @@ class AddOnsStep(CartMixin, AsyncAction, TemplateFlowStep):
         self._completed = True
         return True
 
+    def _get_initial_val_price(self, current_addon_products, cartpos, item, variation):
+        val = None
+        price = None
+
+        if self.request.POST:
+            if variation:
+                field = f'cp_{cartpos.pk}_variation_{item.pk}_{variation.pk}'
+            else:
+                field = f'cp_{cartpos.pk}_item_{item.pk}'
+
+            try:
+                val = int(self.request.POST.get(field) or '0')
+            except ValueError:
+                pass
+            if val and item.free_price:
+                custom_price = forms.DecimalField(localize=True).to_python(self.request.POST.get(f'{field}_price') or '0')
+                price = get_price(
+                    item, variation, voucher=cartpos.voucher, custom_price=custom_price, subevent=cartpos.subevent,
+                    custom_price_is_net=self.event.settings.display_net_prices,
+                    invoice_address=self.invoice_address,
+                )
+            else:
+                price = variation.suggested_price if variation else item.suggested_price
+
+        else:
+            current_products = current_addon_products[item.pk, variation.pk if variation else None]
+            val = len(current_products)
+            if current_products and item.free_price:
+                a = current_products[0]
+                price = TaxedPrice(
+                    net=a.price - a.tax_value,
+                    gross=a.price,
+                    tax=a.tax_value,
+                    name=a.item.tax_rule.name if a.item.tax_rule else "",
+                    rate=a.tax_rate,
+                    code=a.item.tax_rule.code if a.item.tax_rule else None,
+                )
+            else:
+                price = variation.suggested_price if variation else item.suggested_price
+
+        return val, price
+
     @cached_property
     def forms(self):
         """
@@ -261,16 +586,15 @@ class AddOnsStep(CartMixin, AsyncAction, TemplateFlowStep):
         formset = []
         quota_cache = {}
         item_cache = {}
-        for cartpos in get_cart(self.request).filter(addon_to__isnull=True).prefetch_related(
+        for cartpos in sorted(get_cart(self.request).filter(addon_to__isnull=True).prefetch_related(
             'item__addons', 'item__addons__addon_category', 'addons', 'addons__variation',
-        ).order_by('pk'):
+        ), key=lambda c: c.sort_key):
             formsetentry = {
-                'cartpos': cartpos,
+                'pos': cartpos,
                 'item': cartpos.item,
                 'variation': cartpos.variation,
                 'categories': []
             }
-            formset.append(formsetentry)
 
             current_addon_products = defaultdict(list)
             for a in cartpos.addons.all():
@@ -282,67 +606,70 @@ class AddOnsStep(CartMixin, AsyncAction, TemplateFlowStep):
 
                 if ckey not in item_cache:
                     # Get all items to possibly show
-                    items, _btn = get_grouped_items(
+                    items, _btn = prepare_item_list_for_shop(
                         self.request.event,
                         subevent=cartpos.subevent,
                         voucher=None,
-                        channel=self.request.sales_channel.identifier,
+                        channel=self.request.sales_channel,
                         base_qs=iao.addon_category.items,
                         allow_addons=True,
-                        quota_cache=quota_cache
+                        quota_cache=quota_cache,
+                        memberships=(
+                            self.request.customer.usable_memberships(
+                                for_event=cartpos.subevent or self.request.event,
+                                testmode=self.request.event.testmode
+                            )
+                            if getattr(self.request, 'customer', None) else None
+                        ),
                     )
                     item_cache[ckey] = items
                 else:
-                    items = item_cache[ckey]
+                    # We can use the cache to prevent a database fetch, but we need separate Python objects
+                    # or our things below like setting `i.initial` will do the wrong thing.
+                    items = [copy.copy(i) for i in item_cache[ckey]]
+                    for i in items:
+                        i.available_variations = [copy.copy(v) for v in i.available_variations]
 
                 for i in items:
                     i.allow_waitinglist = False
 
                     if i.has_variations:
                         for v in i.available_variations:
-                            v.initial = len(current_addon_products[i.pk, v.pk])
-                            if v.initial and i.free_price:
-                                a = current_addon_products[i.pk, v.pk][0]
-                                v.initial_price = TaxedPrice(
-                                    net=a.price - a.tax_value,
-                                    gross=a.price,
-                                    tax=a.tax_value,
-                                    name=a.item.tax_rule.name if a.item.tax_rule else "",
-                                    rate=a.tax_rate,
-                                )
-                            else:
-                                v.initial_price = v.display_price
+                            v.initial, v.initial_price = self._get_initial_val_price(current_addon_products, cartpos, i, v)
                         i.expand = any(v.initial for v in i.available_variations)
                     else:
-                        i.initial = len(current_addon_products[i.pk, None])
-                        if i.initial and i.free_price:
-                            a = current_addon_products[i.pk, None][0]
-                            i.initial_price = TaxedPrice(
-                                net=a.price - a.tax_value,
-                                gross=a.price,
-                                tax=a.tax_value,
-                                name=a.item.tax_rule.name if a.item.tax_rule else "",
-                                rate=a.tax_rate,
-                            )
-                        else:
-                            i.initial_price = i.display_price
+                        i.initial, i.initial_price = self._get_initial_val_price(current_addon_products, cartpos, i, None)
 
                 if items:
                     formsetentry['categories'].append({
                         'category': iao.addon_category,
-                        'price_included': iao.price_included,
+                        'price_included': iao.price_included or (cartpos.voucher_id and cartpos.voucher.all_addons_included),
                         'multi_allowed': iao.multi_allowed,
                         'min_count': iao.min_count,
                         'max_count': iao.max_count,
                         'iao': iao,
                         'items': items
                     })
+            if formsetentry['categories']:
+                formset.append(formsetentry)
         return formset
+
+    @cached_property
+    def cross_selling_is_applicable(self):
+        return any(len(items) > 0 for (category, items, form_prefix) in self.cross_selling_data)
+
+    @cached_property
+    def cross_selling_data(self):
+        return CrossSellingService(
+            self.request.event, self.request.sales_channel, self.positions, self.request.customer
+        ).get_data()
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
         ctx['forms'] = self.forms
         ctx['cart'] = self.get_cart()
+        ctx['cross_selling_data'] = self.cross_selling_data
+        ctx['incomplete'] = not self.is_completed(self.request)
         return ctx
 
     def get_success_message(self, value):
@@ -358,6 +685,8 @@ class AddOnsStep(CartMixin, AsyncAction, TemplateFlowStep):
         self.request = request
         if 'async_id' in request.GET and settings.HAS_CELERY:
             return self.get_result(request)
+        if len(self.forms) == 0 and len(self.cross_selling_data) == 0 and self.is_completed(request):
+            return redirect(self.get_prev_url(request) if request.GET.get('dir') == 'prev' else self.get_next_url(request))
         return TemplateFlowStep.get(self, request)
 
     def _clean_category(self, form, category):
@@ -365,52 +694,53 @@ class AddOnsStep(CartMixin, AsyncAction, TemplateFlowStep):
         for i in category['items']:
             if i.has_variations:
                 for v in i.available_variations:
-                    val = int(self.request.POST.get(f'cp_{form["cartpos"].pk}_variation_{i.pk}_{v.pk}') or '0')
-                    price = self.request.POST.get(f'cp_{form["cartpos"].pk}_variation_{i.pk}_{v.pk}_price') or '0'
+                    try:
+                        val = int(self.request.POST.get(f'cp_{form["pos"].pk}_variation_{i.pk}_{v.pk}') or '0')
+                    except ValueError:
+                        raise ValidationError(_('Please enter numbers only.'))
+                    price = self.request.POST.get(f'cp_{form["pos"].pk}_variation_{i.pk}_{v.pk}_price') or '0'
                     if val:
                         selected[i, v] = val, price
             else:
-                val = int(self.request.POST.get(f'cp_{form["cartpos"].pk}_item_{i.pk}') or '0')
-                price = self.request.POST.get(f'cp_{form["cartpos"].pk}_item_{i.pk}_price') or '0'
+                try:
+                    val = int(self.request.POST.get(f'cp_{form["pos"].pk}_item_{i.pk}') or '0')
+                except ValueError:
+                    raise ValidationError(_('Please enter numbers only.'))
+                price = self.request.POST.get(f'cp_{form["pos"].pk}_item_{i.pk}_price') or '0'
                 if val:
                     selected[i, None] = val, price
 
         if sum(a[0] for a in selected.values()) > category['max_count']:
-            # TODO: Proper pluralization
             raise ValidationError(
-                _(error_messages['addon_max_count']),
-                'addon_max_count',
-                {
+                error_messages['addon_max_count'] % {
                     'base': str(form['item'].name),
                     'max': category['max_count'],
                     'cat': str(category['category'].name),
-                }
+                },
+                'addon_max_count'
             )
         elif sum(a[0] for a in selected.values()) < category['min_count']:
-            # TODO: Proper pluralization
             raise ValidationError(
-                _(error_messages['addon_min_count']),
-                'addon_min_count',
-                {
+                error_messages['addon_min_count'] % {
                     'base': str(form['item'].name),
                     'min': category['min_count'],
                     'cat': str(category['category'].name),
-                }
+                },
+                'addon_min_count',
             )
         elif any(sum(v[0] for k, v in selected.items() if k[0] == i) > 1 for i in category['items']) and not category['multi_allowed']:
             raise ValidationError(
-                _(error_messages['addon_no_multi']),
-                'addon_no_multi',
-                {
+                error_messages['addon_no_multi'] % {
                     'base': str(form['item'].name),
                     'cat': str(category['category'].name),
-                }
+                },
+                'addon_no_multi',
             )
         try:
             validate_cart_addons.send(
                 sender=self.event,
                 addons={k: v[0] for k, v in selected.items()},
-                base_position=form["cartpos"],
+                base_position=form["pos"],
                 iao=category['iao']
             )
         except CartError as e:
@@ -420,7 +750,7 @@ class AddOnsStep(CartMixin, AsyncAction, TemplateFlowStep):
 
     def post(self, request, *args, **kwargs):
         self.request = request
-        data = []
+        addons = []
         for f in self.forms:
             for c in f['categories']:
                 try:
@@ -430,20 +760,22 @@ class AddOnsStep(CartMixin, AsyncAction, TemplateFlowStep):
                     return self.get(request, *args, **kwargs)
 
                 for (i, v), (c, price) in selected.items():
-                    data.append({
-                        'addon_to': f['cartpos'].pk,
+                    addons.append({
+                        'addon_to': f['pos'].pk,
                         'item': i.pk,
                         'variation': v.pk if v else None,
                         'count': c,
                         'price': price,
                     })
 
-        return self.do(self.request.event.id, data, get_or_create_cart_id(self.request),
+        add_to_cart_items = _items_from_post_data(self.request, warn_if_empty=False)
+
+        return self.do(self.request.event.id, addons, add_to_cart_items, get_or_create_cart_id(self.request),
                        invoice_address=self.invoice_address.pk, locale=get_language(),
-                       sales_channel=request.sales_channel.identifier)
+                       sales_channel=request.sales_channel.identifier, override_now_dt=time_machine_now(default=None))
 
 
-class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
+class QuestionsStep(CartQuestionsViewMixin, CartMixin, TemplateFlowStep):
     priority = 50
     identifier = "questions"
     template_name = "pretixpresale/event/checkout_questions.html"
@@ -477,7 +809,11 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
                 self.cart_session.get('email', '') or
                 wd.get('email', '')
             ),
-            'phone': wd.get('phone', None)
+            'email_repeat': (
+                self.cart_session.get('email_repeat', '') or
+                wd.get('email', '')
+            ),
+            'phone': self.cart_session.get('phone', '') or wd.get('phone', None)
         }
         initial.update(self.cart_session.get('contact_form_data', {}))
 
@@ -486,29 +822,80 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
             initial.update({
                 k: v['initial'] for k, v in overrides.items() if 'initial' in v
             })
+        if self.cart_customer:
+            initial['email'] = self.cart_customer.email
+            initial['email_repeat'] = self.cart_customer.email
+            if not initial['phone'] and self.cart_customer.phone:
+                initial['phone'] = self.cart_customer.phone
 
         f = ContactForm(data=self.request.POST if self.request.method == "POST" else None,
                         event=self.request.event,
                         request=self.request,
                         initial=initial, all_optional=self.all_optional)
-        if wd.get('email', '') and wd.get('fix', '') == "true":
+        if wd.get('email', '') and wd.get('fix', '') == "true" or self.cart_customer:
             f.fields['email'].disabled = True
+            if 'email_repeat' in f.fields:
+                f.fields['email_repeat'].disabled = True
 
         for overrides in override_sets:
             for fname, val in overrides.items():
                 if 'disabled' in val and fname in f.fields:
                     f.fields[fname].disabled = val['disabled']
+                if 'validators' in val and fname in f.fields:
+                    f.fields[fname].validators += val['validators']
+                if 'label' in val and fname in f.fields:
+                    f.fields[fname].label = val['label']
 
         return f
 
-    def get_question_override_sets(self, cart_position):
-        return [
+    def get_question_override_sets(self, cart_position, index):
+        o = []
+        if self.cart_customer and index == 0:
+            o.append({
+                'attendee_name_parts': {
+                    'initial': self.cart_customer.name_parts
+                }
+            })
+        o += [
             resp for recv, resp in question_form_fields_overrides.send(
                 self.request.event,
                 position=cart_position,
                 request=self.request
             )
         ]
+        if cart_position.used_membership:
+            d = {
+                'initial': cart_position.used_membership.attendee_name_parts
+            }
+            if not cart_position.used_membership.membership_type.transferable:
+                d['disabled'] = True
+            o.append({
+                'attendee_name_parts': d
+            })
+
+        wd = self.cart_session.get('widget_data', {})
+        if wd.get('attendee-fix', '') == 'true':
+            for k, v in wd.items():
+                if v and k.startswith('attendee-name'):
+                    o.append({
+                        'attendee_name_parts': {
+                            'disabled': True,
+                        }
+                    })
+                elif v and k.startswith('email'):
+                    o.append({
+                        'attendee_email': {
+                            'disabled': True,
+                        }
+                    })
+                elif v and k.startswith('question-'):
+                    o.append({
+                        k[9:].upper(): {
+                            'disabled': True,
+                        }
+                    })
+
+        return o
 
     @cached_property
     def eu_reverse_charge_relevant(self):
@@ -518,7 +905,9 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
     @cached_property
     def invoice_form(self):
         wd = self.cart_session.get('widget_data', {})
-        if not self.invoice_address.pk:
+        if self.invoice_address.pk:
+            wd_initial = {}
+        elif wd:
             wd_initial = {
                 'name_parts': {
                     k[21:].replace('-', '_'): v
@@ -531,15 +920,30 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
                 'zipcode': wd.get('invoice-address-zipcode', ''),
                 'city': wd.get('invoice-address-city', ''),
                 'country': wd.get('invoice-address-country', ''),
+                'internal_reference': wd.get('invoice-address-internal-reference', ''),
+                'custom_field': wd.get('invoice-address-custom-field', ''),
+                'vat_id': wd.get('invoice-address-vat-id', ''),
             }
         else:
-            wd_initial = {}
+            wd_initial = {
+                'is_business': self._get_is_business_heuristic(),
+            }
         initial = dict(wd_initial)
+
+        if self.cart_customer:
+            if not self.invoice_address.pk:
+                initial.update({
+                    'name_parts': self.cart_customer.name_parts
+                })
+
+            if 'saved_invoice_address' in self.cart_session:
+                initial['saved_id'] = self.cart_session['saved_invoice_address']
 
         override_sets = self._contact_override_sets
         for overrides in override_sets:
             initial.update({
-                k: v['initial'] for k, v in overrides.items() if 'initial' in v
+                k: v['initial'] for k, v in overrides.items()
+                if 'initial' in v and (v['disabled'] or not self.invoice_address.pk)
             })
 
         if not self.address_asked and self.request.event.settings.invoice_name_required:
@@ -555,6 +959,7 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
                                    request=self.request,
                                    initial=initial,
                                    instance=self.invoice_address,
+                                   allow_save=bool(self.cart_customer),
                                    validate_vat_id=self.eu_reverse_charge_relevant, all_optional=self.all_optional)
         for name, field in f.fields.items():
             if wd_initial.get(name) and wd.get('fix', '') == 'true':
@@ -564,6 +969,10 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
             for fname, val in overrides.items():
                 if 'disabled' in val and fname in f.fields:
                     f.fields[fname].disabled = val['disabled']
+                if 'validators' in val and fname in f.fields:
+                    f.fields[fname].validators += val['validators']
+                if 'label' in val and fname in f.fields:
+                    f.fields[fname].label = val['label']
 
         return f
 
@@ -582,6 +991,15 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
         if failed:
             messages.error(request,
                            _("We had difficulties processing your input. Please review the errors below."))
+            if "vat_id" in self.invoice_form.errors:
+                # If an invalid VAT ID was given through the widget together with data-fix="true", let's un-block
+                # the field to prevent a deadlock.
+                widget_data = self.cart_session.get('widget_data', {})
+                if "invoice-address-vat-id" in widget_data:
+                    vat_id = widget_data.pop("invoice-address-vat-id", None)
+                    self.invoice_form.data["vat_id"] = vat_id
+                    self.invoice_form.fields["vat_id"].disabled = False
+                    self.cart_session['widget_data'] = widget_data
             return self.render()
         self.cart_session['email'] = self.contact_form.cleaned_data['email']
         d = dict(self.contact_form.cleaned_data)
@@ -589,13 +1007,36 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
             d['phone'] = str(d['phone'])
         self.cart_session['contact_form_data'] = d
         if self.address_asked or self.request.event.settings.invoice_name_required:
+            if not self.address_asked:
+                # Invoice address was there, but is no longer asked for, however, name is still required
+                self.invoice_form.instance.clear(except_name=True)
+
             addr = self.invoice_form.save()
+
+            if self.cart_customer and self.invoice_form.cleaned_data.get('save'):
+                if self.invoice_form.cleaned_data.get('saved_id'):
+                    saved = InvoiceAddress.profiles.filter(
+                        customer=self.cart_customer, pk=self.invoice_form.cleaned_data.get('saved_id')
+                    ).first() or InvoiceAddress(customer=self.cart_customer)
+                else:
+                    saved = InvoiceAddress(customer=self.cart_customer)
+
+                for f in InvoiceAddress._meta.fields:
+                    if f.name not in ('order', 'customer', 'last_modified', 'pk', 'id'):
+                        val = getattr(addr, f.name)
+                        setattr(saved, f.name, copy.deepcopy(val))
+
+                saved.save()
+                self.cart_session['saved_invoice_address'] = saved.pk
+
             try:
-                diff = update_tax_rates(
-                    event=request.event,
+                cm = CartManager(
+                    event=self.request.event,
                     cart_id=get_or_create_cart_id(request),
-                    invoice_address=addr
+                    invoice_address=addr,
+                    sales_channel=request.sales_channel,
                 )
+                diff = cm.recompute_final_prices_and_taxes()
             except TaxRule.SaleNotAllowed:
                 messages.error(request,
                                _("Unfortunately, based on the invoice address you entered, we're not able to sell you "
@@ -607,9 +1048,20 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
                 messages.info(request, _('Due to the invoice address you entered, we need to apply a different tax '
                                          'rate to your purchase and the price of the products in your cart has '
                                          'changed accordingly.'))
-                return redirect(self.get_next_url(request) + '?open_cart=true')
+                return redirect_to_url(self.get_next_url(request) + '?open_cart=true')
+        elif 'invoice_address' in self.cart_session:
+            # Invoice address was there, but is no longer asked for
+            self.invoice_address.delete()
+            del self.cart_session['invoice_address']
 
-        return redirect(self.get_next_url(request))
+        try:
+            validate_memberships_in_order(self.cart_customer, self.positions, self.request.event, lock=False,
+                                          testmode=self.request.event.testmode, valid_from_not_chosen=False)
+        except ValidationError as e:
+            messages.error(self.request, e.message)
+            return self.render()
+
+        return redirect_to_url(self.get_next_url(request))
 
     def is_completed(self, request, warn=False):
         self.request = request
@@ -665,31 +1117,32 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
                     (not q.dependency_question_id or question_is_visible(q.dependency_question_id, q.dependency_values))
                 )
 
-            for q in cp.item.questions_to_ask:
-                if question_is_required(q) and q.id not in answ:
+            if not self.all_optional:
+                for q in cp.item.questions_to_ask:
+                    if question_is_required(q) and q.id not in answ:
+                        if warn:
+                            messages.warning(request, _('Please fill in answers to all required questions.'))
+                        return False
+                if cp.item.ask_attendee_data and self.request.event.settings.get('attendee_names_required', as_type=bool) \
+                        and not cp.attendee_name_parts:
                     if warn:
                         messages.warning(request, _('Please fill in answers to all required questions.'))
                     return False
-            if cp.item.admission and self.request.event.settings.get('attendee_names_required', as_type=bool) \
-                    and not cp.attendee_name_parts:
-                if warn:
-                    messages.warning(request, _('Please fill in answers to all required questions.'))
-                return False
-            if cp.item.admission and self.request.event.settings.get('attendee_emails_required', as_type=bool) \
-                    and cp.attendee_email is None:
-                if warn:
-                    messages.warning(request, _('Please fill in answers to all required questions.'))
-                return False
-            if cp.item.admission and self.request.event.settings.get('attendee_company_required', as_type=bool) \
-                    and cp.company is None:
-                if warn:
-                    messages.warning(request, _('Please fill in answers to all required questions.'))
-                return False
-            if cp.item.admission and self.request.event.settings.get('attendee_attendees_required', as_type=bool) \
-                    and (cp.street is None or cp.city is None or cp.country is None):
-                if warn:
-                    messages.warning(request, _('Please fill in answers to all required questions.'))
-                return False
+                if cp.item.ask_attendee_data and self.request.event.settings.get('attendee_emails_required', as_type=bool) \
+                        and cp.attendee_email is None:
+                    if warn:
+                        messages.warning(request, _('Please fill in answers to all required questions.'))
+                    return False
+                if cp.item.ask_attendee_data and self.request.event.settings.get('attendee_company_required', as_type=bool) \
+                        and cp.company is None:
+                    if warn:
+                        messages.warning(request, _('Please fill in answers to all required questions.'))
+                    return False
+                if cp.item.ask_attendee_data and self.request.event.settings.get('attendee_addresses_required', as_type=bool) \
+                        and (cp.street is None and cp.city is None and cp.country is None):
+                    if warn:
+                        messages.warning(request, _('Please fill in answers to all required questions.'))
+                    return False
 
             responses = question_form_fields.send(sender=self.request.event, position=cp)
             form_data = cp.meta_info_data.get('question_form_data', {})
@@ -701,6 +1154,7 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
+        ctx['order_questions_form'] = self.order_questions_form
         ctx['formgroups'] = self.formdict.items()
         ctx['contact_form'] = self.contact_form
         ctx['invoice_form'] = self.invoice_form
@@ -708,7 +1162,143 @@ class QuestionsStep(QuestionsViewMixin, CartMixin, TemplateFlowStep):
         ctx['cart'] = self.get_cart()
         ctx['cart_session'] = self.cart_session
         ctx['invoice_address_asked'] = self.address_asked
+
+        def reduce_initial(v):
+            if isinstance(v, dict):
+                # try to flatten objects such as name_parts to a single string to determine whether they have any value set
+                return ''.join([v for k, v in v.items() if not k.startswith('_') and v])
+            else:
+                return v
+
+        def is_form_filled(form, ignore_keys=()):
+            return any([reduce_initial(v) for k, v in form.initial.items() if k not in ignore_keys])
+
+        ctx['invoice_address_open'] = (
+            self.request.event.settings.invoice_address_required or
+            self.request.event.settings.invoice_name_required or
+            'invoice' in self.request.GET or
+            # Checking for self.invoice_address.pk is not enough as when an invoice_address has been added and later edited to be empty, it’s not None.
+            # So check initial values as invoice_form can receive pre-filled values from invoice_address, widget-data or overwrites from plug-ins.
+            is_form_filled(self.invoice_form, ignore_keys=('is_business', 'country', 'transmission_type'))
+        )
+
+        if self.cart_customer:
+            if self.address_asked:
+                addresses = self.cart_customer.stored_addresses.all()
+                addresses_list = []
+                for a in addresses:
+                    data = {
+                        "_pk": a.pk,
+                        "_country_for_address": a.country.name if a.country else '',
+                        "_state_for_address": a.state_for_address,
+                        "_name": a.name,
+                        "is_business": "business" if a.is_business else "individual",
+                        **(a.transmission_info or {}),
+                    }
+                    if a.name_parts:
+                        name_parts = a.name_parts
+                        # map full_name to name_parts and vice versa
+                        scheme = PERSON_NAME_SCHEMES[self.request.event.settings.name_scheme]
+                        available_keys = name_parts.keys()
+                        asked_keys = [k for (k, l, w) in scheme["fields"]]
+                        if not set(available_keys).intersection(asked_keys):
+                            if "full_name" in available_keys:
+                                name_keys = ("given_name", "family_name")
+                                name_split = name_parts.get("full_name").rsplit(" ", 1)
+                                name_parts = dict(zip(name_keys, name_split))
+                            elif "full_name" in asked_keys:
+                                name_parts = {
+                                    "full_name": a.name
+                                }
+                        for i, k in enumerate(asked_keys):
+                            data[f"name_parts_{i}"] = name_parts.get(k) or ""
+
+                    for k in (
+                        "company", "street", "zipcode", "city", "country", "state",
+                        "state_for_address", "vat_id", "custom_field", "internal_reference", "beneficiary",
+                        "transmission_type",
+                    ):
+                        v = getattr(a, k) or ""
+                        # always add all values of an address even when empty,
+                        # so an address always gets fully overwritten client-side
+                        data[k] = str(v)
+
+                    addresses_list.append(data)
+
+                ctx['addresses_data'] = addresses_list
+
+            profiles = list(self.cart_customer.attendee_profiles.all())
+            profiles_list = []
+            for p in profiles:
+                data = {
+                    "_pk": p.pk,
+                    "_country_for_address": p.country.name if p.country else '',
+                    "_state_for_address": p.state_for_address,
+                    "_attendee_name": p.attendee_name,
+                }
+                if p.attendee_name_parts:
+                    name_parts = p.attendee_name_parts
+                    # map full_name to name_parts and vice versa
+                    scheme = PERSON_NAME_SCHEMES[self.request.event.settings.name_scheme]
+                    available_keys = name_parts.keys()
+                    asked_keys = [k for (k, l, w) in scheme["fields"]]
+                    if not set(available_keys).intersection(asked_keys):
+                        if "full_name" in available_keys:
+                            name_keys = ("given_name", "family_name")
+                            name_split = name_parts.get("full_name").rsplit(" ", 1)
+                            name_parts = dict(zip(name_keys, name_split))
+                        elif "full_name" in asked_keys:
+                            name_parts = {
+                                "full_name": p.attendee_name
+                            }
+
+                    for i, k in enumerate(asked_keys):
+                        data[f"attendee_name_parts_{i}"] = name_parts.get(k) or ""
+
+                for k in ("attendee_email", "company", "street", "zipcode", "city", "country", "state"):
+                    v = getattr(p, k) or ""
+                    # always add all values of an address even when empty,
+                    # so an address always gets fully overwritten client-side
+                    data[k] = str(v)
+
+                for a in p.answers:
+                    value = a.get('value')
+                    if a["question_type"] == "CC":
+                        answer = QuestionAnswer(question=Question(type=a.get('question_type')), answer=str(value))
+                        value = {value: str(answer)}
+
+                    data[a["field_name"]] = {
+                        "label": a["field_label"],
+                        "value": value,
+                        "identifier": a["question_identifier"],
+                        "type": a["question_type"],
+                    }
+                profiles_list.append(data)
+            ctx['profiles_data'] = profiles_list
         return ctx
+
+    def _get_is_business_heuristic(self):
+        key = 'checkout_heuristic_is_business:' + str(self.event.pk)
+        cached_result = caches['default'].get(key, default=False)
+        if caches['default'].add(key + ':valid', True, timeout=10):  # set valid while query is running
+            QuestionsStep._update_is_business_heuristic.apply_async(args=(self.event.pk,))
+        return cached_result
+
+    @staticmethod
+    @app.task(base=EventTask)
+    def _update_is_business_heuristic(event):
+        result = InvoiceAddress.objects.filter(order__event=event).aggregate(
+            total=Count('*'), business=Sum(Cast('is_business', output_field=models.IntegerField())))
+        if result['total'] < 100:
+            result = InvoiceAddress.objects.filter(order__event__organizer=event.organizer).aggregate(
+                total=Count('*'), business=Sum(Cast('is_business', output_field=models.IntegerField())))
+        if result['business'] and result['total']:
+            is_business = result['business'] / result['total'] >= 0.6
+        else:
+            is_business = False
+        key = 'checkout_heuristic_is_business:' + str(event.pk)
+        caches['default'].set(key, is_business, timeout=30 * 24 * 3600)  # store result for 30 days
+        caches['default'].set(key + ':valid', True, timeout=12 * 3600)  # but recalculate after 12 hours
 
 
 class PaymentStep(CartMixin, TemplateFlowStep):
@@ -721,15 +1311,22 @@ class PaymentStep(CartMixin, TemplateFlowStep):
     @cached_property
     def _total_order_value(self):
         cart = get_cart(self.request)
-        total = get_cart_total(self.request)
-        total += sum([f.value for f in get_fees(self.request.event, self.request, total, self.invoice_address, None,
-                                                cart)])
+        try:
+            fees = get_fees(
+                event=self.request.event, request=self.request, invoice_address=self.invoice_address,
+                payments=[p for p in self.cart_session.get('payments', []) if p.get('multi_use_supported')],
+                positions=cart,
+            )
+        except TaxRule.SaleNotAllowed:
+            # ignore for now, will fail on order creation
+            fees = []
+        total = sum([c.price for c in cart]) + sum([f.value for f in fees])
         return Decimal(total)
 
     @cached_property
     def provider_forms(self):
         providers = []
-        for provider in sorted(self.request.event.get_payment_providers().values(), key=lambda p: str(p.public_name)):
+        for provider in sorted(self.request.event.get_payment_providers().values(), key=lambda p: (-p.priority, str(p.public_name).title())):
             if not provider.is_enabled or not self._is_allowed(provider, self.request):
                 continue
             fee = provider.calculate_fee(self._total_order_value)
@@ -745,74 +1342,236 @@ class PaymentStep(CartMixin, TemplateFlowStep):
             })
         return providers
 
+    @cached_property
+    def single_use_payment(self):
+        singleton_payments = [p for p in self.cart_session.get('payments', []) if not p.get('multi_use_supported')]
+        if not singleton_payments:
+            return None
+        return singleton_payments[0]
+
+    def current_payments_valid(self, amount):
+        singleton_payments = [p for p in self.cart_session.get('payments', []) if not p.get('multi_use_supported')]
+        if len(singleton_payments) > 1:
+            return False
+
+        matched = Decimal('0.00')
+        for p in self.cart_session.get('payments', []):
+            if p.get('min_value') and (amount - matched) < Decimal(p['min_value']):
+                continue
+            if p.get('max_value') and (amount - matched) > Decimal(p['max_value']):
+                matched += Decimal(p['max_value'])
+            else:
+                matched = Decimal('0.00')
+
+        return matched == Decimal('0.00'), amount - matched
+
     def post(self, request):
         self.request = request
+        self.request.pci_dss_payment_page = True
+
+        if "postpone" in request.POST and self._allow_postpone:
+            self.cart_session['payments_postpone'] = True
+            self.cart_session['payments'] = []
+            return redirect_to_url(self.get_next_url(request))
+
+        if "remove_payment" in request.POST:
+            self._remove_payment(request.POST["remove_payment"])
+            return redirect_to_url(self.get_step_url(request))
+
         for p in self.provider_forms:
-            if p['provider'].identifier == request.POST.get('payment', ''):
-                self.cart_session['payment'] = p['provider'].identifier
-                resp = p['provider'].checkout_prepare(
-                    request,
-                    self.get_cart()
-                )
-                if isinstance(resp, str):
-                    return redirect(resp)
-                elif resp is True:
-                    return redirect(self.get_next_url(request))
+            pprov = p['provider']
+            if pprov.identifier == request.POST.get('payment', ''):
+                if not pprov.multi_use_supported:
+                    # Providers with multi_use_supported will call this themselves
+                    simulated_payments = self.cart_session.get('payments', {})
+                    simulated_payments = [p for p in simulated_payments if p.get('multi_use_supported')]
+                    simulated_payments.append({
+                        'provider': pprov.identifier,
+                        'multi_use_supported': False,
+                        'min_value': None,
+                        'max_value': None,
+                        'info_data': {},
+                    })
+                    cart = self.get_cart(payments=simulated_payments)
                 else:
-                    return self.render()
+                    cart = self.get_cart()
+
+                resp = pprov.checkout_prepare(
+                    request,
+                    cart,
+                )
+                if pprov.multi_use_supported:
+                    if resp is True:
+                        # Provider needs to call add_payment_to_cart itself, but we need to remove all previously
+                        # selected ones that don't have multi_use supported. Otherwise, if you first select a credit
+                        # card, then go back and switch to a gift card, you'll have both in the session and the credit
+                        # card has preference, which is unexpected.
+                        self.cart_session['payments'] = [p for p in self.cart_session.get('payments', []) if p.get('multi_use_supported')]
+
+                        if pprov.identifier not in [p['provider'] for p in self.cart_session.get('payments', [])]:
+                            raise ImproperlyConfigured(f'Payment provider {pprov.identifier} set multi_use_supported '
+                                                       f'and returned True from payment_prepare, but did not call '
+                                                       f'add_payment_to_cart')
+
+                        cart = self.get_cart()
+                        valid, remainder = self.current_payments_valid(cart['total'])
+                        if valid:
+                            return redirect_to_url(self.get_next_url(request))
+                        else:
+                            # Show payment step again to select another method
+                            messages.success(
+                                request,
+                                _("Your payment method has been applied, but {} still need to be paid. Please select "
+                                  "a payment method for the remainder.").format(
+                                    money_filter(remainder, self.event.currency)
+                                )
+                            )
+                            return redirect_to_url(self.get_step_url(request))
+                    elif isinstance(resp, str):
+                        return redirect_to_url(resp)
+                else:
+                    if resp is True or isinstance(resp, str):
+                        # There can only be one payment method that does not have multi_use_supported, remove all
+                        # previous ones.
+                        self.cart_session['payments'] = [p for p in self.cart_session.get('payments', []) if p.get('multi_use_supported')]
+                        add_payment_to_cart(request, pprov, None, None, None)
+
+                        if isinstance(resp, str):
+                            return redirect_to_url(resp)
+                        else:
+                            return redirect_to_url(self.get_next_url(request))
+                return self.render()
+
+        if self.is_completed(request, warn=False):
+            # All payments already accounted for, no need to select one
+            return redirect_to_url(self.get_next_url(request))
+
         messages.error(self.request, _("Please select a payment method."))
         return self.render()
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
+        ctx['cart'] = self.get_cart()
+        ctx['current_payments'] = [
+            p for p in self.current_selected_payments(
+                ctx['cart']['raw'], ctx['cart']['fees'], ctx['cart']['invoice_address'],
+            )
+            if p.get('multi_use_supported')
+        ]
+        ctx['remaining'] = self._total_order_value - sum(p['payment_amount'] for p in ctx['current_payments']) + sum(p['fee'] for p in ctx['current_payments'])
         ctx['providers'] = self.provider_forms
         ctx['show_fees'] = any(p['fee'] for p in self.provider_forms)
-        ctx['selected'] = self.request.POST.get('payment', self.cart_session.get('payment', ''))
-        if len(self.provider_forms) == 1:
+
+        if 'payment' in self.request.POST:
+            ctx['selected'] = self.request.POST['payment']
+        elif self.cart_session.get('payments_postpone') and self._allow_postpone:
+            ctx['selected'] = ''
+        elif len(self.provider_forms) == 1:
             ctx['selected'] = self.provider_forms[0]['provider'].identifier
-        ctx['cart'] = self.get_cart()
+        elif self.single_use_payment:
+            ctx['selected'] = self.single_use_payment['provider']
+        else:
+            ctx['selected'] = ''
+
+        ctx['allow_postpone'] = self._allow_postpone
+        if self._allow_postpone:
+            now_dt = now()
+            ctx['payment_deadline'] = compute_payment_deadline(
+                event=self.request.event,
+                sales_channel=self.request.sales_channel,
+                subevents={p.subevent for p in ctx['cart']['raw']},
+                now_dt=now_dt,
+            )
+            if ctx['payment_deadline'].time() != time(hour=23, minute=59, second=59):
+                ctx['payment_deadline_minutes'] = int((ctx['payment_deadline'] - now_dt).total_seconds() // 60)
         return ctx
 
     @cached_property
-    def payment_provider(self):
-        return self.request.event.get_payment_providers().get(self.cart_session['payment'])
+    def _allow_postpone(self):
+        return self.request.sales_channel.identifier in self.request.event.settings.payment_choice_postpone_allowed_channels
 
     def _is_allowed(self, prov, request):
         return prov.is_allowed(request, total=self._total_order_value)
 
     def is_completed(self, request, warn=False):
-        self.request = request
-        if 'payment' not in self.cart_session or not self.payment_provider:
+        if self.cart_session.get('payments_postpone') and self._allow_postpone:
+            return True
+
+        if not self.cart_session.get('payments'):
             if warn:
-                messages.error(request, _('The payment information you entered was incomplete.'))
+                messages.error(request, _('Please select a payment method to proceed.'))
             return False
-        if not self.payment_provider.payment_is_valid_session(request) or \
-                not self.payment_provider.is_enabled or \
-                not self._is_allowed(self.payment_provider, request):
+
+        cart = get_cart(self.request)
+        try:
+            fees = get_fees(
+                event=self.request.event,
+                request=self.request,
+                invoice_address=self.invoice_address,
+                payments=self.cart_session.get('payments', []),
+                positions=cart
+            )
+        except TaxRule.SaleNotAllowed:
+            # ignore for now, will fail on order creation
+            fees = []
+        total = sum([c.price for c in cart]) + sum([f.value for f in fees])
+
+        selected = self.current_selected_payments(cart, fees, self.invoice_address, warn=warn)
+        if sum(p['payment_amount'] for p in selected) != total:
             if warn:
-                messages.error(request, _('The payment information you entered was incomplete.'))
+                messages.error(request, _('Please select a payment method to proceed.'))
             return False
+
+        if len([p for p in selected if not p['multi_use_supported']]) > 1:
+            raise ImproperlyConfigured('Multiple non-multi-use providers in session, should never happen')
+
+        for p in selected:
+            if not p['pprov'] or not p['pprov'].is_enabled or not self._is_allowed(p['pprov'], request):
+                self._remove_payment(p['id'])
+                if p['payment_amount']:
+                    if warn:
+                        messages.error(request, _('Please select a payment method to proceed.'))
+                    return False
+
+            if not p['multi_use_supported'] and not p['pprov'].payment_is_valid_session(request):
+                if warn:
+                    messages.error(request, _('The payment information you entered was incomplete.'))
+                return False
         return True
 
     def is_applicable(self, request):
         self.request = request
 
         for cartpos in get_cart(self.request):
-            if cartpos.item.require_approval:
-                if 'payment' in self.cart_session:
-                    del self.cart_session['payment']
+            if cartpos.requires_approval(invoice_address=self.invoice_address):
+                if 'payments' in self.cart_session:
+                    del self.cart_session['payments']
                 return False
 
-        for p in self.request.event.get_payment_providers().values():
-            if p.is_implicit(request) if callable(p.is_implicit) else p.is_implicit:
-                if self._is_allowed(p, request):
-                    self.cart_session['payment'] = p.identifier
+        used_providers = {p['provider'] for p in self.cart_session.get('payments', [])}
+        for provider in self.request.event.get_payment_providers().values():
+            if provider.is_implicit(request) if callable(provider.is_implicit) else provider.is_implicit:
+                if self._is_allowed(provider, request):
+                    self.cart_session['payments'] = [
+                        {
+                            'id': str(uuid.uuid4()),
+                            'provider': provider.identifier,
+                            'multi_use_supported': False,
+                            'min_value': None,
+                            'max_value': None,
+                            'info_data': {},
+                        }
+                    ]
                     return False
-                elif self.cart_session.get('payment') == p.identifier:
+                elif provider.identifier in used_providers:
                     # is_allowed might have changed, e.g. after add-on selection
-                    del self.cart_session['payment']
+                    self.cart_session['payments'] = [p for p in self.cart_session['payments'] if p['provider'] != provider.identifier]
 
         return True
+
+    def get(self, request):
+        self.request.pci_dss_payment_page = True
+        return super().get(request)
 
 
 class ConfirmStep(CartMixin, AsyncAction, TemplateFlowStep):
@@ -840,36 +1599,47 @@ class ConfirmStep(CartMixin, AsyncAction, TemplateFlowStep):
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
         ctx['cart'] = self.get_cart(answers=True)
-        if self.payment_provider:
-            ctx['payment'] = self.payment_provider.checkout_confirm_render(self.request)
-            ctx['payment_provider'] = self.payment_provider
-        ctx['require_approval'] = any(cp.item.require_approval for cp in ctx['cart']['positions'])
+
+        selected_payments = self.current_selected_payments(
+            ctx['cart']['raw'],
+            ctx['cart']['fees'],
+            ctx['cart']['invoice_address'],
+        )
+        ctx['payments'] = []
+        for p in selected_payments:
+            if p['provider'] == 'free':
+                continue
+            if 'info_data' in inspect.signature(p['pprov'].checkout_confirm_render).parameters:
+                block = p['pprov'].checkout_confirm_render(self.request, info_data=p['info_data'])
+            else:
+                block = p['pprov'].checkout_confirm_render(self.request)
+            ctx['payments'].append((p, block))
+
+        ctx['require_approval'] = any(cp.requires_approval(invoice_address=self.invoice_address) for cp in ctx['cart']['positions'])
         ctx['addr'] = self.invoice_address
         ctx['confirm_messages'] = self.confirm_messages
         ctx['cart_session'] = self.cart_session
+        ctx['checkout_session'] = self.checkout_session
         ctx['invoice_address_asked'] = self.address_asked
+        ctx['customer'] = self.cart_customer
 
         self.cart_session['shown_total'] = str(ctx['cart']['total'])
 
         email = self.cart_session.get('contact_form_data', {}).get('email')
         if email != settings.PRETIX_EMAIL_NONE_VALUE:
             ctx['contact_info'] = [
-                (_('E-mail'), email),
+                (_('Email'), email),
             ]
         else:
             ctx['contact_info'] = []
         phone = self.cart_session.get('contact_form_data', {}).get('phone')
         if phone:
-            ctx['contact_info'].append((_('Phone number'), phone))
+            ctx['contact_info'].append((_('Phone number'), phone_format(phone)))
         responses = contact_form_fields.send(self.event, request=self.request)
         for r, response in sorted(responses, key=lambda r: str(r[0])):
             for key, value in response.items():
                 v = self.cart_session.get('contact_form_data', {}).get(key)
                 v = value.bound_data(v, initial='')
-                if v is True:
-                    v = _('Yes')
-                elif v is False:
-                    v = _('No')
                 ctx['contact_info'].append((rich_text_snippet(value.label), v))
 
         return ctx
@@ -917,35 +1687,51 @@ class ConfirmStep(CartMixin, AsyncAction, TemplateFlowStep):
                             'redirect': self.get_error_url(),
                             'message': msg
                         })
-                    return redirect(self.get_error_url())
+                    return redirect_to_url(self.get_error_url())
 
         meta_info = {
             'contact_form_data': self.cart_session.get('contact_form_data', {}),
             'confirm_messages': [
-                str(m) for m in self.confirm_messages.values()
+                conditional_escape(str(m)) for m in self.confirm_messages.values()
             ]
         }
+        api_meta = {}
+        unlock_hashes = request.session.get('pretix_unlock_hashes', [])
+        if unlock_hashes:
+            meta_info['unlock_hashes'] = unlock_hashes
         for receiver, response in order_meta_from_request.send(sender=request.event, request=request):
             meta_info.update(response)
+        for receiver, response in order_api_meta_from_request.send(sender=request.event, request=request):
+            api_meta.update(response)
 
-        return self.do(self.request.event.id, self.payment_provider.identifier if self.payment_provider else None,
-                       [p.id for p in self.positions], self.cart_session.get('email'),
-                       translation.get_language(), self.invoice_address.pk, meta_info,
-                       request.sales_channel.identifier, self.cart_session.get('gift_cards'),
-                       self.cart_session.get('shown_total'))
+        return self.do(
+            self.request.event.id,
+            payments=self.cart_session.get('payments', []),
+            positions=[p.id for p in self.positions],
+            email=self.cart_session.get('email'),
+            locale=translation.get_language(),
+            address=self.invoice_address.pk,
+            meta_info=meta_info,
+            sales_channel=request.sales_channel.identifier,
+            shown_total=self.cart_session.get('shown_total'),
+            customer=self.cart_session.get('customer'),
+            override_now_dt=time_machine_now(default=None),
+            api_meta=api_meta,
+            cart_id=get_or_create_cart_id(request),
+        )
 
     def get_success_message(self, value):
         create_empty_cart_id(self.request)
+        if isinstance(value, dict):
+            for w in value.get('warnings', []):
+                messages.warning(self.request, w)
         return None
 
     def get_success_url(self, value):
+        if isinstance(value, dict):
+            value = value['order_id']
         order = Order.objects.get(id=value)
         return self.get_order_url(order)
-
-    def get_error_message(self, exception):
-        if exception.__class__.__name__ == 'SendMailException':
-            return _('There was an error sending the confirmation mail. Please try again later.')
-        return super().get_error_message(exception)
 
     def get_error_url(self):
         return self.get_step_url(self.request)
@@ -966,6 +1752,8 @@ class ConfirmStep(CartMixin, AsyncAction, TemplateFlowStep):
 
 DEFAULT_FLOW = (
     AddOnsStep,
+    CustomerStep,
+    MembershipStep,
     QuestionsStep,
     PaymentStep,
     ConfirmStep

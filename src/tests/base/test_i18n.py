@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -38,10 +38,10 @@ class I18nStringTest(TestCase):
             'en': 'Hello'
         }
         s = LazyI18nString(data)
-        translation.activate('en')
-        self.assertEqual(str(s), 'Hello')
-        translation.activate('de')
-        self.assertEqual(str(s), 'Hallo')
+        with translation.override('en'):
+            self.assertEqual(str(s), 'Hello')
+        with translation.override('de'):
+            self.assertEqual(str(s), 'Hallo')
 
     def test_similar_translations(self):
         data = {
@@ -50,57 +50,57 @@ class I18nStringTest(TestCase):
             'de-informal': 'Du'
         }
         s = LazyI18nString(data)
-        translation.activate('de')
-        self.assertEqual(str(s), 'Sie')
-        translation.activate('de-informal')
-        self.assertEqual(str(s), 'Du')
+        with translation.override('de'):
+            self.assertEqual(str(s), 'Sie')
+        with translation.override('de-informal'):
+            self.assertEqual(str(s), 'Du')
 
         data = {
             'en': 'You',
             'de-informal': 'Du'
         }
         s = LazyI18nString(data)
-        translation.activate('de')
-        self.assertEqual(str(s), 'Du')
-        translation.activate('de-informal')
-        self.assertEqual(str(s), 'Du')
+        with translation.override('de'):
+            self.assertEqual(str(s), 'Du')
+        with translation.override('de-informal'):
+            self.assertEqual(str(s), 'Du')
 
         data = {
             'en': 'You',
             'de': 'Sie'
         }
         s = LazyI18nString(data)
-        translation.activate('de')
-        self.assertEqual(str(s), 'Sie')
-        translation.activate('de-informal')
-        self.assertEqual(str(s), 'Sie')
+        with translation.override('de'):
+            self.assertEqual(str(s), 'Sie')
+        with translation.override('de-informal'):
+            self.assertEqual(str(s), 'Sie')
 
     def test_missing_default_translation(self):
         data = {
             'de': 'Hallo',
         }
         s = LazyI18nString(data)
-        translation.activate('en')
-        self.assertEqual(str(s), 'Hallo')
-        translation.activate('de')
-        self.assertEqual(str(s), 'Hallo')
+        with translation.override('en'):
+            self.assertEqual(str(s), 'Hallo')
+        with translation.override('de'):
+            self.assertEqual(str(s), 'Hallo')
 
     def test_missing_translation(self):
         data = {
             'en': 'Hello',
         }
         s = LazyI18nString(data)
-        translation.activate('en')
-        self.assertEqual(str(s), 'Hello')
-        translation.activate('de')
-        self.assertEqual(str(s), 'Hello')
+        with translation.override('en'):
+            self.assertEqual(str(s), 'Hello')
+        with translation.override('de'):
+            self.assertEqual(str(s), 'Hello')
 
     def test_legacy_string(self):
         s = LazyI18nString("Hello")
-        translation.activate('en')
-        self.assertEqual(str(s), 'Hello')
-        translation.activate('de')
-        self.assertEqual(str(s), 'Hello')
+        with translation.override('en'):
+            self.assertEqual(str(s), 'Hello')
+        with translation.override('de'):
+            self.assertEqual(str(s), 'Hello')
 
     def test_none(self):
         s = LazyI18nString(None)
@@ -113,10 +113,9 @@ class I18nFieldTest(TestCase):
     """
     This test case tests the I18n*Field classes
     """
-    @classmethod
-    def setUpTestData(cls):
+    def setUp(self):
         o = Organizer.objects.create(name='Dummy', slug='dummy')
-        cls.event = Event.objects.create(
+        self.event = Event.objects.create(
             organizer=o, name='Dummy', slug='dummy',
             date_from=now(),
         )
@@ -125,10 +124,10 @@ class I18nFieldTest(TestCase):
         obj = ItemCategory.objects.create(event=self.event, name="Hello")
         obj = ItemCategory.objects.get(id=obj.id)
         self.assertIsInstance(obj.name, LazyI18nString)
-        translation.activate('en')
-        self.assertEqual(str(obj.name), "Hello")
-        translation.activate('de')
-        self.assertEqual(str(obj.name), "Hello")
+        with translation.override('en'):
+            self.assertEqual(str(obj.name), "Hello")
+        with translation.override('de'):
+            self.assertEqual(str(obj.name), "Hello")
 
     def test_save_load_cycle_i18n_string(self):
         obj = ItemCategory.objects.create(event=self.event,
@@ -140,7 +139,7 @@ class I18nFieldTest(TestCase):
                                           ))
         obj = ItemCategory.objects.get(id=obj.id)
         self.assertIsInstance(obj.name, LazyI18nString)
-        translation.activate('en')
-        self.assertEqual(str(obj.name), "Hello")
-        translation.activate('de')
-        self.assertEqual(str(obj.name), "Hallo")
+        with translation.override('en'):
+            self.assertEqual(str(obj.name), "Hello")
+        with translation.override('de'):
+            self.assertEqual(str(obj.name), "Hallo")

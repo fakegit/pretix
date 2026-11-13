@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -34,9 +34,9 @@
 
 import datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
-import pytz
 from django.utils.timezone import now
 from django_scopes import scope
 from tests.testdummy.payment import DummyPaymentProvider
@@ -97,7 +97,15 @@ def test_payment_fee_reverse_percent_and_abs_default(event):
 def test_availability_date_available(event):
     prov = DummyPaymentProvider(event)
     prov.settings.set('_availability_date', datetime.date.today() + datetime.timedelta(days=1))
-    result = prov._is_still_available()
+    result = prov._is_available_by_time()
+    assert result
+
+
+@pytest.mark.django_db
+def test_availability_start_available(event):
+    prov = DummyPaymentProvider(event)
+    prov.settings.set('_availability_start', datetime.date.today() - datetime.timedelta(days=1))
+    result = prov._is_available_by_time()
     assert result
 
 
@@ -105,25 +113,50 @@ def test_availability_date_available(event):
 def test_availability_date_not_available(event):
     prov = DummyPaymentProvider(event)
     prov.settings.set('_availability_date', datetime.date.today() - datetime.timedelta(days=1))
-    result = prov._is_still_available()
+    result = prov._is_available_by_time()
+    assert not result
+
+
+@pytest.mark.django_db
+def test_availability_start_not_available(event):
+    prov = DummyPaymentProvider(event)
+    prov.settings.set('_availability_start', datetime.date.today() + datetime.timedelta(days=1))
+    result = prov._is_available_by_time()
     assert not result
 
 
 @pytest.mark.django_db
 def test_availability_date_relative(event):
     event.settings.set('timezone', 'US/Pacific')
-    tz = pytz.timezone('US/Pacific')
-    event.date_from = tz.localize(datetime.datetime(2016, 12, 3, 12, 0, 0))
+    tz = ZoneInfo('US/Pacific')
+    event.date_from = datetime.datetime(2016, 12, 3, 12, 0, 0, tzinfo=tz)
     event.save()
     prov = DummyPaymentProvider(event)
     prov.settings.set('_availability_date', RelativeDateWrapper(
-        RelativeDate(days_before=2, time=None, base_date_name='date_from', minutes_before=None)
+        RelativeDate(days=2, time=None, base_date_name='event__date_from', minutes=None)
     ))
 
-    utc = pytz.timezone('UTC')
-    assert prov._is_still_available(tz.localize(datetime.datetime(2016, 11, 30, 23, 0, 0)).astimezone(utc))
-    assert prov._is_still_available(tz.localize(datetime.datetime(2016, 12, 1, 23, 59, 0)).astimezone(utc))
-    assert not prov._is_still_available(tz.localize(datetime.datetime(2016, 12, 2, 0, 0, 1)).astimezone(utc))
+    utc = datetime.timezone.utc
+    assert prov._is_available_by_time(datetime.datetime(2016, 11, 30, 23, 0, 0, tzinfo=tz).astimezone(utc))
+    assert prov._is_available_by_time(datetime.datetime(2016, 12, 1, 23, 59, 0, tzinfo=tz).astimezone(utc))
+    assert not prov._is_available_by_time(datetime.datetime(2016, 12, 2, 0, 0, 1, tzinfo=tz).astimezone(utc))
+
+
+@pytest.mark.django_db
+def test_availability_start_relative(event):
+    event.settings.set('timezone', 'US/Pacific')
+    tz = ZoneInfo('US/Pacific')
+    event.date_from = datetime.datetime(2016, 12, 3, 12, 0, 0, tzinfo=tz)
+    event.save()
+    prov = DummyPaymentProvider(event)
+    prov.settings.set('_availability_start', RelativeDateWrapper(
+        RelativeDate(days=2, time=datetime.time(12, 0), base_date_name='event__date_from', minutes=None)
+    ))
+
+    utc = datetime.timezone.utc
+    assert not prov._is_available_by_time(datetime.datetime(2016, 11, 30, 23, 0, 0, tzinfo=tz).astimezone(utc))
+    assert prov._is_available_by_time(datetime.datetime(2016, 12, 1, 0, 0, tzinfo=tz).astimezone(utc))
+    assert prov._is_available_by_time(datetime.datetime(2016, 12, 2, 0, 0, 1, tzinfo=tz).astimezone(utc))
 
 
 @pytest.mark.django_db
@@ -132,11 +165,11 @@ def test_availability_date_timezones(event):
     prov = DummyPaymentProvider(event)
     prov.settings.set('_availability_date', '2016-12-01')
 
-    tz = pytz.timezone('US/Pacific')
-    utc = pytz.timezone('UTC')
-    assert prov._is_still_available(tz.localize(datetime.datetime(2016, 11, 30, 23, 0, 0)).astimezone(utc))
-    assert prov._is_still_available(tz.localize(datetime.datetime(2016, 12, 1, 23, 59, 0)).astimezone(utc))
-    assert not prov._is_still_available(tz.localize(datetime.datetime(2016, 12, 2, 0, 0, 1)).astimezone(utc))
+    tz = ZoneInfo('US/Pacific')
+    utc = ZoneInfo('UTC')
+    assert prov._is_available_by_time(datetime.datetime(2016, 11, 30, 23, 0, 0, tzinfo=tz).astimezone(utc))
+    assert prov._is_available_by_time(datetime.datetime(2016, 12, 1, 23, 59, 0, tzinfo=tz).astimezone(utc))
+    assert not prov._is_available_by_time(datetime.datetime(2016, 12, 2, 0, 0, 1, tzinfo=tz).astimezone(utc))
 
 
 @pytest.mark.django_db
@@ -160,14 +193,14 @@ def test_availability_date_cart_relative_subevents(event):
 
     prov = DummyPaymentProvider(event)
     prov.settings.set('_availability_date', RelativeDateWrapper(
-        RelativeDate(days_before=3, time=None, base_date_name='date_from', minutes_before=None)
+        RelativeDate(days=3, time=None, base_date_name='event__date_from', minutes=None)
     ))
-    assert prov._is_still_available(cart_id="123")
+    assert prov._is_available_by_time(cart_id="123")
 
     prov.settings.set('_availability_date', RelativeDateWrapper(
-        RelativeDate(days_before=4, time=None, base_date_name='date_from', minutes_before=None)
+        RelativeDate(days=4, time=None, base_date_name='event__date_from', minutes=None)
     ))
-    assert not prov._is_still_available(cart_id="123")
+    assert not prov._is_available_by_time(cart_id="123")
 
 
 @pytest.mark.django_db
@@ -187,6 +220,7 @@ def test_availability_date_order_relative_subevents(event):
         status=Order.STATUS_PENDING,
         datetime=now(), expires=now() + datetime.timedelta(days=10),
         total=Decimal('46.00'),
+        sales_channel=event.organizer.sales_channels.get(identifier="web"),
     )
     OrderPosition.objects.create(
         order=order, item=ticket, variation=None, subevent=se1,
@@ -199,11 +233,11 @@ def test_availability_date_order_relative_subevents(event):
 
     prov = DummyPaymentProvider(event)
     prov.settings.set('_availability_date', RelativeDateWrapper(
-        RelativeDate(days_before=3, time=None, base_date_name='date_from', minutes_before=None)
+        RelativeDate(days=3, time=None, base_date_name='event__date_from', minutes=None)
     ))
-    assert prov._is_still_available(order=order)
+    assert prov._is_available_by_time(order=order)
 
     prov.settings.set('_availability_date', RelativeDateWrapper(
-        RelativeDate(days_before=4, time=None, base_date_name='date_from', minutes_before=None)
+        RelativeDate(days=4, time=None, base_date_name='event__date_from', minutes=None)
     ))
-    assert not prov._is_still_available(order=order)
+    assert not prov._is_available_by_time(order=order)

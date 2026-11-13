@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -32,83 +32,137 @@
 # Unless required by applicable law or agreed to in writing, software distributed under the Apache License 2.0 is
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
-
+import copy
+import hmac
 import inspect
 import json
+import logging
 import mimetypes
 import os
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict, defaultdict
 from decimal import Decimal
+from urllib.parse import quote, urlencode
 
 from django import forms
 from django.conf import settings
 from django.contrib import messages
+from django.core.exceptions import ValidationError
 from django.core.files import File
 from django.db import transaction
-from django.db.models import Exists, OuterRef, Q, Sum
+from django.db.models import Count, Exists, OuterRef, Q, Subquery, Sum
 from django.http import (
     FileResponse, Http404, HttpResponseRedirect, JsonResponse,
 )
-from django.shortcuts import get_object_or_404, redirect
+from django.shortcuts import get_object_or_404, redirect, render
+from django.utils.crypto import get_random_string
 from django.utils.decorators import method_decorator
 from django.utils.functional import cached_property
 from django.utils.timezone import now
 from django.utils.translation import gettext, gettext_lazy as _
 from django.views.decorators.clickjacking import xframe_options_exempt
-from django.views.generic import TemplateView, View
+from django.views.generic import ListView, TemplateView, View
 
+from pretix.base.auth import has_event_access_permission
 from pretix.base.models import (
-    CachedTicket, GiftCard, Invoice, Order, OrderPosition, Quota, TaxRule,
+    CachedTicket, Checkin, GiftCard, Invoice, Order, OrderPosition, Quota,
+    TaxRule,
 )
 from pretix.base.models.orders import (
     CachedCombinedTicket, InvoiceAddress, OrderFee, OrderPayment, OrderRefund,
     QuestionAnswer,
 )
+from pretix.base.models.tax import TaxedPrice
 from pretix.base.payment import PaymentException
 from pretix.base.services.invoices import (
     generate_cancellation, generate_invoice, invoice_pdf, invoice_pdf_task,
-    invoice_qualified,
+    invoice_qualified, transmit_invoice,
 )
-from pretix.base.services.mail import SendMailException
 from pretix.base.services.orders import (
-    OrderChangeManager, OrderError, cancel_order, change_payment_provider,
+    OrderChangeManager, OrderError, _try_auto_refund, cancel_order,
+    change_payment_provider,
 )
 from pretix.base.services.pricing import get_price
 from pretix.base.services.tickets import generate, invalidate_cache
-from pretix.base.signals import (
-    allow_ticket_download, order_modified, register_ticket_outputs,
-)
+from pretix.base.signals import order_modified, register_ticket_outputs
 from pretix.base.templatetags.money import money_filter
 from pretix.base.views.mixins import OrderQuestionsViewMixin
 from pretix.base.views.tasks import AsyncAction
+from pretix.helpers.http import redirect_to_url
 from pretix.helpers.safedownload import check_token
-from pretix.multidomain.urlreverse import build_absolute_uri, eventreverse
-from pretix.presale.forms.checkout import InvoiceAddressForm, QuestionsForm
+from pretix.multidomain.urlreverse import eventreverse, eventreverse_absolute
+from pretix.presale.forms.checkout import (
+    CustomerAwareQuestionsForm, InvoiceAddressForm,
+)
 from pretix.presale.forms.order import OrderPositionChangeForm
+from pretix.presale.productlist import prepare_item_list_for_shop
 from pretix.presale.signals import question_form_fields_overrides
 from pretix.presale.views import (
     CartMixin, EventViewMixin, iframe_entry_view_wrapper,
 )
 from pretix.presale.views.robots import NoSearchIndexViewMixin
 
+logger = logging.getLogger(__name__)
+
 
 class OrderDetailMixin(NoSearchIndexViewMixin):
+    def _allow_anonymous_access(self):
+        return not (self.request.organizer.settings.customer_accounts and
+                    self.request.organizer.settings.customer_accounts_require_login_for_order_access)
+
+    def verify_order_access(self):
+        o = self.order
+
+        if o is None:
+            raise Http404(_('Unknown order code or not authorized to access this order.'))
+
+        if o is False:
+            login_url = eventreverse_absolute(self.request.organizer, 'presale:organizer.customer.login', kwargs={})
+
+            if self.request.domain_mode in ('event', 'organizer_alternative'):
+                nonce = get_random_string(32)
+                self.request.session['cross_domain_customer_auth_nonce'] = nonce
+                query = {
+                    "next": self.request.scheme + "://" + self.request.get_host() + self.request.get_full_path(),
+                    "request_cross_domain_customer_auth_nonce": nonce,
+                    "request_cross_domain_customer_auth": "true",
+                }
+                return redirect_to_url(f'{login_url}?{urlencode(query)}')
+
+            else:
+                next_url = quote(self.request.get_full_path())
+                return redirect_to_url(f'{login_url}?next={next_url}')
+
+        return None
 
     @cached_property
     def order(self):
-        order = self.request.event.orders.filter(code=self.kwargs['order']).select_related('event').first()
-        if order:
-            if order.secret.lower() == self.kwargs['secret'].lower():
+        """
+        Returns the order object when access is permitted, returns `False` when the
+        order exists but requires authentication, and returns `None` when the order
+        does not exist or access is denied entirely.
+        """
+        try:
+            order = self.request.event.orders.filter().select_related('event').get_with_secret_check(
+                code=self.kwargs['order'], received_secret=self.kwargs['secret'], tag=None,
+            )
+
+            if has_event_access_permission(self.request, 'event.orders:read'):
                 return order
-            else:
-                return None
-        else:
-            # Do a comparison as well to harden timing attacks
-            if 'abcdefghijklmnopq'.lower() == self.kwargs['secret'].lower():
-                return None
-            else:
-                return None
+
+            if order.customer is None or not order.customer.is_verified or self._allow_anonymous_access():
+                return order
+
+            if not self.request.customer:
+                return False
+
+            if order.customer_id == self.request.customer.pk:
+                return order
+
+            return None
+
+        except Order.DoesNotExist:
+            return None
 
     def get_order_url(self):
         return eventreverse(self.request.event, 'presale:event.order', kwargs={
@@ -116,24 +170,31 @@ class OrderDetailMixin(NoSearchIndexViewMixin):
             'secret': self.order.secret
         })
 
+    def dispatch(self, request, *args, **kwargs):
+        resp = self.verify_order_access()
+        if resp:
+            return resp
+
+        return super().dispatch(request, *args, **kwargs)
+
 
 class OrderPositionDetailMixin(NoSearchIndexViewMixin):
     @cached_property
     def position(self):
-        p = OrderPosition.objects.filter(
+        qs = OrderPosition.objects.filter(
             order__event=self.request.event,
-            addon_to__isnull=True,
             order__code=self.kwargs['order'],
             positionid=self.kwargs['position']
-        ).select_related('order', 'order__event').first()
+        ).select_related('order', 'order__event')
+        p = qs.first()
         if p:
-            if p.web_secret.lower() == self.kwargs['secret'].lower():
+            if hmac.compare_digest(p.web_secret.lower(), self.kwargs['secret'].lower()):
                 return p
             else:
                 return None
         else:
             # Do a comparison as well to harden timing attacks
-            if 'abcdefghijklmnopq'.lower() == self.kwargs['secret'].lower():
+            if hmac.compare_digest('abcdefghijklmnopq'.lower(), self.kwargs['secret'].lower()):
                 return None
             else:
                 return None
@@ -153,13 +214,10 @@ class OrderPositionDetailMixin(NoSearchIndexViewMixin):
 @method_decorator(xframe_options_exempt, 'dispatch')
 class OrderOpen(EventViewMixin, OrderDetailMixin, View):
     def get(self, request, *args, **kwargs):
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
-        if kwargs.get('hash') == self.order.email_confirm_hash():
-            if not self.order.email_known_to_work:
-                self.order.log_action('pretix.event.order.contact.confirmed')
-                self.order.email_known_to_work = True
-                self.order.save(update_fields=['email_known_to_work'])
+        if self.order.check_email_confirm_secret(kwargs.get('hash')) and not self.order.email_known_to_work:
+            self.order.log_action('pretix.event.order.contact.confirmed')
+            self.order.email_known_to_work = True
+            self.order.save(update_fields=['email_known_to_work'])
         return redirect(self.get_order_url())
 
 
@@ -168,40 +226,46 @@ class TicketPageMixin:
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
 
+        positions_with_tickets = list(self.order.positions_with_tickets)
         ctx['order'] = self.order
 
-        can_download = all([r for rr, r in allow_ticket_download.send(self.request.event, order=self.order)])
+        can_download = bool(positions_with_tickets)
+        ctx['plugins_allow_ticket_download'] = can_download
         if self.request.event.settings.ticket_download_date:
             ctx['ticket_download_date'] = self.order.ticket_download_date
-        can_download = (
-            can_download and self.order.ticket_download_available and
-            list(self.order.positions_with_tickets)
-        )
+        can_download = can_download and self.order.ticket_download_available
         ctx['download_email_required'] = can_download and (
             self.request.event.settings.ticket_download_require_validated_email and
-            self.order.sales_channel == 'web' and
+            self.order.sales_channel.type == 'web' and
             not self.order.email_known_to_work
         )
         ctx['can_download'] = can_download and not ctx['download_email_required']
 
+        qs = self.context_query_set
+        if self.request.event.settings.show_checkin_number_user:
+            qs = qs.annotate(
+                checkin_count=Subquery(
+                    Checkin.objects.filter(
+                        successful=True,
+                        type=Checkin.TYPE_ENTRY,
+                        position_id=OuterRef('pk'),
+                        list__consider_tickets_used=True,
+                    ).order_by().values('position').annotate(c=Count('*')).values('c')
+                )
+            )
+        ctx['cart'] = self.get_cart(
+            answers=True, downloads=ctx['can_download'],
+            queryset=qs,
+            order=self.order
+        )
+
+        ctx['tickets_with_download'] = [p for p in ctx['cart']['positions'] if p in positions_with_tickets]
+
         ctx['download_buttons'] = self.download_buttons
 
-        ctx['backend_user'] = (
-            self.request.user.is_authenticated
-            and self.request.user.has_event_permission(self.request.organizer, self.request.event, 'can_view_orders', request=self.request)
-        )
+        ctx['backend_user'] = has_event_access_permission(self.request, 'event.orders:read')
+
         return ctx
-
-
-@method_decorator(xframe_options_exempt, 'dispatch')
-class OrderDetails(EventViewMixin, OrderDetailMixin, CartMixin, TicketPageMixin, TemplateView):
-    template_name = "pretixpresale/event/order.html"
-
-    def get(self, request, *args, **kwargs):
-        self.kwargs = kwargs
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
-        return super().get(request, *args, **kwargs)
 
     @cached_property
     def download_buttons(self):
@@ -223,14 +287,29 @@ class OrderDetails(EventViewMixin, OrderDetailMixin, CartMixin, TicketPageMixin,
             })
         return buttons
 
+
+@method_decorator(xframe_options_exempt, 'dispatch')
+class OrderDetails(EventViewMixin, OrderDetailMixin, CartMixin, TicketPageMixin, TemplateView):
+    template_name = "pretixpresale/event/order.html"
+
+    def get(self, request, *args, **kwargs):
+        self.kwargs = kwargs
+        if self.order.status == Order.STATUS_PENDING:
+            payment_to_complete = self.order.payments.filter(state=OrderPayment.PAYMENT_STATE_CREATED, process_initiated=False).first()
+            if payment_to_complete:
+                return redirect(eventreverse(self.request.event, 'presale:event.order.pay.complete', kwargs={
+                    'order': self.order.code,
+                    'secret': self.order.secret,
+                    'payment': payment_to_complete.pk
+                }))
+        return super().get(request, *args, **kwargs)
+
     def get_context_data(self, **kwargs):
-        ctx = super().get_context_data(**kwargs)
-        ctx['cart'] = self.get_cart(
-            answers=True, downloads=ctx['can_download'],
-            queryset=self.order.positions.prefetch_related('issued_gift_cards').select_related('tax_rule'),
-            order=self.order
+        self.context_query_set = (
+            self.order.positions.prefetch_related('issued_gift_cards', 'owned_gift_cards').select_related('tax_rule')
         )
-        ctx['tickets_with_download'] = [p for p in ctx['cart']['positions'] if p.generate_ticket]
+        ctx = super().get_context_data(**kwargs)
+
         ctx['can_download_multi'] = any([b['multi'] for b in self.download_buttons]) and (
             [p.generate_ticket for p in ctx['cart']['positions']].count(True) > 1
         )
@@ -241,7 +320,7 @@ class OrderDetails(EventViewMixin, OrderDetailMixin, CartMixin, TicketPageMixin,
                 state__in=[OrderPayment.PAYMENT_STATE_CANCELED, OrderPayment.PAYMENT_STATE_FAILED]
             ).exists() and self.order.status == Order.STATUS_PENDING:
                 ctx['generate_invoice_requires'] = 'payment'
-        ctx['url'] = build_absolute_uri(
+        ctx['url'] = eventreverse_absolute(
             self.request.event, 'presale:event.order', kwargs={
                 'order': self.order.code,
                 'secret': self.order.secret
@@ -259,9 +338,17 @@ class OrderDetails(EventViewMixin, OrderDetailMixin, CartMixin, TicketPageMixin,
             ctx['can_pay'] = False
 
             for provider in self.request.event.get_payment_providers().values():
-                if provider.is_enabled and provider.order_change_allowed(self.order):
-                    ctx['can_pay'] = True
-                    break
+                if provider.is_enabled:
+
+                    if 'request' in inspect.signature(provider.order_change_allowed).parameters:
+                        if provider.is_enabled and provider.order_change_allowed(self.order, request=self.request):
+                            ctx['can_pay'] = True
+                            break
+
+                    else:
+                        if provider.is_enabled and provider.order_change_allowed(self.order):
+                            ctx['can_pay'] = True
+                            break
 
             if lp and lp.state not in (OrderPayment.PAYMENT_STATE_CONFIRMED, OrderPayment.PAYMENT_STATE_REFUNDED,
                                        OrderPayment.PAYMENT_STATE_CANCELED):
@@ -270,7 +357,7 @@ class OrderDetails(EventViewMixin, OrderDetailMixin, CartMixin, TicketPageMixin,
                 pp = lp.payment_provider
                 ctx['last_payment_info'] = pp.payment_pending_render(self.request, ctx['last_payment'])
 
-                if lp.state == OrderPayment.PAYMENT_STATE_PENDING and not pp.abort_pending_allowed:
+                if lp.state == OrderPayment.PAYMENT_STATE_PENDING and not pp._payment_abort_pending_allowed(lp):
                     ctx['can_pay'] = False
 
             ctx['can_pay'] = ctx['can_pay'] and self.order._can_be_paid() is True
@@ -287,7 +374,7 @@ class OrderDetails(EventViewMixin, OrderDetailMixin, CartMixin, TicketPageMixin,
         ctx['user_cancel_allowed'] = self.order.user_cancel_allowed
         for r in ctx['refunds']:
             if r.provider == 'giftcard':
-                gc = GiftCard.objects.get(pk=r.info_data.get('gift_card'))
+                gc = self.request.organizer.accepted_gift_cards.get(pk=r.info_data.get('gift_card'))
                 r.giftcard = gc
 
         return ctx
@@ -303,38 +390,14 @@ class OrderPositionDetails(EventViewMixin, OrderPositionDetailMixin, CartMixin, 
             raise Http404(_('Unknown order code or not authorized to access this order.'))
         return super().get(request, *args, **kwargs)
 
-    @cached_property
-    def download_buttons(self):
-        buttons = []
-
-        responses = register_ticket_outputs.send(self.request.event)
-        for receiver, response in responses:
-            provider = response(self.request.event)
-            if not provider.is_enabled:
-                continue
-            buttons.append({
-                'text': provider.download_button_text or 'Download',
-                'icon': provider.download_button_icon or 'fa-download',
-                'identifier': provider.identifier,
-                'multi': provider.multi_download_enabled,
-                'multi_text': provider.multi_download_button_text or 'Download',
-                'long_text': provider.long_download_button_text or 'Download',
-                'javascript_required': provider.javascript_required
-            })
-        return buttons
-
     def get_context_data(self, **kwargs):
+        self.context_query_set = self.order.positions.select_related('tax_rule').filter(
+            Q(pk=self.position.pk) | Q(addon_to__id=self.position.pk)
+        )
         ctx = super().get_context_data(**kwargs)
         ctx['can_download_multi'] = False
         ctx['position'] = self.position
-        ctx['cart'] = self.get_cart(
-            answers=True, downloads=ctx['can_download'],
-            queryset=self.order.positions.select_related('tax_rule').filter(
-                Q(pk=self.position.pk) | Q(addon_to__id=self.position.pk)
-            ),
-            order=self.order
-        )
-        ctx['tickets_with_download'] = [p for p in ctx['cart']['positions'] if p.generate_ticket]
+        ctx['attendee_change_allowed'] = self.position.attendee_change_allowed
         return ctx
 
 
@@ -349,8 +412,12 @@ class OrderPaymentStart(EventViewMixin, OrderDetailMixin, TemplateView):
 
     def dispatch(self, request, *args, **kwargs):
         self.request = request
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
+        self.request.pci_dss_payment_page = True
+
+        resp = self.verify_order_access()
+        if resp:
+            return resp
+
         if (self.order.status not in (Order.STATUS_PENDING, Order.STATUS_EXPIRED)
                 or self.payment.state != OrderPayment.PAYMENT_STATE_CREATED
                 or not self.payment.payment_provider.is_enabled
@@ -369,9 +436,9 @@ class OrderPaymentStart(EventViewMixin, OrderDetailMixin, TemplateView):
         if 'payment_change_{}'.format(self.order.pk) in request.session:
             del request.session['payment_change_{}'.format(self.order.pk)]
         if isinstance(resp, str):
-            return redirect(resp)
+            return redirect_to_url(resp)
         elif resp is True:
-            return redirect(self.get_confirm_url())
+            return redirect_to_url(self.get_confirm_url())
         else:
             return self.get(request, *args, **kwargs)
 
@@ -417,9 +484,12 @@ class OrderPaymentConfirm(EventViewMixin, OrderDetailMixin, TemplateView):
 
     def dispatch(self, request, *args, **kwargs):
         self.request = request
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
-        if self.payment.state != OrderPayment.PAYMENT_STATE_CREATED or not self.order._can_be_paid():
+
+        resp = self.verify_order_access()
+        if resp:
+            return resp
+
+        if self.payment.state != OrderPayment.PAYMENT_STATE_CREATED or self.order._can_be_paid() is not True:
             messages.error(request, _('The payment for this order cannot be continued.'))
             return redirect(self.get_order_url())
         if (not self.payment.payment_provider.payment_is_valid_session(request) or
@@ -436,14 +506,8 @@ class OrderPaymentConfirm(EventViewMixin, OrderDetailMixin, TemplateView):
 
     def post(self, request, *args, **kwargs):
         try:
-            if not self.order.invoices.exists() and invoice_qualified(self.order):
-                if self.request.event.settings.get('invoice_generate') == 'True' or (
-                        self.request.event.settings.get('invoice_generate') == 'paid' and self.payment.payment_provider.requires_invoice_immediately):
-                    i = generate_invoice(self.order)
-                    self.order.log_action('pretix.event.order.invoice.generated', data={
-                        'invoice': i.pk
-                    })
-                    messages.success(self.request, _('An invoice has been generated.'))
+            self.payment.process_initiated = True
+            self.payment.save(update_fields=['process_initiated'])
             resp = self.payment.payment_provider.execute_payment(request, self.payment)
         except PaymentException as e:
             messages.error(request, str(e))
@@ -457,7 +521,12 @@ class OrderPaymentConfirm(EventViewMixin, OrderDetailMixin, TemplateView):
         ctx['order'] = self.order
         ctx['payment'] = self.payment
         if 'order' in inspect.signature(self.payment.payment_provider.checkout_confirm_render).parameters:
-            ctx['payment_info'] = self.payment.payment_provider.checkout_confirm_render(self.request, order=self.order)
+            if 'info_data' in inspect.signature(self.payment.payment_provider.checkout_confirm_render).parameters:
+                ctx['payment_info'] = self.payment.payment_provider.checkout_confirm_render(
+                    self.request, order=self.order, info_data=self.payment.info_data
+                )
+            else:
+                ctx['payment_info'] = self.payment.payment_provider.checkout_confirm_render(self.request, order=self.order)
         else:
             ctx['payment_info'] = self.payment.payment_provider.checkout_confirm_render(self.request)
         ctx['payment_provider'] = self.payment.payment_provider
@@ -485,9 +554,12 @@ class OrderPaymentComplete(EventViewMixin, OrderDetailMixin, View):
 
     def dispatch(self, request, *args, **kwargs):
         self.request = request
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
-        if self.payment.state != OrderPayment.PAYMENT_STATE_CREATED or not self.order._can_be_paid():
+
+        resp = self.verify_order_access()
+        if resp:
+            return resp
+
+        if self.payment.state != OrderPayment.PAYMENT_STATE_CREATED or self.order._can_be_paid() is not True:
             messages.error(request, _('The payment for this order cannot be continued.'))
             return redirect(self.get_order_url())
         if (not self.payment.payment_provider.payment_is_valid_session(request) or
@@ -504,15 +576,17 @@ class OrderPaymentComplete(EventViewMixin, OrderDetailMixin, View):
 
     def get(self, request, *args, **kwargs):
         try:
+            self.payment.process_initiated = True
+            self.payment.save(update_fields=['process_initiated'])
             resp = self.payment.payment_provider.execute_payment(request, self.payment)
         except PaymentException as e:
             messages.error(request, str(e))
             return redirect(self.get_order_url())
 
         if self.order.status == Order.STATUS_PAID:
-            return redirect(resp or self.get_order_url() + '?paid=yes')
+            return redirect_to_url(resp or self.get_order_url() + '?paid=yes')
         else:
-            return redirect(resp or self.get_order_url() + '?thanks=yes')
+            return redirect_to_url(resp or self.get_order_url() + '?thanks=yes')
 
     def get_payment_url(self):
         return eventreverse(self.request.event, 'presale:event.order.pay', kwargs={
@@ -528,9 +602,13 @@ class OrderPayChangeMethod(EventViewMixin, OrderDetailMixin, TemplateView):
 
     def dispatch(self, request, *args, **kwargs):
         self.request = request
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
-        if self.order.status not in (Order.STATUS_PENDING, Order.STATUS_EXPIRED) or not self.order._can_be_paid():
+        self.request.pci_dss_payment_page = True
+
+        resp = self.verify_order_access()
+        if resp:
+            return resp
+
+        if self.order.status not in (Order.STATUS_PENDING, Order.STATUS_EXPIRED) or self.order._can_be_paid() is not True:
             messages.error(request, _('The payment method for this order cannot be changed.'))
             return redirect(self.get_order_url())
 
@@ -541,7 +619,8 @@ class OrderPayChangeMethod(EventViewMixin, OrderDetailMixin, TemplateView):
 
         if self.open_payment:
             pp = self.open_payment.payment_provider
-            if self.open_payment.state == OrderPayment.PAYMENT_STATE_PENDING and not pp.abort_pending_allowed:
+            if self.open_payment.state == OrderPayment.PAYMENT_STATE_PENDING and not pp._payment_abort_pending_allowed(
+                    self.open_payment):
                 messages.error(request, _('A payment is currently pending for this order.'))
                 return redirect(self.get_order_url())
 
@@ -577,16 +656,19 @@ class OrderPayChangeMethod(EventViewMixin, OrderDetailMixin, TemplateView):
 
     @transaction.atomic()
     def mark_paid_free(self):
-        p = self.order.payments.create(
-            state=OrderPayment.PAYMENT_STATE_CREATED,
-            provider='manual',
-            amount=Decimal('0.00'),
-            fee=None
-        )
-        try:
+        p = self.order.payments.filter(state=OrderPayment.PAYMENT_STATE_CONFIRMED).last()
+        if not p:
+            p = self.order.payments.create(
+                state=OrderPayment.PAYMENT_STATE_CREATED,
+                provider='free',
+                amount=Decimal('0.00'),
+                fee=None
+            )
             p.confirm()
-        except SendMailException:
-            pass
+        else:
+            p._mark_order_paid(
+                payment_refund_sum=self.order.payment_refund_sum
+            )
 
     def get(self, request, *args, **kwargs):
         if self.order.pending_sum <= Decimal('0.00'):
@@ -606,9 +688,17 @@ class OrderPayChangeMethod(EventViewMixin, OrderDetailMixin, TemplateView):
     def provider_forms(self):
         providers = []
         pending_sum = self.order.pending_sum
-        for provider in self.request.event.get_payment_providers().values():
-            if not provider.is_enabled or not provider.order_change_allowed(self.order):
+        for provider in sorted(self.request.event.get_payment_providers().values(), key=lambda p: (-p.priority, str(p.public_name).title())):
+            if not provider.is_enabled:
                 continue
+
+            if 'request' in inspect.signature(provider.order_change_allowed).parameters:
+                if not provider.order_change_allowed(self.order, request=self.request):
+                    continue
+            else:
+                if not provider.order_change_allowed(self.order):
+                    continue
+
             current_fee = sum(f.value for f in self.open_fees) or Decimal('0.00')
             fee = provider.calculate_fee(pending_sum - current_fee)
             if 'order' in inspect.signature(provider.payment_form_render).parameters:
@@ -635,7 +725,12 @@ class OrderPayChangeMethod(EventViewMixin, OrderDetailMixin, TemplateView):
                 request.session['payment_change_{}'.format(self.order.pk)] = '1'
 
                 with transaction.atomic():
-                    old_fee, new_fee, fee, newpayment = change_payment_provider(self.order, p['provider'], None)
+                    old_fee, new_fee, fee, newpayment, new_invoice_created = change_payment_provider(
+                        self.order, p['provider'], None
+                    )
+
+                if new_invoice_created:
+                    messages.success(self.request, _('An invoice has been generated.'))
 
                 resp = p['provider'].payment_prepare(request, newpayment)
                 if isinstance(resp, str):
@@ -652,6 +747,10 @@ class OrderPayChangeMethod(EventViewMixin, OrderDetailMixin, TemplateView):
         ctx['order'] = self.order
         ctx['providers'] = self.provider_forms
         ctx['show_fees'] = any(p['fee_diff'] for p in self.provider_forms)
+        if len(self.provider_forms) == 1:
+            ctx['selected'] = self.provider_forms[0]['provider'].identifier
+        elif "payment" in self.request.POST:
+            ctx['selected'] = self.request.POST.get("payment")
         return ctx
 
     def get_confirm_url(self, payment):
@@ -664,15 +763,17 @@ class OrderPayChangeMethod(EventViewMixin, OrderDetailMixin, TemplateView):
 
 def can_generate_invoice(event, order, ignore_payments=False):
     v = (
-        order.sales_channel in event.settings.get('invoice_generate_sales_channels')
+        order.sales_channel.identifier in event.settings.get('invoice_generate_sales_channels')
         and (
             event.settings.get('invoice_generate') in ('user', 'True')
             or (
-                event.settings.get('invoice_generate') == 'paid'
+                event.settings.get('invoice_generate') in ('paid', 'user_paid')
                 and order.status == Order.STATUS_PAID
             )
         ) and (
             invoice_qualified(order)
+        ) and (
+            order.status in (Order.STATUS_PENDING, Order.STATUS_PAID)
         )
     )
     if not ignore_payments:
@@ -689,8 +790,6 @@ class OrderInvoiceCreate(EventViewMixin, OrderDetailMixin, View):
 
     def dispatch(self, request, *args, **kwargs):
         self.request = request
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
         return super().dispatch(request, *args, **kwargs)
 
     def post(self, request, *args, **kwargs):
@@ -699,19 +798,30 @@ class OrderInvoiceCreate(EventViewMixin, OrderDetailMixin, View):
         elif self.order.invoices.exists():
             messages.error(self.request, _('An invoice for this order already exists.'))
         else:
-            i = generate_invoice(self.order)
-            self.order.log_action('pretix.event.order.invoice.generated', data={
-                'invoice': i.pk
-            })
-            messages.success(self.request, _('The invoice has been generated.'))
+            try:
+                i = generate_invoice(self.order)
+                self.order.log_action('pretix.event.order.invoice.generated', data={
+                    'invoice': i.pk
+                })
+                messages.success(self.request, _('The invoice has been generated.'))
+            except Exception as e:
+                logger.exception("Could not generate invoice.")
+                self.order.log_action("pretix.event.order.invoice.failed", data={
+                    "exception": str(e)
+                })
+                messages.error(self.request, _('Invoice generation has failed, please reach out to the organizer.'))
         return redirect(self.get_order_url())
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
 class OrderModify(EventViewMixin, OrderDetailMixin, OrderQuestionsViewMixin, TemplateView):
-    form_class = QuestionsForm
+    orderposition_form_class = CustomerAwareQuestionsForm
     invoice_form_class = InvoiceAddressForm
     template_name = "pretixpresale/event/order_modify.html"
+
+    @property
+    def order_question_container(self):
+        return self.order
 
     @cached_property
     def positions(self):
@@ -719,7 +829,7 @@ class OrderModify(EventViewMixin, OrderDetailMixin, OrderQuestionsViewMixin, Tem
             return []
         return super().positions
 
-    def get_question_override_sets(self, order_position):
+    def get_question_override_sets(self, order_position, index):
         override_sets = [
             resp for recv, resp in question_form_fields_overrides.send(
                 self.request.event,
@@ -731,6 +841,14 @@ class OrderModify(EventViewMixin, OrderDetailMixin, OrderQuestionsViewMixin, Tem
             for k in override:
                 # We don't want initial values to be modified, they should come from the order directly
                 override[k].pop('initial', None)
+
+        if order_position.used_membership and not order_position.used_membership.membership_type.transferable:
+            override_sets.append({
+                'attendee_name_parts': {
+                    'disabled': True
+                }
+            })
+
         return override_sets
 
     def post(self, request, *args, **kwargs):
@@ -764,24 +882,40 @@ class OrderModify(EventViewMixin, OrderDetailMixin, OrderQuestionsViewMixin, Tem
             elif self.order.invoices.exists():
                 messages.error(self.request, _('An invoice for this order already exists.'))
             else:
-                i = generate_invoice(self.order)
-                self.order.log_action('pretix.event.order.invoice.generated', data={
-                    'invoice': i.pk
-                })
-                messages.success(self.request, _('The invoice has been generated.'))
+                try:
+                    i = generate_invoice(self.order)
+                    self.order.log_action('pretix.event.order.invoice.generated', data={
+                        'invoice': i.pk
+                    })
+                    messages.success(self.request, _('The invoice has been generated.'))
+                except Exception as e:
+                    logger.exception("Could not generate invoice.")
+                    self.order.log_action("pretix.event.order.invoice.failed", data={
+                        "exception": str(e)
+                    })
+                    messages.error(self.request, _('Invoice generation has failed, please reach out to the organizer.'))
         elif self.request.event.settings.invoice_reissue_after_modify:
             if self.invoice_form.changed_data:
-                inv = self.order.invoices.last()
-                if inv and not inv.canceled and not inv.shredded:
-                    c = generate_cancellation(inv)
-                    if self.order.status != Order.STATUS_CANCELED:
-                        inv = generate_invoice(self.order)
-                    else:
-                        inv = c
-                    self.order.log_action('pretix.event.order.invoice.reissued', data={
-                        'invoice': inv.pk
+                try:
+                    inv = self.order.invoices.last()
+                    if inv and not inv.canceled and not inv.shredded:
+                        c = generate_cancellation(inv)
+                        if self.order.status != Order.STATUS_CANCELED:
+                            inv = generate_invoice(self.order)
+                        else:
+                            inv = c
+                        self.order.log_action('pretix.event.order.invoice.reissued', data={
+                            'invoice': inv.pk
+                        })
+                        transmit_invoice.apply_async(args=(c.event_id, c.pk, True))
+                        if c.pk != inv.pk:
+                            transmit_invoice.apply_async(args=(inv.event_id, inv.pk, True))
+                        messages.success(self.request, _('The invoice has been reissued.'))
+                except Exception as e:
+                    self.order.log_action("pretix.event.order.invoice.failed", data={
+                        "exception": str(e)
                     })
-                    messages.success(self.request, _('The invoice has been reissued.'))
+                    logger.exception("Could not generate invoice.")
 
         invalidate_cache.apply_async(kwargs={'event': self.request.event.pk, 'order': self.order.pk})
         CachedTicket.objects.filter(order_position__order=self.order).delete()
@@ -791,14 +925,108 @@ class OrderModify(EventViewMixin, OrderDetailMixin, OrderQuestionsViewMixin, Tem
     def get(self, request, *args, **kwargs):
         return super().get(request, *args, **kwargs)
 
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(
+            **kwargs,
+        )
+
+        ctx['invoice_generation_selfservice'] = (
+            self.request.event.settings.invoice_reissue_after_modify or
+            (
+                can_generate_invoice(self.request.event, self.order, ignore_payments=True) and
+                not self.order.invoices.exists()
+            )
+        )
+
+        return ctx
+
     def dispatch(self, request, *args, **kwargs):
         self.request = request
         self.kwargs = kwargs
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
+
+        resp = self.verify_order_access()
+        if resp:
+            return resp
+
         if not self.order.can_modify_answers:
             messages.error(request, _('You cannot modify this order'))
             return redirect(self.get_order_url())
+        return super().dispatch(request, *args, **kwargs)
+
+
+@method_decorator(xframe_options_exempt, 'dispatch')
+class OrderPositionModify(EventViewMixin, OrderPositionDetailMixin, OrderQuestionsViewMixin, TemplateView):
+    orderposition_form_class = CustomerAwareQuestionsForm
+    invoice_form_class = None
+    template_name = "pretixpresale/event/position_modify.html"
+
+    @cached_property
+    def invoice_form(self):
+        return None
+
+    @property
+    def order_question_container(self):
+        return None
+
+    @cached_property
+    def positions(self):
+        return [p for p in super().positions if p.pk == self.position.pk or p.addon_to_id == self.position.pk]
+
+    def get_question_override_sets(self, order_position, index):
+        override_sets = [
+            resp for recv, resp in question_form_fields_overrides.send(
+                self.request.event,
+                position=order_position,
+                request=self.request
+            )
+        ]
+        for override in override_sets:
+            for k in override:
+                # We don't want initial values to be modified, they should come from the order directly
+                override[k].pop('initial', None)
+
+        if order_position.used_membership and not order_position.used_membership.membership_type.transferable:
+            override_sets.append({
+                'attendee_name_parts': {
+                    'disabled': True
+                }
+            })
+
+        return override_sets
+
+    def post(self, request, *args, **kwargs):
+        failed = not self.save()
+        if failed:
+            messages.error(self.request,
+                           _("We had difficulties processing your input. Please review the errors below."))
+            return self.get(request, *args, **kwargs)
+        self.order.log_action('pretix.event.order.modified', {
+            'by_ticket_holder': True,
+            'data': [{
+                k: (f.cleaned_data.get(k).name
+                    if isinstance(f.cleaned_data.get(k), File)
+                    else f.cleaned_data.get(k))
+                for k in f.changed_data
+            } for f in self.forms]
+        })
+        order_modified.send(sender=self.request.event, order=self.order)
+
+        invalidate_cache.apply_async(kwargs={'event': self.request.event.pk, 'order': self.order.pk})
+        CachedTicket.objects.filter(order_position__order=self.order).delete()
+        CachedCombinedTicket.objects.filter(order=self.order).delete()
+        return redirect(self.get_position_url())
+
+    def get(self, request, *args, **kwargs):
+        return super().get(request, *args, **kwargs)
+
+    def dispatch(self, request, *args, **kwargs):
+        self.request = request
+        self.kwargs = kwargs
+        if not self.position:
+            raise Http404(_('Unknown order code or not authorized to access this order.'))
+        if not self.position.can_modify_answers:
+            messages.error(request, _('You cannot modify this order'))
+            return redirect(self.get_position_url())
         return super().dispatch(request, *args, **kwargs)
 
 
@@ -809,8 +1037,11 @@ class OrderCancel(EventViewMixin, OrderDetailMixin, TemplateView):
     def dispatch(self, request, *args, **kwargs):
         self.request = request
         self.kwargs = kwargs
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
+
+        resp = self.verify_order_access()
+        if resp:
+            return resp
+
         if not self.order.user_cancel_allowed:
             messages.error(request, _('You cannot cancel this order.'))
             return redirect(self.get_order_url())
@@ -858,15 +1089,25 @@ class OrderCancelDo(EventViewMixin, OrderDetailMixin, AsyncAction, View):
         return self.get_order_url()
 
     def post(self, request, *args, **kwargs):
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
         if not self.order.user_cancel_allowed:
             messages.error(request, _('You cannot cancel this order.'))
             return redirect(self.get_order_url())
         fee = None
+        require_approval = False
+        auto_refund = (
+            not self.request.event.settings.cancel_allow_user_paid_require_approval
+            and self.request.event.settings.cancel_allow_user_paid_refund_as_giftcard != "manually"
+        )
         if self.order.status == Order.STATUS_PAID and self.order.total != Decimal('0.00'):
+            require_approval = self.request.event.settings.cancel_allow_user_paid_require_approval
             fee = self.order.user_cancel_fee
-        if 'cancel_fee' in request.POST and self.request.event.settings.cancel_allow_user_paid_adjust_fees:
+            auto_refund = self.request.event.settings.cancel_allow_user_paid_refund_as_giftcard != "manually"
+        if self.order.total == Decimal('0.00'):
+            fee = Decimal('0.00')
+        elif self.order.status == Order.STATUS_PENDING:
+            auto_refund = False
+            fee = self.order.user_cancel_fee
+        elif 'cancel_fee' in request.POST and self.order.status == Order.STATUS_PAID and self.request.event.settings.cancel_allow_user_paid_adjust_fees:
             fee = fee or Decimal('0.00')
             fee_in = re.sub('[^0-9.,]', '', request.POST.get('cancel_fee'))
             try:
@@ -893,7 +1134,7 @@ class OrderCancelDo(EventViewMixin, OrderDetailMixin, AsyncAction, View):
                 self.request.POST.get('giftcard') == 'true'
             )
         )
-        if self.request.event.settings.cancel_allow_user_paid_require_approval:
+        if require_approval:
             self.order.cancellation_requests.create(
                 cancellation_fee=fee or Decimal('0.00'),
                 refund_as_giftcard=giftcard,
@@ -902,8 +1143,8 @@ class OrderCancelDo(EventViewMixin, OrderDetailMixin, AsyncAction, View):
             return self.success(None)
         else:
             comment = gettext('Canceled by customer')
-            return self.do(self.order.pk, cancellation_fee=fee, try_auto_refund=True, refund_as_giftcard=giftcard,
-                           comment=comment)
+            return self.do(self.order.pk, cancellation_fee=fee, try_auto_refund=auto_refund, refund_as_giftcard=giftcard,
+                           refund_comment=comment)
 
     def get_context_data(self, **kwargs):
         ctx = super().get_context_data(**kwargs)
@@ -923,7 +1164,11 @@ class AnswerDownload(EventViewMixin, OrderDetailMixin, View):
         answid = kwargs.get('answer')
         token = request.GET.get('token', '')
 
-        answer = get_object_or_404(QuestionAnswer, orderposition__order=self.order, id=answid)
+        answer = get_object_or_404(
+            QuestionAnswer,
+            Q(orderposition__order=self.order) | Q(order=self.order),
+            id=answid,
+        )
         if not answer.file:
             raise Http404()
         if not check_token(request, answer, token):
@@ -933,7 +1178,7 @@ class AnswerDownload(EventViewMixin, OrderDetailMixin, View):
         resp = FileResponse(answer.file, content_type=ftype or 'application/binary')
         resp['Content-Disposition'] = 'attachment; filename="{}-{}-{}-{}"'.format(
             self.request.event.slug.upper(), self.order.code,
-            answer.orderposition.positionid,
+            answer.orderposition.positionid if answer.orderposition else '',
             os.path.basename(answer.file.name).split('.', 1)[1]
         )
         return resp
@@ -945,8 +1190,6 @@ class OrderDownloadMixin:
 
     @cached_property
     def output(self):
-        if not all([r for rr, r in allow_ticket_download.send(self.request.event, order=self.order)]):
-            return None
         responses = register_ticket_outputs.send(self.request.event)
         for receiver, response in responses:
             provider = response(self.request.event)
@@ -965,14 +1208,15 @@ class OrderDownloadMixin:
             return self.error(OrderError(_('You requested an invalid ticket output type.')))
         if not self.order or ('position' in kwargs and not self.order_position):
             raise Http404(_('Unknown order code or not authorized to access this order.'))
-        if not self.order.ticket_download_available:
+        positions = list(self.order.positions_with_tickets)
+        if not self.order.ticket_download_available or not positions:
             return self.error(OrderError(_('Ticket download is not (yet) enabled for this order.')))
-        if 'position' in kwargs and not self.order_position.generate_ticket:
+        if 'position' in kwargs and self.order_position not in positions:
             return self.error(OrderError(_('Ticket download is not enabled for this product.')))
 
         if (
             self.request.event.settings.ticket_download_require_validated_email and
-            self.order.sales_channel == 'web' and
+            self.order.sales_channel.type == 'web' and
             not self.order.email_known_to_work
         ):
             return self.error(OrderError(_('Please click the link we sent you via email to download your tickets.')))
@@ -1000,26 +1244,26 @@ class OrderDownloadMixin:
                 resp = HttpResponseRedirect(value.file.file.read())
                 return resp
             else:
-                resp = FileResponse(value.file.file, content_type=value.type)
-                if self.order_position.subevent:
-                    # Subevent date in filename improves accessibility e.g. for screen reader users
-                    resp['Content-Disposition'] = 'attachment; filename="{}-{}-{}-{}-{}{}"'.format(
-                        self.request.event.slug.upper(), self.order.code, self.order_position.positionid,
-                        self.order_position.subevent.date_from.strftime('%Y_%m_%d'),
-                        self.output.identifier, value.extension
-                    )
-                else:
-                    resp['Content-Disposition'] = 'attachment; filename="{}-{}-{}-{}{}"'.format(
-                        self.request.event.slug.upper(), self.order.code, self.order_position.positionid,
-                        self.output.identifier, value.extension
-                    )
-                return resp
+                name_parts = (
+                    self.request.event.slug.upper(),
+                    self.order.code,
+                    str(self.order_position.positionid),
+                    self.order_position.subevent.date_from.strftime('%Y_%m_%d') if self.order_position.subevent else None,
+                    self.output.identifier
+                )
+                filename = "-".join(filter(None, name_parts)) + value.extension
+                return FileResponse(value.file.file, filename=filename, content_type=value.type)
         elif isinstance(value, CachedCombinedTicket):
-            resp = FileResponse(value.file.file, content_type=value.type)
-            resp['Content-Disposition'] = 'attachment; filename="{}-{}-{}{}"'.format(
-                self.request.event.slug.upper(), self.order.code, self.output.identifier, value.extension
-            )
-            return resp
+            if value.type == 'text/uri-list':
+                resp = HttpResponseRedirect(value.file.file.read())
+                return resp
+            else:
+                return FileResponse(
+                    value.file.file,
+                    filename="{}-{}-{}{}".format(
+                        self.request.event.slug.upper(), self.order.code, self.output.identifier, value.extension),
+                    content_type=value.type
+                )
         else:
             return redirect(self.get_self_url())
 
@@ -1060,6 +1304,53 @@ class OrderDownload(OrderDownloadMixin, EventViewMixin, OrderDetailMixin, AsyncA
 
 
 @method_decorator(xframe_options_exempt, 'dispatch')
+class OrderGiftCardDetails(EventViewMixin, OrderDetailMixin, ListView):
+    template_name = 'pretixpresale/event/order_giftcard.html'
+    context_object_name = 'transactions'
+    paginate_by = 50
+
+    @cached_property
+    def giftcard(self):
+        return GiftCard.objects.filter(
+            owner_ticket__order_id=self.order.pk
+        ).get(pk=self.kwargs['pk'])
+
+    def get_queryset(self):
+        return self.giftcard.transactions.order_by('-datetime', '-pk')
+
+    def get_context_data(self, **kwargs):
+        return super().get_context_data(
+            order=self.order,
+            giftcard=self.giftcard,
+            **kwargs,
+        )
+
+
+@method_decorator(xframe_options_exempt, 'dispatch')
+class OrderPositionGiftCardDetails(EventViewMixin, OrderPositionDetailMixin, ListView):
+    template_name = 'pretixpresale/event/position_giftcard.html'
+    context_object_name = 'transactions'
+    paginate_by = 50
+
+    @cached_property
+    def giftcard(self):
+        return get_object_or_404(GiftCard.objects.filter(
+            Q(owner_ticket_id=self.position.pk) | Q(owner_ticket__addon_to_id=self.position.pk)
+        ), pk=self.kwargs['pk'])
+
+    def get_queryset(self):
+        return self.giftcard.transactions.order_by('-datetime', '-pk')
+
+    def get_context_data(self, **kwargs):
+        return super().get_context_data(
+            order=self.order,
+            position=self.position,
+            giftcard=self.giftcard,
+            **kwargs,
+        )
+
+
+@method_decorator(xframe_options_exempt, 'dispatch')
 class OrderPositionDownload(OrderDownloadMixin, EventViewMixin, OrderPositionDetailMixin, AsyncAction, View):
     task = generate
     known_errortypes = ['OrderError']
@@ -1088,9 +1379,6 @@ class OrderPositionDownload(OrderDownloadMixin, EventViewMixin, OrderPositionDet
 class InvoiceDownload(EventViewMixin, OrderDetailMixin, View):
 
     def get(self, request, *args, **kwargs):
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
-
         try:
             invoice = Invoice.objects.get(
                 event=self.request.event,
@@ -1115,33 +1403,24 @@ class InvoiceDownload(EventViewMixin, OrderDetailMixin, View):
             return redirect(self.get_order_url())
 
         try:
-            resp = FileResponse(invoice.file.file, content_type='application/pdf')
+            return FileResponse(
+                invoice.file.file,
+                filename='{}.pdf'.format(re.sub("[^a-zA-Z0-9-_.]+", "_", invoice.number)),
+                content_type='application/pdf'
+            )
         except FileNotFoundError:
             invoice_pdf_task.apply(args=(invoice.pk,))
             return self.get(request, *args, **kwargs)
-        resp['Content-Disposition'] = 'inline; filename="{}.pdf"'.format(invoice.number)
-        resp._csp_ignore = True  # Some browser's PDF readers do not work with CSP
-        return resp
 
 
-@method_decorator(xframe_options_exempt, 'dispatch')
-class OrderChange(EventViewMixin, OrderDetailMixin, TemplateView):
-    template_name = "pretixpresale/event/order_change.html"
-
-    def dispatch(self, request, *args, **kwargs):
-        self.request = request
-        self.kwargs = kwargs
-        if not self.order:
-            raise Http404(_('Unknown order code or not authorized to access this order.'))
-        if not self.order.user_change_allowed:
-            messages.error(request, _('You cannot change this order.'))
-            return redirect(self.get_order_url())
-        return super().dispatch(request, *args, **kwargs)
+class OrderChangeMixin:
 
     @cached_property
     def formdict(self):
         storage = OrderedDict()
         for pos in self.positions:
+            if self.request.event.settings.change_allow_user_addons and pos.addon_to_id:
+                continue
             if pos.addon_to_id:
                 if pos.addon_to not in storage:
                     storage[pos.addon_to] = []
@@ -1162,18 +1441,117 @@ class OrderChange(EventViewMixin, OrderDetailMixin, TemplateView):
     @cached_property
     def positions(self):
         positions = list(
-            self.order.positions.select_related('item', 'item__tax_rule').prefetch_related(
-                'item__quotas', 'item__variations', 'item__variations__quotas'
+            self.get_position_queryset().select_related('item', 'item__tax_rule').prefetch_related(
+                'item__variations', 'addons',
             )
         )
+        quota_cache = {}
+        item_cache = {}
         try:
             ia = self.order.invoice_address
         except InvoiceAddress.DoesNotExist:
             ia = None
         for p in positions:
             p.form = OrderPositionChangeForm(prefix='op-{}'.format(p.pk), instance=p,
-                                             invoice_address=ia, event=self.request.event,
-                                             data=self.request.POST if self.request.method == "POST" else None)
+                                             invoice_address=ia, event=self.request.event, quota_cache=quota_cache,
+                                             data=self.request.POST if self.request.method == "POST" else None,
+                                             hide_prices=self.get_hide_prices())
+
+            if p.addon_to_id is None and self.request.event.settings.change_allow_user_addons:
+                p.addon_form = {
+                    'pos': p,
+                    'categories': []
+                }
+                current_addon_products = defaultdict(list)
+                current_addon_products_missing = Counter()
+                for a in p.addons.all():
+                    if a.canceled:
+                        continue
+                    if not a.is_bundled:
+                        current_addon_products[a.item_id, a.variation_id].append(a)
+                        current_addon_products_missing[a.item, a.variation] += 1
+
+                for iao in p.item.addons.all():
+                    ckey = '{}-{}'.format(p.subevent.pk if p.subevent else 0, iao.addon_category.pk)
+
+                    if ckey not in item_cache:
+                        # Get all items to possibly show
+                        items, _btn = prepare_item_list_for_shop(
+                            self.request.event,
+                            subevent=p.subevent,
+                            voucher=None,
+                            channel=self.order.sales_channel,
+                            base_qs=iao.addon_category.items,
+                            allow_addons=True,
+                            quota_cache=quota_cache,
+                            memberships=(
+                                self.order.customer.usable_memberships(
+                                    for_event=p.subevent or self.request.event,
+                                    testmode=self.order.testmode
+                                )
+                                if self.order.customer else None
+                            ),
+                            ignore_hide_sold_out_for_item_ids={k[0] for k in current_addon_products.keys()}
+                        )
+                        item_cache[ckey] = items
+                    else:
+                        # We can use the cache to prevent a database fetch, but we need separate Python objects
+                        # or our things below like setting `i.initial` will do the wrong thing.
+                        items = [copy.copy(i) for i in item_cache[ckey]]
+                        for i in items:
+                            i.available_variations = [copy.copy(v) for v in i.available_variations]
+
+                    for i in items:
+                        i.allow_waitinglist = False
+
+                        if i.has_variations:
+                            for v in i.available_variations:
+                                v.initial = len(current_addon_products[i.pk, v.pk])
+                                current_addon_products_missing[i, v] = 0
+                                if v.initial and i.free_price:
+                                    a = current_addon_products[i.pk, v.pk][0]
+                                    v.initial_price = TaxedPrice(
+                                        net=a.price - a.tax_value,
+                                        gross=a.price,
+                                        tax=a.tax_value,
+                                        name=a.item.tax_rule.name if a.item.tax_rule else "",
+                                        code=a.item.tax_rule.code if a.item.tax_rule else None,
+                                        rate=a.tax_rate,
+                                    )
+                                else:
+                                    v.initial_price = v.suggested_price
+                            i.expand = any(v.initial for v in i.available_variations)
+                        else:
+                            i.initial = len(current_addon_products[i.pk, None])
+                            current_addon_products_missing[i, None] = 0
+                            if i.initial and i.free_price:
+                                a = current_addon_products[i.pk, None][0]
+                                i.initial_price = TaxedPrice(
+                                    net=a.price - a.tax_value,
+                                    gross=a.price,
+                                    tax=a.tax_value,
+                                    name=a.item.tax_rule.name if a.item.tax_rule else "",
+                                    code=a.item.tax_rule.name if a.item.tax_rule else None,
+                                    rate=a.tax_rate,
+                                )
+                            else:
+                                i.initial_price = i.suggested_price
+
+                    if items:
+                        p.addon_form['categories'].append({
+                            'category': iao.addon_category,
+                            'price_included': iao.price_included or (p.voucher_id and p.voucher.all_addons_included),
+                            'multi_allowed': iao.multi_allowed,
+                            'min_count': iao.min_count,
+                            'max_count': iao.max_count,
+                            'iao': iao,
+                            'items': [i for i in items if not i.require_voucher],
+                            'items_missing': {
+                                k: v for k, v in current_addon_products_missing.items()
+                                if v and k[0].category_id == iao.addon_category_id
+                            },
+                        })
+
         return positions
 
     def _process_change(self, ocm):
@@ -1217,36 +1595,224 @@ class OrderChange(EventViewMixin, OrderDetailMixin, TemplateView):
                 return False
         return True
 
-    def post(self, *args, **kwargs):
+    def _clean_category(self, form, category):
+        selected = {}
+        for i in category['items']:
+            if i.has_variations:
+                for v in i.available_variations:
+                    try:
+                        val = int(self.request.POST.get(f'cp_{form["pos"].pk}_variation_{i.pk}_{v.pk}') or '0')
+                    except ValueError:
+                        raise ValidationError(_('Please enter numbers only.'))
+                    price = self.request.POST.get(f'cp_{form["pos"].pk}_variation_{i.pk}_{v.pk}_price') or '0'
+                    if val:
+                        selected[i, v] = val, price
+            else:
+                try:
+                    val = int(self.request.POST.get(f'cp_{form["pos"].pk}_item_{i.pk}') or '0')
+                except ValueError:
+                    raise ValidationError(_('Please enter numbers only.'))
+                price = self.request.POST.get(f'cp_{form["pos"].pk}_item_{i.pk}_price') or '0'
+                if val:
+                    selected[i, None] = val, price
+
+        return selected
+
+    def post(self, request, *args, **kwargs):
         was_paid = self.order.status == Order.STATUS_PAID
+        original_total = self.order.total
         ocm = OrderChangeManager(
             self.order,
-            user=self.request.user,
             notify=True,
-            reissue_invoice=True,
+            reissue_invoice=self.order.invoices.exists() or self.request.event.settings.get('invoice_generate') == 'True',
         )
-        form_valid = self._process_change(ocm)
+
+        form_valid = True
+        if self.request.event.settings.change_allow_user_addons:
+            addons_data = []
+            for p in self.positions:
+                if p.addon_to_id or not hasattr(p, 'addon_form'):
+                    continue
+                for c in p.addon_form['categories']:
+                    try:
+                        selected = self._clean_category(p.addon_form, c)
+                    except ValidationError as e:
+                        messages.error(request, e.message % e.params if e.params else e.message)
+                        return self.get(request, *args, **kwargs)
+
+                    for (i, v), (c, price) in selected.items():
+                        addons_data.append({
+                            'addon_to': p.pk,
+                            'item': i.pk,
+                            'variation': v.pk if v else None,
+                            'count': c,
+                            'price': price,
+                        })
+            try:
+                ocm.set_addons(addons_data, self.get_position_queryset())
+            except OrderError as e:
+                messages.error(self.request, str(e))
+                form_valid = False
+
+        if form_valid:
+            form_valid = self._process_change(ocm)
 
         if not form_valid:
             messages.error(self.request, _('An error occurred. Please see the details below.'))
         else:
             try:
-                ocm.commit(check_quotas=True)
+                self._validate_total_diff(ocm)
             except OrderError as e:
                 messages.error(self.request, str(e))
-            else:
+                return self.get(request, *args, **kwargs)
 
-                if self.order.status != Order.STATUS_PAID and was_paid:
-                    messages.success(self.request, _('The order has been changed. You can now proceed by paying the open amount of {amount}.').format(
-                        amount=money_filter(self.order.pending_sum, self.request.event.currency)
-                    ))
-                    return redirect(eventreverse(self.request.event, 'presale:event.order.pay.change', kwargs={
-                        'order': self.order.code,
-                        'secret': self.order.secret
-                    }))
+            if "confirm" in request.POST:
+                try:
+                    ocm.commit(check_quotas=True)
+                except OrderError as e:
+                    messages.error(self.request, str(e))
                 else:
-                    messages.success(self.request, _('The order has been changed.'))
+                    totaldiff = self.order.total - original_total
+                    if self.order.pending_sum < Decimal('0.00') and totaldiff < Decimal('0.00'):
+                        auto_refund = (
+                            not self.request.event.settings.cancel_allow_user_paid_require_approval
+                            and self.request.event.settings.cancel_allow_user_paid_refund_as_giftcard != "manually"
+                        )
+                        refund_as_giftcard = self.request.event.settings.cancel_allow_user_paid_refund_as_giftcard == 'force'
+                        if auto_refund:
+                            try:
+                                _try_auto_refund(self.order, refund_as_giftcard=refund_as_giftcard)
+                            except OrderError as e:
+                                messages.error(self.request, str(e))
 
-                return redirect(self.get_order_url())
+                    if self.order.status != Order.STATUS_PAID and was_paid:
+                        messages.success(self.request, _('The order has been changed. You can now proceed by paying the open amount of {amount}.').format(
+                            amount=money_filter(self.order.pending_sum, self.request.event.currency)
+                        ))
+                        return redirect(eventreverse(self.request.event, 'presale:event.order.pay.change', kwargs={
+                            'order': self.order.code,
+                            'secret': self.order.secret
+                        }))
+                    else:
+                        messages.success(self.request, _('The order has been changed.'))
 
-        return self.get(*args, **kwargs)
+                    return redirect(self.get_self_url())
+            elif not ocm._operations:
+                messages.info(self.request, _('You did not make any changes.'))
+                return redirect(self.get_self_url())
+            else:
+                new_pending_sum = self.order.pending_sum + ocm.guess_totaldiff()
+                can_auto_refund = False
+                if new_pending_sum < Decimal('0.00'):
+                    proposals = self.order.propose_auto_refunds(Decimal('-1.00') * new_pending_sum)
+                    can_auto_refund = sum(proposals.values()) == Decimal('-1.00') * new_pending_sum
+
+                return render(request, self.confirm_template_name, {
+                    'operations': ocm._operations,
+                    'totaldiff': ocm.guess_totaldiff(),
+                    'order': self.order,
+                    'payment_refund_sum': self.order.payment_refund_sum,
+                    'new_pending_sum': new_pending_sum,
+                    'can_auto_refund': can_auto_refund,
+                    **self.get_confirm_context_data(),
+                })
+
+        return self.get(request, *args, **kwargs)
+
+    def _validate_total_diff(self, ocm):
+        pr = self.get_price_requirement()
+        totaldiff = ocm.guess_totaldiff()
+        if totaldiff < Decimal('0.00') and pr == 'gte':
+            raise OrderError(_('You may not change your order in a way that reduces the total price.'))
+        if totaldiff <= Decimal('0.00') and pr == 'gt':
+            raise OrderError(_('You may only change your order in a way that increases the total price.'))
+        if totaldiff != Decimal('0.00') and pr == 'eq':
+            raise OrderError(_('You may not change your order in a way that changes the total price.'))
+        if totaldiff < Decimal('0.00') and self.order.total + totaldiff < self.order.payment_refund_sum and pr == 'gte_paid':
+            raise OrderError(_('You may not change your order in a way that would require a refund.'))
+
+        if totaldiff > Decimal('0.00') and self.order.status == Order.STATUS_PAID:
+            self.order.set_expires(
+                now(),
+                self.order.event.subevents.filter(id__in=self.order.positions.values_list('subevent_id', flat=True))
+            )
+            if self.order.expires < now():
+                raise OrderError(_('You may not change your order in a way that increases the total price since '
+                                   'payments are no longer being accepted for this event.'))
+
+        if totaldiff > Decimal('0.00') and self.order.status == Order.STATUS_PENDING:
+            for p in self.order.payments.filter(state=OrderPayment.PAYMENT_STATE_PENDING):
+                if not p.payment_provider._payment_abort_pending_allowed(p):
+                    raise OrderError(_('You may not change your order in a way that requires additional payment while '
+                                       'we are processing your current payment. Please check back after your current '
+                                       'payment has been accepted.'))
+
+
+@method_decorator(xframe_options_exempt, 'dispatch')
+class OrderChange(OrderChangeMixin, EventViewMixin, OrderDetailMixin, TemplateView):
+    template_name = "pretixpresale/event/order_change.html"
+    confirm_template_name = 'pretixpresale/event/order_change_confirm.html'
+
+    def dispatch(self, request, *args, **kwargs):
+        self.request = request
+        self.kwargs = kwargs
+
+        resp = self.verify_order_access()
+        if resp:
+            return resp
+
+        if not self.order.user_change_allowed:
+            messages.error(request, _('You cannot change this order.'))
+            return redirect(self.get_order_url())
+        return super().dispatch(request, *args, **kwargs)
+
+    def get_self_url(self):
+        return self.get_order_url()
+
+    def get_position_queryset(self):
+        return self.order.positions.all()
+
+    def get_price_requirement(self):
+        return self.request.event.settings.change_allow_user_price
+
+    def get_confirm_context_data(self):
+        return {}
+
+    def get_hide_prices(self):
+        return False
+
+
+@method_decorator(xframe_options_exempt, 'dispatch')
+class OrderPositionChange(OrderChangeMixin, EventViewMixin, OrderPositionDetailMixin, TemplateView):
+    template_name = "pretixpresale/event/position_change.html"
+    confirm_template_name = 'pretixpresale/event/position_change_confirm.html'
+
+    def dispatch(self, request, *args, **kwargs):
+        self.request = request
+        self.kwargs = kwargs
+        if not self.position:
+            raise Http404(_('Unknown order code or not authorized to access this order.'))
+        if not self.position.attendee_change_allowed:
+            messages.error(request, _('You cannot change this order.'))
+            return redirect(self.get_position_url())
+        return super().dispatch(request, *args, **kwargs)
+
+    def get_self_url(self):
+        return self.get_position_url()
+
+    def get_position_queryset(self):
+        return self.order.positions.filter(Q(pk=self.position.pk) | Q(addon_to_id=self.position.id))
+
+    def get_price_requirement(self):
+        return 'eq'
+
+    def get_confirm_context_data(self):
+        return {'position': self.position}
+
+    def get_context_data(self, **kwargs):
+        ctx = super().get_context_data(**kwargs)
+        ctx['position'] = self.position
+        return ctx
+
+    def get_hide_prices(self):
+        return self.request.event.settings.hide_prices_from_attendees

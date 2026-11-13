@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -36,7 +36,7 @@ from collections import OrderedDict
 
 from django import forms
 from django.dispatch import receiver
-from django.utils.translation import gettext_lazy as _
+from django.utils.translation import gettext_lazy as _, pgettext_lazy
 
 from pretix.base.models import OrderPosition
 
@@ -50,6 +50,8 @@ from ..signals import (
 class MailExporter(BaseExporter):
     identifier = 'mailaddrs'
     verbose_name = _('Email addresses (text file)')
+    category = pgettext_lazy('export_category', 'Order data')
+    description = _("Download a text file with all email addresses collected either from buyers or from ticket holders.")
 
     def render(self, form_data: dict):
         qs = Order.objects.filter(event__in=self.events, status__in=form_data['status']).prefetch_related('event')
@@ -61,7 +63,7 @@ class MailExporter(BaseExporter):
                            | set(a['attendee_email'] for a in pos if a['attendee_email']))
 
         if self.is_multievent:
-            return '{}_pretixemails.txt'.format(self.events.first().organizer.slug), 'text/plain', data.encode("utf-8")
+            return '{}_pretixemails.txt'.format(self.organizer.slug), 'text/plain', data.encode("utf-8")
         else:
             return '{}_pretixemails.txt'.format(self.event.slug), 'text/plain', data.encode("utf-8")
 

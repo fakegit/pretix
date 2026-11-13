@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -22,11 +22,19 @@
 import os
 import sys
 from enum import Enum
+from importlib import metadata
 from typing import List
 
 from django.apps import AppConfig, apps
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
+from django.utils.translation import gettext_lazy as _
+from django_scopes import scope
+from packaging.requirements import Requirement
+
+PLUGIN_LEVEL_EVENT = 'event'
+PLUGIN_LEVEL_ORGANIZER = 'organizer'
+PLUGIN_LEVEL_EVENT_ORGANIZER_HYBRID = 'event_organizer'
 
 
 class PluginType(Enum):
@@ -41,10 +49,38 @@ class PluginType(Enum):
     EXPORT = 4
 
 
-def get_all_plugins(event=None) -> List[type]:
+def plugin_is_available(meta, event=None, organizer=None):
+    if not hasattr(meta.app, 'is_available'):
+        return True
+
+    level = getattr(meta, "level", PLUGIN_LEVEL_EVENT)
+    if level == PLUGIN_LEVEL_EVENT:
+        if event:
+            return meta.app.is_available(event)
+        elif organizer:
+            if not hasattr(organizer, '_plugin_availability_fallback_event'):
+                with scope(organizer=organizer):
+                    setattr(organizer, '_plugin_availability_fallback_event', organizer.events.first())
+            return (
+                organizer._plugin_availability_fallback_event
+                and meta.app.is_available(organizer._plugin_availability_fallback_event)
+            )
+    elif level == PLUGIN_LEVEL_ORGANIZER:
+        if organizer:
+            return meta.app.is_available(organizer)
+        elif event:
+            return meta.app.is_available(event.organizer)
+    elif level == PLUGIN_LEVEL_EVENT_ORGANIZER_HYBRID and (event or organizer):
+        return meta.app.is_available(event or organizer)
+
+    return True
+
+
+def get_all_plugins(*, event=None, organizer=None) -> List[type]:
     """
     Returns the PretixPluginMeta classes of all plugins found in the installed Django apps.
     """
+    assert not event or not organizer
     plugins = []
     for app in apps.get_app_configs():
         if hasattr(app, 'PretixPluginMeta'):
@@ -54,9 +90,8 @@ def get_all_plugins(event=None) -> List[type]:
             if app.name in settings.PRETIX_PLUGINS_EXCLUDE:
                 continue
 
-            if hasattr(app, 'is_available') and event:
-                if not app.is_available(event):
-                    continue
+            if not plugin_is_available(meta, event, organizer):
+                continue
 
             plugins.append(meta)
     return sorted(
@@ -65,7 +100,14 @@ def get_all_plugins(event=None) -> List[type]:
     )
 
 
-class PluginConfig(AppConfig):
+class PluginConfigMeta(type):
+    def __getattribute__(cls, item):
+        if item == "default" and cls is PluginConfig:
+            return False
+        return super().__getattribute__(item)
+
+
+class PluginConfig(AppConfig, metaclass=PluginConfigMeta):
     IGNORE = False
 
     def __init__(self, *args, **kwargs):
@@ -74,12 +116,34 @@ class PluginConfig(AppConfig):
             raise ImproperlyConfigured("A pretix plugin config should have a PretixPluginMeta inner class.")
 
         if hasattr(self.PretixPluginMeta, 'compatibility') and not os.environ.get("PRETIX_IGNORE_CONFLICTS") == "True":
-            import pkg_resources
-            try:
-                pkg_resources.require(self.PretixPluginMeta.compatibility)
-            except pkg_resources.VersionConflict as e:
+            req = Requirement(self.PretixPluginMeta.compatibility)
+            requirement_version = metadata.version(req.name)
+            if not req.specifier.contains(requirement_version, prereleases=True):
                 print("Incompatible plugins found!")
                 print("Plugin {} requires you to have {}, but you installed {}.".format(
-                    self.name, e.req, e.dist
+                    self.name, req, requirement_version
                 ))
                 sys.exit(1)
+
+        if not hasattr(self.PretixPluginMeta, 'level'):
+            self.PretixPluginMeta.level = PLUGIN_LEVEL_EVENT
+        if self.PretixPluginMeta.level not in (PLUGIN_LEVEL_EVENT, PLUGIN_LEVEL_ORGANIZER, PLUGIN_LEVEL_EVENT_ORGANIZER_HYBRID):
+            raise ImproperlyConfigured(f"Unknown plugin level '{self.PretixPluginMeta.level}'")
+
+
+CATEGORY_ORDER = [
+    'FEATURE',
+    'PAYMENT',
+    'INTEGRATION',
+    'CUSTOMIZATION',
+    'FORMAT',
+    'API',
+]
+CATEGORY_LABELS = {
+    'FEATURE': _('Features'),
+    'PAYMENT': _('Payment providers'),
+    'INTEGRATION': _('Integrations'),
+    'CUSTOMIZATION': _('Customizations'),
+    'FORMAT': _('Output and export formats'),
+    'API': _('API features'),
+}

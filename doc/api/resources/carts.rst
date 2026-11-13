@@ -3,6 +3,14 @@
 Cart positions
 ==============
 
+.. note::
+
+   This API is affected by an upcoming larger change to our API. The API documentation already reflects the future
+   version. Features or fields not yet available are marked with **NEW**.
+   The new version is expected to be released for hosted pretix early December and for self-hosted pretix with
+   version 2027.1.
+   You can find more information `on our blog <https://pretix.eu/about/en/blog/20261110-questionnaires/>`_.
+
 The API provides limited access to the cart position data model. This API currently only allows creating and deleting
 cart positions to reserve quota.
 
@@ -17,8 +25,8 @@ The cart position resource contains the following public fields:
 Field                                 Type                       Description
 ===================================== ========================== =======================================================
 id                                    integer                    Internal ID of the cart position
-cart_id                               string                     Identifier of the cart this belongs to. Needs to end
-                                                                 in "@api" for API-created positions.
+cart_id                               string                     Identifier of the cart this belongs to, needs to end
+                                                                 in "@api" for API-created positions
 datetime                              datetime                   Time of creation
 expires                               datetime                   The cart position will expire at this time and no longer block quota
 item                                  integer                    ID of the item
@@ -29,23 +37,25 @@ attendee_name_parts                   object of strings          Composition of 
 attendee_email                        string                     Specified attendee email address for this position (or ``null``)
 voucher                               integer                    Internal ID of the voucher used for this position (or ``null``)
 addon_to                              integer                    Internal ID of the position this position is an add-on for (or ``null``)
-subevent                              integer                    ID of the date inside an event series this position belongs to (or ``null``).
-answers                               list of objects            Answers to user-defined questions
-├ question                            integer                    Internal ID of the answered question
+is_bundled                            boolean                    If ``addon_to`` is set, this shows whether this is a bundled product or an addon product
+subevent                              integer                    ID of the date inside an event series this position belongs to (or ``null``)
+answers                               list of objects            Values of data fields (answers to user-defined questions)
+├ datafield                           string                     **NEW** The data field's ``identifier`` (internal reference)
 ├ answer                              string                     Text representation of the answer
-├ question_identifier                 string                     The question's ``identifier`` field
 ├ options                             list of integers           Internal IDs of selected option(s)s (only for choice types)
-└ option_identifiers                  list of strings            The ``identifier`` fields of the selected option(s)s
-seat                                  objects                    The assigned seat. Can be ``null``.
+├ option_identifiers                  list of strings            The ``identifier`` fields of the selected option(s)s
+├ question                            integer                    **Deprecated.** Internal ID of the data field
+└ question_identifier                 string                     **Read-only, deprecated.** The data field's ``identifier`` (internal reference)
+seat                                  objects                    The assigned seat (or ``null``)
 ├ id                                  integer                    Internal ID of the seat instance
 ├ name                                string                     Human-readable seat name
+├ zone_name                           string                     Name of the zone the seat is in
+├ row_name                            string                     Name/number of the row the seat is in
+├ row_label                           string                     Additional label of the row (or ``null``)
+├ seat_number                         string                     Number of the seat within the row
+├ seat_label                          string                     Additional label of the seat (or ``null``)
 └ seat_guid                           string                     Identifier of the seat within the seating plan
 ===================================== ========================== =======================================================
-
-.. versionchanged:: 3.0
-
-   This ``seat`` attribute has been added.
-
 
 Cart position endpoints
 -----------------------
@@ -87,6 +97,7 @@ Cart position endpoints
             "attendee_email": null,
             "voucher": null,
             "addon_to": null,
+            "is_bundled": false,
             "subevent": null,
             "datetime": "2018-06-11T10:00:00Z",
             "expires": "2018-06-11T10:00:00Z",
@@ -133,6 +144,7 @@ Cart position endpoints
         "attendee_email": null,
         "voucher": null,
         "addon_to": null,
+        "is_bundled": false,
         "subevent": null,
         "datetime": "2018-06-11T10:00:00Z",
         "expires": "2018-06-11T10:00:00Z",
@@ -168,15 +180,15 @@ Cart position endpoints
 
        * does not validate if the event's ticket sales are already over or haven't started
 
-       * does not support add-on products at the moment
+       * does not validate constraints on add-on products at the moment
 
        * does not check or calculate prices but believes any prices you send
-
-       * does not support the redemption of vouchers
 
        * does not prevent you from buying items that can only be bought with a voucher
 
        * does not support file upload questions
+
+       Note that more validation might be added in the future, so please do not rely on missing validation.
 
    You can supply the following fields of the resource:
 
@@ -189,11 +201,15 @@ Cart position endpoints
    * ``attendee_email`` (optional)
    * ``subevent`` (optional)
    * ``expires`` (optional)
-   * ``includes_tax`` (optional)
+   * ``includes_tax`` (optional, **DEPRECATED**, do not use, will be removed)
    * ``sales_channel`` (optional)
+   * ``voucher`` (optional, expect a voucher code)
+   * ``addons`` (optional, expect a list of nested objects of cart positions)
+   * ``bundled`` (optional, expect a list of nested objects of cart positions)
    * ``answers``
 
-      * ``question``
+      * ``datafield`` **NEW**
+      * ``question`` **DEPRECATED**
       * ``answer``
       * ``options``
 
@@ -217,9 +233,15 @@ Cart position endpoints
         "attendee_email": null,
         "answers": [
           {
-            "question": 1,
+            "datafield": "A1B2C3D4",
             "answer": "23",
             "options": []
+          }
+        ],
+        "addons": [
+          {
+            "item": 2,
+            "variation": null,
           }
         ],
         "subevent": null
@@ -233,12 +255,105 @@ Cart position endpoints
       Vary: Accept
       Content-Type: application/json
 
-      (Full cart position resource, see above.)
+      (Full cart position resource, see above, with additional nested objects "addons" and "bundled".)
 
    :param organizer: The ``slug`` field of the organizer of the event to create a position for
    :param event: The ``slug`` field of the event to create a position for
    :statuscode 201: no error
    :statuscode 400: The item could not be created due to invalid submitted data or lack of quota.
+   :statuscode 401: Authentication failure
+   :statuscode 403: The requested organizer/event does not exist **or** you have no permission to create this
+         order.
+
+.. http:post:: /api/v1/organizers/(organizer)/events/(event)/cartpositions/bulk_create/
+
+   Creates multiple new cart position. **This operation is deliberately not atomic, so each cart position can succeed
+   or fail individually, so the response code of the response is not the only thing to look at!**
+
+   .. warning:: This endpoint is considered **experimental**. It might change at any time without prior notice.
+
+   .. warning:: The same limitations as with the regular creation endpoint apply.
+
+   **Example request**:
+
+   .. sourcecode:: http
+
+      POST /api/v1/organizers/bigevents/events/sampleconf/cartpositions/bulk_create/ HTTP/1.1
+      Host: pretix.eu
+      Accept: application/json, text/javascript
+      Content-Type: application/json
+
+      [
+        {
+          "item": 1,
+          "variation": null,
+          "price": "23.00",
+          "attendee_name_parts": {
+            "given_name": "Peter",
+            "family_name": "Miller"
+          },
+          "attendee_email": null,
+          "answers": [
+            {
+              "datafield": "A1B2C3D4",
+              "answer": "23",
+              "options": []
+            }
+          ],
+          "subevent": null
+        },
+        {
+          "item": 1,
+          "variation": null,
+          "price": "23.00",
+          "attendee_name_parts": {
+            "given_name": "Maria",
+            "family_name": "Miller"
+          },
+          "attendee_email": null,
+          "answers": [
+            {
+              "datafield": "A1B2C3D4",
+              "answer": "23",
+              "options": []
+            }
+          ],
+          "subevent": null
+        }
+      ]
+
+   **Example response**:
+
+   .. sourcecode:: http
+
+      HTTP/1.1 200 OK
+      Vary: Accept
+      Content-Type: application/json
+
+      {
+        "results": [
+          {
+            "success": true,
+            "errors": null,
+            "data": {
+              "id": 1,
+              ...
+            },
+          },
+          {
+            "success": "false",
+            "errors": {
+              "non_field_errors": ["There is not enough quota available on quota \"Tickets\" to perform the operation."]
+            },
+            "data": null
+          }
+        ]
+      }
+
+   :param organizer: The ``slug`` field of the organizer of the event to create positions for
+   :param event: The ``slug`` field of the event to create positions for
+   :statuscode 200: See response for success
+   :statuscode 400: Your input could not be parsed
    :statuscode 401: Authentication failure
    :statuscode 403: The requested organizer/event does not exist **or** you have no permission to create this
          order.

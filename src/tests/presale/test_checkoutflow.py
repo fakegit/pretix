@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -44,7 +44,7 @@ def event():
 def req_with_session():
     factory = RequestFactory()
     r = factory.get('/')
-    SessionMiddleware().process_request(r)
+    SessionMiddleware(NotImplementedError).process_request(r)
     r.session.save()
     return r
 
@@ -100,10 +100,12 @@ def test_plugin_in_order(event, mocker):
 
     flow = with_mocked_step(mocker, MockingStep, event)
     assert isinstance(flow[0], checkoutflow.AddOnsStep)
-    assert isinstance(flow[1], checkoutflow.QuestionsStep)
-    assert isinstance(flow[2], MockingStep)
-    assert isinstance(flow[3], checkoutflow.PaymentStep)
-    assert isinstance(flow[4], checkoutflow.ConfirmStep)
+    assert isinstance(flow[1], checkoutflow.CustomerStep)
+    assert isinstance(flow[2], checkoutflow.MembershipStep)
+    assert isinstance(flow[3], checkoutflow.QuestionsStep)
+    assert isinstance(flow[4], MockingStep)
+    assert isinstance(flow[5], checkoutflow.PaymentStep)
+    assert isinstance(flow[6], checkoutflow.ConfirmStep)
 
 
 @pytest.mark.django_db
@@ -117,9 +119,9 @@ def test_step_ignored(event, mocker, req_with_session):
 
     flow = with_mocked_step(mocker, MockingStep, event)
     req_with_session.event = event
-    assert flow[1].get_next_applicable(req_with_session) is flow[4]
+    assert flow[3].get_next_applicable(req_with_session) is flow[6]
     # flow[3] is also skipped because no payment is required if there is no cart
-    assert flow[1] is flow[4].get_prev_applicable(req_with_session)
+    assert flow[3] is flow[6].get_prev_applicable(req_with_session)
 
 
 @pytest.mark.django_db

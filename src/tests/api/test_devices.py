@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -35,6 +35,8 @@ def device(organizer, event):
         unique_serial="UOS3GNZ27O39V3QS",
         initialization_token="frkso3m2w58zuw70",
         hardware_model="TC25",
+        os_name="Android",
+        os_version="8.1.0",
         software_brand="pretixSCAN",
         software_version="1.5.1",
         initialized=now(),
@@ -58,6 +60,8 @@ TEST_DEV_RES = {
     "initialized": "2020-09-18T14:17:44.190021Z",
     "hardware_brand": "Zebra",
     "hardware_model": "TC25",
+    "os_name": "Android",
+    "os_version": "8.1.0",
     "software_brand": "pretixSCAN",
     "software_version": "1.5.1",
     "security_profile": "full"

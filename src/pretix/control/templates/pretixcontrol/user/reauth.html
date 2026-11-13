@@ -3,6 +3,7 @@
 {% load bootstrap3 %}
 {% load compress %}
 {% load static %}
+{% load escapejson %}
 {% block content %}
     <form class="form-signin" id="webauthn-form" action="" method="post">
         {% csrf_token %}
@@ -18,7 +19,7 @@
         <input class="form-control" id="webauthn-response" name="webauthn"
                 type="hidden">
         {% if jsondata %}
-            <div class="sr-only alert alert-danger" id="webauthn-error">
+            <div class="alert alert-danger hidden" id="webauthn-error">
                 {% trans "WebAuthn failed. Check that the correct authentication device is correctly plugged in." %}
             </div>
             <p><small>
@@ -43,11 +44,11 @@
 
         {% if jsondata %}
             <script type="text/json" id="webauthn-login">
-            {{ jsondata|safe }}
+                {{ jsondata|escapejson }}
             </script>
         {% endif %}
         {% compress js %}
-            <script type="text/javascript" src="{% static "jquery/js/jquery-2.1.1.min.js" %}"></script>
+            <script type="text/javascript" src="{% static "jquery/js/jquery-3.6.4.min.js" %}"></script>
             <script type="text/javascript" src="{% static "pretixcontrol/js/base64js.js" %}"></script>
             <script type="text/javascript" src="{% static "pretixcontrol/js/ui/webauthn.js" %}"></script>
             <script type="text/javascript" src="{% static "pretixcontrol/js/ui/focus.js" %}"></script>

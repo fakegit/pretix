@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -32,9 +32,12 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 # License for the specific language governing permissions and limitations under the License.
 
+import json
 import logging
+import operator
 import re
 from decimal import Decimal
+from functools import reduce
 
 import dateutil.parser
 from celery.exceptions import MaxRetriesExceededError
@@ -42,15 +45,17 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Max, Min, Q
 from django.db.models.functions import Length
-from django.utils.translation import gettext, gettext_noop
+from django.utils.timezone import now
+from django.utils.translation import gettext_noop
 from django_scopes import scope, scopes_disabled
 
 from pretix.base.email import get_email_context
 from pretix.base.i18n import language
-from pretix.base.models import Event, Order, OrderPayment, Organizer, Quota
+from pretix.base.models import (
+    Event, Invoice, Order, OrderPayment, OrderRefund, Organizer, Quota,
+)
 from pretix.base.payment import PaymentException
 from pretix.base.services.locking import LockTimeoutException
-from pretix.base.services.mail import SendMailException
 from pretix.base.services.orders import change_payment_provider
 from pretix.base.services.tasks import TransactionAwareTask
 from pretix.celery_app import app
@@ -62,17 +67,14 @@ logger = logging.getLogger(__name__)
 
 def notify_incomplete_payment(o: Order):
     with language(o.locale, o.event.settings.region):
-        email_template = o.event.settings.mail_text_order_expire_warning
-        email_context = get_email_context(event=o.event, order=o)
-        email_subject = gettext('Your order received an incomplete payment: %(code)s') % {'code': o.code}
+        email_template = o.event.settings.mail_text_order_incomplete_payment
+        email_context = get_email_context(event=o.event, order=o, pending_sum=o.pending_sum)
+        email_subject = o.event.settings.mail_subject_order_incomplete_payment
 
-        try:
-            o.send_mail(
-                email_subject, email_template, email_context,
-                'pretix.event.order.email.expire_warning_sent'
-            )
-        except SendMailException:
-            logger.exception('Reminder email could not be sent')
+        o.send_mail(
+            email_subject, email_template, email_context,
+            'pretix.event.order.email.expire_warning_sent'
+        )
 
 
 def cancel_old_payments(order):
@@ -113,20 +115,49 @@ def _find_order_for_code(base_qs, code):
             pass
 
 
+def _find_order_for_invoice_id(base_qs, prefixes, number):
+    try:
+        # Working with __iregex here is an experiment, if this turns out to be too slow in production
+        # we might need to switch to a different approach.
+        r = [
+            Q(
+                prefix__istartswith=prefix,  # redundant, but hopefully makes it a little faster
+                full_invoice_no__iregex=prefix + r'[\- ]*0*' + number
+            )
+            for prefix in set(prefixes)
+        ]
+        return base_qs.select_related('order').get(
+            reduce(operator.or_, r)
+        ).order
+    except (Invoice.DoesNotExist, Invoice.MultipleObjectsReturned):
+        pass
+
+
 @transaction.atomic
-def _handle_transaction(trans: BankTransaction, matches: tuple, event: Event = None, organizer: Organizer = None):
+def _handle_transaction(trans: BankTransaction, matches: tuple, regex_match_to_slug, event: Event = None, organizer: Organizer = None):
     orders = []
     if event:
         for slug, code in matches:
             order = _find_order_for_code(event.orders, code)
-            if order and order.code not in {o.code for o in orders}:
-                orders.append(order)
+            if order:
+                if order.code not in {o.code for o in orders}:
+                    orders.append(order)
+            else:
+                order = _find_order_for_invoice_id(Invoice.objects.filter(event=event), (slug, regex_match_to_slug.get(slug, slug)), code)
+                if order and order.code not in {o.code for o in orders}:
+                    orders.append(order)
     else:
         qs = Order.objects.filter(event__organizer=organizer)
         for slug, code in matches:
-            order = _find_order_for_code(qs.filter(event__slug__iexact=slug), code)
-            if order and order.code not in {o.code for o in orders}:
-                orders.append(order)
+            original_slug = regex_match_to_slug.get(slug, slug)
+            order = _find_order_for_code(qs.filter(Q(event__slug__iexact=slug) | Q(event__slug__iexact=original_slug)), code)
+            if order:
+                if order.code not in {o.code for o in orders}:
+                    orders.append(order)
+            else:
+                order = _find_order_for_invoice_id(Invoice.objects.filter(event__organizer=organizer), (slug, original_slug), code)
+                if order and order.code not in {o.code for o in orders}:
+                    orders.append(order)
 
     if not orders:
         # No match
@@ -135,17 +166,6 @@ def _handle_transaction(trans: BankTransaction, matches: tuple, event: Event = N
         return
     else:
         trans.order = orders[0]
-
-    for o in orders:
-        if o.status == Order.STATUS_PAID and o.pending_sum <= Decimal('0.00'):
-            trans.state = BankTransaction.STATE_DUPLICATE
-            trans.save()
-            return
-        elif o.status == Order.STATUS_CANCELED:
-            trans.state = BankTransaction.STATE_ERROR
-            trans.message = gettext_noop('The order has already been canceled.')
-            trans.save()
-            return
 
     if len(orders) > 1:
         # Multi-match! Can we split this automatically?
@@ -162,8 +182,72 @@ def _handle_transaction(trans: BankTransaction, matches: tuple, event: Event = N
     else:
         splits = [(orders[0], trans.amount)]
 
+    for o in orders:
+        if o.status == Order.STATUS_PAID and o.pending_sum <= Decimal('0.00'):
+            trans.state = BankTransaction.STATE_DUPLICATE
+            trans.save()
+            return
+        elif o.status == Order.STATUS_CANCELED:
+            trans.state = BankTransaction.STATE_ERROR
+            trans.message = gettext_noop('The order has already been canceled.')
+            trans.save()
+            return
+
+        if trans.currency is not None and trans.currency != o.event.currency:
+            trans.state = BankTransaction.STATE_ERROR
+            trans.message = gettext_noop('Currencies do not match.')
+            trans.save()
+            return
+
     trans.state = BankTransaction.STATE_VALID
     for order, amount in splits:
+        info_data = {
+            'reference': trans.reference,
+            'date': trans.date_parsed.isoformat() if trans.date_parsed else trans.date,
+            'payer': trans.payer,
+            'iban': trans.iban,
+            'bic': trans.bic,
+            'full_amount': str(trans.amount),
+            'trans_id': trans.pk
+        }
+        if amount < Decimal("0.00"):
+            pending_refund = order.refunds.filter(
+                amount=-amount,
+                provider__in=('manual', 'banktransfer'),
+                state__in=(OrderRefund.REFUND_STATE_CREATED, OrderRefund.REFUND_STATE_TRANSIT),
+            ).first()
+            existing_payment = order.payments.filter(
+                provider='banktransfer',
+                state__in=(OrderPayment.PAYMENT_STATE_CONFIRMED,),
+            ).first()
+            if pending_refund:
+                pending_refund.provider = "banktransfer"
+                pending_refund.info_data = {
+                    **pending_refund.info_data,
+                    **info_data,
+                }
+                pending_refund.done()
+            elif existing_payment:
+                existing_payment.create_external_refund(
+                    amount=-amount,
+                    info=json.dumps(info_data)
+                )
+            else:
+                r = order.refunds.create(
+                    state=OrderRefund.REFUND_STATE_EXTERNAL,
+                    source=OrderRefund.REFUND_SOURCE_EXTERNAL,
+                    amount=-amount,
+                    order=order,
+                    execution_date=now(),
+                    provider='banktransfer',
+                    info=json.dumps(info_data)
+                )
+                order.log_action('pretix.event.order.refund.created.externally', {
+                    'local_id': r.local_id,
+                    'provider': r.provider,
+                })
+            continue
+
         try:
             p, created = order.payments.get_or_create(
                 amount=amount,
@@ -182,19 +266,15 @@ def _handle_transaction(trans: BankTransaction, matches: tuple, event: Event = N
             ).last()
 
         p.info_data = {
-            'reference': trans.reference,
-            'date': trans.date_parsed.isoformat() if trans.date_parsed else trans.date,
-            'payer': trans.payer,
-            'iban': trans.iban,
-            'bic': trans.bic,
-            'full_amount': str(trans.amount),
-            'trans_id': trans.pk
+            **p.info_data,
+            **info_data,
         }
 
         if created:
             # We're perform a payment method switching on-demand here
-            old_fee, new_fee, fee, p = change_payment_provider(order, p.payment_provider, p.amount,
-                                                               new_payment=p, create_log=False)  # noqa
+            old_fee, new_fee, fee, p, new_invoice_created = change_payment_provider(
+                order, p.payment_provider, p.amount, new_payment=p, create_log=False
+            )  # noqa
             if fee:
                 p.fee = fee
                 p.save(update_fields=['fee'])
@@ -202,9 +282,6 @@ def _handle_transaction(trans: BankTransaction, matches: tuple, event: Event = N
         try:
             p.confirm()
         except Quota.QuotaExceededException:
-            # payment confirmed but order status could not be set, no longer problem of this plugin
-            cancel_old_payments(order)
-        except SendMailException:
             # payment confirmed but order status could not be set, no longer problem of this plugin
             cancel_old_payments(order)
         else:
@@ -217,11 +294,11 @@ def _handle_transaction(trans: BankTransaction, matches: tuple, event: Event = N
     trans.save()
 
 
-def parse_date(date_str):
+def parse_date(date_str, region=None):
     try:
         return dateutil.parser.parse(
             date_str,
-            dayfirst="." in date_str,
+            dayfirst="." in date_str or region in ["GB"],
         ).date()
     except (ValueError, OverflowError):
         pass
@@ -233,6 +310,9 @@ def _get_unknown_transactions(job: BankImportJob, data: list, event: Event = Non
     known_checksums = set(t['checksum'] for t in BankTransaction.objects.filter(
         Q(event=event) if event else Q(organizer=organizer)
     ).values('checksum'))
+    known_by_external_id = set((t['external_id'], t['date'], t['amount']) for t in BankTransaction.objects.filter(
+        Q(event=event) if event else Q(organizer=organizer), external_id__isnull=False
+    ).values('external_id', 'date', 'amount'))
 
     transactions = []
     for row in data:
@@ -253,14 +333,18 @@ def _get_unknown_transactions(job: BankImportJob, data: list, event: Event = Non
 
         trans = BankTransaction(event=event, organizer=organizer, import_job=job,
                                 payer=row.get('payer', ''),
-                                reference=row['reference'],
-                                amount=amount, date=row['date'],
-                                iban=row.get('iban', ''), bic=row.get('bic', ''))
+                                reference=row.get('reference', ''),
+                                amount=amount,
+                                date=row.get('date', ''),
+                                iban=row.get('iban', ''),
+                                bic=row.get('bic', ''),
+                                external_id=row.get('external_id'),
+                                currency=event.currency if event else job.currency)
 
-        trans.date_parsed = parse_date(trans.date)
+        trans.date_parsed = parse_date(trans.date, (event and event.settings.region) or (organizer and organizer.settings.region) or None)
 
         trans.checksum = trans.calculate_checksum()
-        if trans.checksum not in known_checksums:
+        if trans.checksum not in known_checksums and (not trans.external_id or (trans.external_id, trans.date, trans.amount) not in known_by_external_id):
             trans.state = BankTransaction.STATE_UNCHECKED
             trans.save()
             transactions.append(trans)
@@ -283,30 +367,73 @@ def process_banktransfers(self, job: int, data: list) -> None:
 
                 transactions = _get_unknown_transactions(job, data, **job.owner_kwargs)
 
+                # Match order codes
+                regex_match_to_slug = {}
                 code_len_agg = Order.objects.filter(event__organizer=job.organizer).annotate(
                     clen=Length('code')
                 ).aggregate(min=Min('clen'), max=Max('clen'))
                 if job.event:
-                    prefixes = [job.event.slug.upper()]
+                    prefixes = {job.event.slug.upper(), job.event.slug.upper().replace("-", "")}
+                    if "-" in job.event.slug:
+                        regex_match_to_slug[job.event.slug.upper().replace("-", "")] = job.event.slug
                 else:
-                    prefixes = [e.slug.upper()
-                                for e in job.organizer.events.all()]
+                    prefixes = set()
+                    for e in job.organizer.events.all():
+                        prefixes.add(e.slug.upper())
+                        if "-" in e.slug:
+                            prefixes.add(e.slug.upper().replace("-", ""))
+                            regex_match_to_slug[e.slug.upper().replace("-", "")] = e.slug
+
+                # Match invoice numbers
+                inr_len_agg = Invoice.objects.filter(event__organizer=job.organizer).annotate(
+                    clen=Length('invoice_no')
+                ).aggregate(min=Min('clen'), max=Max('clen'))
+                if job.event:
+                    invoice_prefixes = Invoice.objects.filter(event=job.event)
+                else:
+                    invoice_prefixes = Invoice.objects.filter(event__organizer=job.organizer)
+                for p in invoice_prefixes.order_by().distinct().values_list('prefix', flat=True):
+                    prefix = p.rstrip(" -")
+                    prefixes.add(prefix)
+                    if "-" in prefix:
+                        prefix_nodash = prefix.replace("-", "")
+                        prefixes.add(prefix_nodash)
+                        regex_match_to_slug[prefix_nodash] = prefix
+
                 pattern = re.compile(
                     "(%s)[ \\-_]*([A-Z0-9]{%s,%s})" % (
-                        "|".join(p.replace(".", r"\.").replace("-", r"[\- ]*") for p in prefixes),
-                        code_len_agg['min'] or 0,
-                        code_len_agg['max'] or 5
+                        # We need to sort prefixes by length with long ones first. In case we have an event with slug
+                        # "CONF" and one with slug "CONF2022", we want CONF2022 to match first, to avoid the parser
+                        # thinking "2022" is already the order code.
+                        "|".join([re.escape(p).replace("\\-", r"[\- ]*") for p in sorted(prefixes, key=lambda p: len(p), reverse=True)]),
+                        min(code_len_agg['min'] or 1, inr_len_agg['min'] or 1),
+                        max(code_len_agg['max'] or 5, inr_len_agg['max'] or 5)
                     )
                 )
 
                 for trans in transactions:
-                    matches = pattern.findall(trans.reference.replace(" ", "").replace("\n", "").upper())
+                    if trans.amount == Decimal("0.00"):
+                        # Ignore all zero-valued transactions
+                        trans.state = BankTransaction.STATE_DISCARDED
+                        trans.save()
+                        continue
+                    # Whitespace in references is unreliable since linebreaks and spaces can occur almost anywhere, e.g.
+                    # DEMOCON-123\n45 should be matched to DEMOCON-12345. However, sometimes whitespace is important,
+                    # e.g. when there are two references. "DEMOCON-12345 DEMOCON-45678" would otherwise be parsed as
+                    # "DEMOCON-12345DE" in some conditions. We'll naively take whatever has more matches.
+                    matches_with_whitespace = pattern.findall(trans.reference.replace("\n", " ").upper())
+                    matches_without_whitespace = pattern.findall(trans.reference.replace(" ", "").replace("\n", "").upper())
+
+                    if len(matches_without_whitespace) > len(matches_with_whitespace):
+                        matches = matches_without_whitespace
+                    else:
+                        matches = matches_with_whitespace
 
                     if matches:
                         if job.event:
-                            _handle_transaction(trans, matches, event=job.event)
+                            _handle_transaction(trans, matches, regex_match_to_slug, event=job.event)
                         else:
-                            _handle_transaction(trans, matches, organizer=job.organizer)
+                            _handle_transaction(trans, matches, regex_match_to_slug, organizer=job.organizer)
                     else:
                         trans.state = BankTransaction.STATE_NOMATCH
                         trans.save()

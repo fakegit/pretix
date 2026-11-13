@@ -18,3 +18,5 @@ Contents:
    email
    permissions
    logging
+   locking
+   timemachine

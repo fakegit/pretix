@@ -1,8 +1,8 @@
 #
 # This file is part of pretix (Community Edition).
 #
-# Copyright (C) 2014-2020 Raphael Michel and contributors
-# Copyright (C) 2020-2021 rami.io GmbH and contributors
+# Copyright (C) 2014-2020  Raphael Michel and contributors
+# Copyright (C) 2020-today pretix GmbH and contributors
 #
 # This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
 # Public License as published by the Free Software Foundation in version 3 of the License.
@@ -20,7 +20,9 @@
 # <https://www.gnu.org/licenses/>.
 #
 from django.conf import settings
-from django.http import StreamingHttpResponse
+from django.http import (
+    HttpResponsePermanentRedirect, HttpResponseRedirect, StreamingHttpResponse,
+)
 
 
 class ChunkBasedFileResponse(StreamingHttpResponse):
@@ -36,7 +38,12 @@ class ChunkBasedFileResponse(StreamingHttpResponse):
 def get_client_ip(request):
     ip = request.META.get('REMOTE_ADDR')
     if settings.TRUST_X_FORWARDED_FOR:
-        x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+        x_forwarded_for = request.headers.get('x-forwarded-for')
         if x_forwarded_for:
             ip = x_forwarded_for.split(',')[0]
     return ip
+
+
+def redirect_to_url(to, permanent=False):
+    redirect_class = HttpResponsePermanentRedirect if permanent else HttpResponseRedirect
+    return redirect_class(to)
